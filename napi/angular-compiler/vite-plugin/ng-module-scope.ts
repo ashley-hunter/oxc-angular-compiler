@@ -22,6 +22,9 @@
  * don't match any template element.
  */
 
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+
 import { extractNgModuleInfoSync } from '#binding'
 
 /**
@@ -225,35 +228,33 @@ export class NgModuleScopeCollector {
     scope: NgModuleScopeDep[],
     seen: Set<string>,
     importingModule: NgModuleInfo,
+    visitedModules?: Set<string>,
   ): void {
-    // Check user-defined modules first
-    let moduleInfo = this.modules.get(moduleName)
+    // Prevent circular module resolution (e.g., module A re-exports B, B re-exports A)
+    const visited = visitedModules ?? new Set<string>()
+    if (visited.has(moduleName)) return
+    visited.add(moduleName)
 
-    // If not found, try to resolve from node_modules
+    // Check user-defined modules first, then try to resolve from node_modules
+    let moduleInfo = this.modules.get(moduleName)
     if (!moduleInfo) {
       this.resolveExternalModule(moduleName, importingModule)
       moduleInfo = this.modules.get(moduleName)
     }
-
     if (!moduleInfo) return
 
     // A module's exports are what it makes available to importers
     for (const exportName of moduleInfo.exports) {
       if (seen.has(exportName)) continue
 
-      // Check if the export is a module itself (re-export pattern)
-      if (this.modules.has(exportName)) {
-        this.addImportedModuleExports(exportName, scope, seen, moduleInfo)
-        continue
-      }
-
-      // Try to resolve the export as an external module if we haven't seen it
+      // Check if the export is a module itself (re-export pattern).
+      // Try to resolve it if not already known.
       if (!this.modules.has(exportName)) {
         this.resolveExternalModule(exportName, moduleInfo)
-        if (this.modules.has(exportName)) {
-          this.addImportedModuleExports(exportName, scope, seen, moduleInfo)
-          continue
-        }
+      }
+      if (this.modules.has(exportName)) {
+        this.addImportedModuleExports(exportName, scope, seen, moduleInfo, visited)
+        continue
       }
 
       // It's a directive/pipe — look up its source module
@@ -281,6 +282,9 @@ export class NgModuleScopeCollector {
    *
    * Uses the `resolveAndRead` callback to locate the file, then parses it with
    * the same OXC parser to extract NgModule metadata. Results are cached.
+   *
+   * Handles re-export chains (e.g., Angular v21 splits FESM bundles into chunk
+   * files, and the entry point re-exports from chunks).
    */
   private resolveExternalModule(
     moduleName: string,
@@ -292,11 +296,29 @@ export class NgModuleScopeCollector {
     const specifier = importingModule.importSources[moduleName]
     if (!specifier) return
 
+    this.resolveAndParseSpecifier(specifier, moduleName)
+  }
+
+  /**
+   * Resolve a specifier to a file, parse it, and store the modules found.
+   * Follows re-export chains if the target module is re-exported from another file.
+   */
+  private resolveAndParseSpecifier(
+    specifier: string,
+    targetModuleName?: string,
+  ): void {
+    if (!this.resolveAndRead) return
+
     // Check cache — don't re-parse the same specifier
     if (this.resolvedModuleCache.has(specifier)) return
     this.resolvedModuleCache.set(specifier, true)
 
-    const resolved = this.resolveAndRead(specifier)
+    let resolved
+    try {
+      resolved = this.resolveAndRead(specifier)
+    } catch {
+      return
+    }
     if (!resolved) return
 
     const fileInfo = extractNgModuleInfoSync(resolved.source, resolved.filePath)
@@ -321,6 +343,50 @@ export class NgModuleScopeCollector {
       }
 
       this.modules.set(mod.className, info)
+    }
+
+    // If the target module wasn't found, follow re-export chains.
+    // Angular v21 splits FESM bundles into chunks:
+    //   common.mjs: export { CommonModule } from './_common_module-chunk.mjs'
+    // The re-exported source is captured in importSources by the Rust parser.
+    if (targetModuleName && !this.modules.has(targetModuleName)) {
+      const reExportSource = fileInfo.importSources[targetModuleName]
+      if (reExportSource && reExportSource.startsWith('.')) {
+        // Resolve the chunk file path relative to the entry point
+        const chunkPath = resolve(dirname(resolved.filePath), reExportSource)
+        // Try reading the chunk file directly (may need .mjs extension)
+        const candidates = chunkPath.match(/\.\w+$/)
+          ? [chunkPath]
+          : [chunkPath + '.mjs', chunkPath + '.js']
+
+        for (const candidate of candidates) {
+          if (this.resolvedModuleCache.has(candidate)) break
+          this.resolvedModuleCache.set(candidate, true)
+          try {
+            const chunkSource = readFileSync(candidate, 'utf-8')
+            const chunkInfo = extractNgModuleInfoSync(chunkSource, candidate)
+
+            for (const [className, kind] of Object.entries(chunkInfo.classKinds)) {
+              this.classKindsByName.set(className, kind)
+            }
+            for (const mod of chunkInfo.modules) {
+              if (this.modules.has(mod.className)) continue
+              this.modules.set(mod.className, {
+                className: mod.className,
+                declarations: mod.declarations,
+                imports: mod.imports,
+                exports: mod.exports,
+                filePath: candidate,
+                importSources: chunkInfo.importSources,
+                classKinds: chunkInfo.classKinds,
+              })
+            }
+            break // Successfully read and parsed
+          } catch {
+            continue // Try next candidate
+          }
+        }
+      }
     }
   }
 

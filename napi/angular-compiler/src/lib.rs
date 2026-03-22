@@ -1024,35 +1024,14 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                         _ => continue,
                     };
 
-                    match (prop_name, callee_name) {
-                        ("\u{0275}mod", "\u{0275}\u{0275}ngDeclareNgModule") => {
-                            if let Some(module_info) = extract_declare_ng_module_info(call) {
-                                referenced_identifiers
-                                    .extend(module_info.declarations.iter().cloned());
-                                referenced_identifiers
-                                    .extend(module_info.imports.iter().cloned());
-                                referenced_identifiers
-                                    .extend(module_info.exports.iter().cloned());
-                                modules.push(module_info);
-                            }
-                        }
-                        ("\u{0275}dir", "\u{0275}\u{0275}ngDeclareDirective") => {
-                            if let Some(type_name) = extract_declare_type_name(call) {
-                                class_kinds.insert(type_name, "directive".to_string());
-                            }
-                        }
-                        ("\u{0275}pipe", "\u{0275}\u{0275}ngDeclarePipe") => {
-                            if let Some(type_name) = extract_declare_type_name(call) {
-                                class_kinds.insert(type_name, "pipe".to_string());
-                            }
-                        }
-                        ("\u{0275}cmp", "\u{0275}\u{0275}ngDeclareComponent") => {
-                            if let Some(type_name) = extract_declare_type_name(call) {
-                                class_kinds.insert(type_name, "component".to_string());
-                            }
-                        }
-                        _ => {}
-                    }
+                    process_declare_call(
+                        prop_name,
+                        callee_name,
+                        call,
+                        &mut modules,
+                        &mut referenced_identifiers,
+                        &mut class_kinds,
+                    );
                 }
             }
         }
@@ -1073,39 +1052,14 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                             _ => continue,
                         };
 
-                        match (prop_name, callee_name) {
-                            ("\u{0275}mod", "\u{0275}\u{0275}ngDeclareNgModule") => {
-                                if let Some(module_info) =
-                                    extract_declare_ng_module_info(call)
-                                {
-                                    referenced_identifiers
-                                        .extend(module_info.declarations.iter().cloned());
-                                    referenced_identifiers
-                                        .extend(module_info.imports.iter().cloned());
-                                    referenced_identifiers
-                                        .extend(module_info.exports.iter().cloned());
-                                    modules.push(module_info);
-                                }
-                            }
-                            ("\u{0275}dir", "\u{0275}\u{0275}ngDeclareDirective") => {
-                                if let Some(type_name) = extract_declare_type_name(call) {
-                                    class_kinds
-                                        .insert(type_name, "directive".to_string());
-                                }
-                            }
-                            ("\u{0275}pipe", "\u{0275}\u{0275}ngDeclarePipe") => {
-                                if let Some(type_name) = extract_declare_type_name(call) {
-                                    class_kinds.insert(type_name, "pipe".to_string());
-                                }
-                            }
-                            ("\u{0275}cmp", "\u{0275}\u{0275}ngDeclareComponent") => {
-                                if let Some(type_name) = extract_declare_type_name(call) {
-                                    class_kinds
-                                        .insert(type_name, "component".to_string());
-                                }
-                            }
-                            _ => {}
-                        }
+                        process_declare_call(
+                            prop_name,
+                            callee_name,
+                            call,
+                            &mut modules,
+                            &mut referenced_identifiers,
+                            &mut class_kinds,
+                        );
                     }
                 }
             }
@@ -1123,6 +1077,23 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
         }
     }
 
+    // Also capture re-exports: `export { Foo, Bar } from './other-file'`
+    // This is needed to follow re-export chains (e.g., Angular v21 splits FESM
+    // bundles into chunk files, and the entry point re-exports from chunks).
+    for stmt in &program.body {
+        if let Statement::ExportNamedDeclaration(export) = stmt {
+            if let Some(source) = &export.source {
+                let source_module = source.value.to_string();
+                for specifier in &export.specifiers {
+                    let local_name = specifier.local.name().to_string();
+                    import_sources
+                        .entry(local_name)
+                        .or_insert(source_module.clone());
+                }
+            }
+        }
+    }
+
     FileNgModuleInfo {
         modules,
         import_sources,
@@ -1134,6 +1105,43 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
 ///
 /// Parses the `type`, `declarations`, `imports`, and `exports` properties from
 /// the object argument to build an `NgModuleExtractedInfo`.
+/// Process a ɵɵngDeclare* call, extracting module info or class kinds as appropriate.
+fn process_declare_call(
+    prop_name: &str,
+    callee_name: &str,
+    call: &oxc_ast::ast::CallExpression<'_>,
+    modules: &mut Vec<NgModuleExtractedInfo>,
+    referenced_identifiers: &mut Vec<String>,
+    class_kinds: &mut HashMap<String, String>,
+) {
+    match (prop_name, callee_name) {
+        ("\u{0275}mod", "\u{0275}\u{0275}ngDeclareNgModule") => {
+            if let Some(module_info) = extract_declare_ng_module_info(call) {
+                referenced_identifiers.extend(module_info.declarations.iter().cloned());
+                referenced_identifiers.extend(module_info.imports.iter().cloned());
+                referenced_identifiers.extend(module_info.exports.iter().cloned());
+                modules.push(module_info);
+            }
+        }
+        ("\u{0275}dir", "\u{0275}\u{0275}ngDeclareDirective") => {
+            if let Some(type_name) = extract_declare_type_name(call) {
+                class_kinds.insert(type_name, "directive".to_string());
+            }
+        }
+        ("\u{0275}pipe", "\u{0275}\u{0275}ngDeclarePipe") => {
+            if let Some(type_name) = extract_declare_type_name(call) {
+                class_kinds.insert(type_name, "pipe".to_string());
+            }
+        }
+        ("\u{0275}cmp", "\u{0275}\u{0275}ngDeclareComponent") => {
+            if let Some(type_name) = extract_declare_type_name(call) {
+                class_kinds.insert(type_name, "component".to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_declare_ng_module_info(
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Option<NgModuleExtractedInfo> {
