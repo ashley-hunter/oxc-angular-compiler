@@ -8,7 +8,7 @@
  * - Hot Module Replacement (HMR)
  */
 
-import { readFileSync, watch } from 'node:fs'
+import { readdirSync, readFileSync, watch } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { ServerResponse } from 'node:http'
 import { createRequire } from 'node:module'
@@ -245,6 +245,50 @@ export function angular(options: PluginOptions = {}): Plugin[] {
   }
 
   /**
+   * Pre-scan project files for @NgModule metadata.
+   *
+   * Vite processes files in dependency order: since NgModule files import
+   * their declared components, components are transformed BEFORE the module
+   * that declares them. Without pre-scanning, the NgModule scope is not yet
+   * available when the component is being compiled, causing it to fall back
+   * to runtime resolution (ɵɵgetComponentDepsFactory) which doesn't work in AOT.
+   *
+   * This function eagerly collects NgModule metadata from all project TypeScript
+   * files so the scope map is populated before any component transforms run.
+   */
+  function preCollectNgModules(dir: string, collector: NgModuleScopeCollector): void {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) {
+        continue
+      }
+      const fullPath = resolve(dir, entry.name)
+      if (entry.isDirectory()) {
+        preCollectNgModules(fullPath, collector)
+      } else if (
+        entry.name.endsWith('.ts') &&
+        !entry.name.endsWith('.d.ts') &&
+        !entry.name.endsWith('.spec.ts') &&
+        !entry.name.endsWith('.test.ts')
+      ) {
+        try {
+          const code = readFileSync(fullPath, 'utf-8')
+          if (code.includes('@NgModule')) {
+            collector.collectFromSource(code, fullPath)
+          }
+        } catch {
+          // File read error, skip
+        }
+      }
+    }
+  }
+
+  /**
    * Main Angular plugin for file transformation.
    */
   function angularPlugin(): Plugin {
@@ -269,6 +313,15 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       },
       configResolved(config) {
         resolvedConfig = config
+      },
+      buildStart() {
+        // Pre-scan project files for NgModule metadata so the scope map is
+        // populated before any component transforms run. Without this,
+        // components are transformed before their declaring NgModule is seen
+        // (because Vite processes dependencies before importers).
+        if (ngModuleScopeCollector) {
+          preCollectNgModules(workspaceRoot, ngModuleScopeCollector)
+        }
       },
       // Safety net: resolve @ng/component virtual modules in SSR context.
       // The browser serves these via HTTP middleware, but Vite's module runner
