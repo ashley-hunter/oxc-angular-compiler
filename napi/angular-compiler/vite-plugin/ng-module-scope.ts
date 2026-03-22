@@ -61,209 +61,14 @@ interface NgModuleInfo {
 }
 
 /**
- * Registry of well-known Angular modules and their exported directives/pipes.
+ * Callback to resolve and read a module file from node_modules.
  *
- * This provides the exports for standard Angular modules like CommonModule,
- * FormsModule, etc. without needing to parse the Angular source code.
+ * Given a module specifier (e.g., "@angular/common"), returns
+ * the file contents and resolved path, or undefined if not found.
  */
-const WELL_KNOWN_MODULES: Record<string, NgModuleScopeDep[]> = {
-  CommonModule: [
-    // Structural directives
-    { name: 'NgForOf', module: '@angular/common', kind: 'directive', selector: '[ngFor][ngForOf]' },
-    { name: 'NgIf', module: '@angular/common', kind: 'directive', selector: '[ngIf]' },
-    { name: 'NgSwitch', module: '@angular/common', kind: 'directive', selector: '[ngSwitch]' },
-    {
-      name: 'NgSwitchCase',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngSwitchCase]',
-    },
-    {
-      name: 'NgSwitchDefault',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngSwitchDefault]',
-    },
-    {
-      name: 'NgTemplateOutlet',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngTemplateOutlet]',
-    },
-    {
-      name: 'NgComponentOutlet',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngComponentOutlet]',
-    },
-    // Attribute directives
-    { name: 'NgClass', module: '@angular/common', kind: 'directive', selector: '[ngClass]' },
-    { name: 'NgStyle', module: '@angular/common', kind: 'directive', selector: '[ngStyle]' },
-    {
-      name: 'NgPlural',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngPlural]',
-    },
-    {
-      name: 'NgPluralCase',
-      module: '@angular/common',
-      kind: 'directive',
-      selector: '[ngPluralCase]',
-    },
-    // Pipes
-    { name: 'AsyncPipe', module: '@angular/common', kind: 'pipe', pipeName: 'async' },
-    { name: 'UpperCasePipe', module: '@angular/common', kind: 'pipe', pipeName: 'uppercase' },
-    { name: 'LowerCasePipe', module: '@angular/common', kind: 'pipe', pipeName: 'lowercase' },
-    { name: 'TitleCasePipe', module: '@angular/common', kind: 'pipe', pipeName: 'titlecase' },
-    { name: 'DatePipe', module: '@angular/common', kind: 'pipe', pipeName: 'date' },
-    { name: 'DecimalPipe', module: '@angular/common', kind: 'pipe', pipeName: 'number' },
-    { name: 'PercentPipe', module: '@angular/common', kind: 'pipe', pipeName: 'percent' },
-    { name: 'CurrencyPipe', module: '@angular/common', kind: 'pipe', pipeName: 'currency' },
-    { name: 'SlicePipe', module: '@angular/common', kind: 'pipe', pipeName: 'slice' },
-    { name: 'JsonPipe', module: '@angular/common', kind: 'pipe', pipeName: 'json' },
-    { name: 'KeyValuePipe', module: '@angular/common', kind: 'pipe', pipeName: 'keyvalue' },
-    {
-      name: 'I18nPluralPipe',
-      module: '@angular/common',
-      kind: 'pipe',
-      pipeName: 'i18nPlural',
-    },
-    {
-      name: 'I18nSelectPipe',
-      module: '@angular/common',
-      kind: 'pipe',
-      pipeName: 'i18nSelect',
-    },
-  ],
-  BrowserModule: [], // BrowserModule re-exports CommonModule
-  FormsModule: [
-    { name: 'NgModel', module: '@angular/forms', kind: 'directive', selector: '[ngModel]' },
-    { name: 'NgForm', module: '@angular/forms', kind: 'directive', selector: 'form:not([ngNoForm])' },
-    {
-      name: 'NgModelGroup',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[ngModelGroup]',
-    },
-    {
-      name: 'DefaultValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'input:not([type=checkbox])[formControlName]',
-    },
-    {
-      name: 'CheckboxControlValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'input[type=checkbox][formControlName]',
-    },
-    {
-      name: 'NumberValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'input[type=number][formControlName]',
-    },
-    {
-      name: 'SelectControlValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'select:not([multiple])[formControlName]',
-    },
-    {
-      name: 'SelectMultipleControlValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'select[multiple][formControlName]',
-    },
-    {
-      name: 'RadioControlValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'input[type=radio][formControlName]',
-    },
-    {
-      name: 'RangeValueAccessor',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: 'input[type=range][formControlName]',
-    },
-    {
-      name: 'RequiredValidator',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[required][formControlName]',
-    },
-    {
-      name: 'MinLengthValidator',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[minlength][formControlName]',
-    },
-    {
-      name: 'MaxLengthValidator',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[maxlength][formControlName]',
-    },
-    {
-      name: 'PatternValidator',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[pattern][formControlName]',
-    },
-  ],
-  ReactiveFormsModule: [
-    {
-      name: 'FormControlDirective',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[formControl]',
-    },
-    {
-      name: 'FormControlName',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[formControlName]',
-    },
-    {
-      name: 'FormGroupDirective',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[formGroup]',
-    },
-    {
-      name: 'FormGroupName',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[formGroupName]',
-    },
-    {
-      name: 'FormArrayName',
-      module: '@angular/forms',
-      kind: 'directive',
-      selector: '[formArrayName]',
-    },
-  ],
-  RouterModule: [
-    {
-      name: 'RouterOutlet',
-      module: '@angular/router',
-      kind: 'directive',
-      selector: 'router-outlet',
-    },
-    { name: 'RouterLink', module: '@angular/router', kind: 'directive', selector: '[routerLink]' },
-    {
-      name: 'RouterLinkActive',
-      module: '@angular/router',
-      kind: 'directive',
-      selector: '[routerLinkActive]',
-    },
-  ],
-}
-
-// BrowserModule re-exports CommonModule
-WELL_KNOWN_MODULES['BrowserModule'] = [...WELL_KNOWN_MODULES['CommonModule']]
+export type ResolveAndReadFn = (
+  specifier: string,
+) => { source: string; filePath: string } | undefined
 
 /**
  * NgModule scope collector.
@@ -273,6 +78,9 @@ WELL_KNOWN_MODULES['BrowserModule'] = [...WELL_KNOWN_MODULES['CommonModule']]
  *
  * Uses OXC's Rust-based parser via NAPI for robust TypeScript parsing,
  * correctly handling nested objects, complex expressions, and all TS syntax.
+ *
+ * Dynamically resolves imported modules (including Angular built-ins and
+ * third-party libraries) by parsing their actual source files from node_modules.
  */
 export class NgModuleScopeCollector {
   /** Map of NgModule class name → NgModuleInfo */
@@ -283,6 +91,11 @@ export class NgModuleScopeCollector {
 
   /** Map of class name → Angular decorator kind ("pipe", "directive", "component"), accumulated across all files */
   private classKindsByName = new Map<string, string>()
+
+  /** Cache of resolved module specifiers to avoid re-parsing */
+  private resolvedModuleCache = new Map<string, boolean>()
+
+  constructor(private resolveAndRead?: ResolveAndReadFn) {}
 
   /**
    * Parse a TypeScript file and extract any @NgModule metadata.
@@ -394,7 +207,7 @@ export class NgModuleScopeCollector {
 
     // Add exports from imported modules
     for (const importName of moduleInfo.imports) {
-      this.addImportedModuleExports(importName, scope, seen)
+      this.addImportedModuleExports(importName, scope, seen, moduleInfo)
     }
 
     return scope
@@ -402,25 +215,26 @@ export class NgModuleScopeCollector {
 
   /**
    * Add the exported directives/pipes from an imported module to the scope.
+   *
+   * For user-defined modules, uses the already-collected metadata.
+   * For external modules (e.g., @angular/common), dynamically resolves and
+   * parses the actual source file from node_modules.
    */
   private addImportedModuleExports(
     moduleName: string,
     scope: NgModuleScopeDep[],
     seen: Set<string>,
+    importingModule: NgModuleInfo,
   ): void {
-    // Check well-known modules first
-    const wellKnown = WELL_KNOWN_MODULES[moduleName]
-    if (wellKnown) {
-      for (const dep of wellKnown) {
-        if (seen.has(dep.name)) continue
-        seen.add(dep.name)
-        scope.push(dep)
-      }
-      return
+    // Check user-defined modules first
+    let moduleInfo = this.modules.get(moduleName)
+
+    // If not found, try to resolve from node_modules
+    if (!moduleInfo) {
+      this.resolveExternalModule(moduleName, importingModule)
+      moduleInfo = this.modules.get(moduleName)
     }
 
-    // Check user-defined modules
-    const moduleInfo = this.modules.get(moduleName)
     if (!moduleInfo) return
 
     // A module's exports are what it makes available to importers
@@ -428,9 +242,18 @@ export class NgModuleScopeCollector {
       if (seen.has(exportName)) continue
 
       // Check if the export is a module itself (re-export pattern)
-      if (this.modules.has(exportName) || WELL_KNOWN_MODULES[exportName]) {
-        this.addImportedModuleExports(exportName, scope, seen)
+      if (this.modules.has(exportName)) {
+        this.addImportedModuleExports(exportName, scope, seen, moduleInfo)
         continue
+      }
+
+      // Try to resolve the export as an external module if we haven't seen it
+      if (!this.modules.has(exportName)) {
+        this.resolveExternalModule(exportName, moduleInfo)
+        if (this.modules.has(exportName)) {
+          this.addImportedModuleExports(exportName, scope, seen, moduleInfo)
+          continue
+        }
       }
 
       // It's a directive/pipe — look up its source module
@@ -441,9 +264,63 @@ export class NgModuleScopeCollector {
         // Imported from another file — use the import source
         scope.push({ name: exportName, module: sourceModule, kind })
       } else {
-        // Defined locally in the module's file — use the file path as source
-        scope.push({ name: exportName, module: moduleInfo.filePath, kind })
+        // Defined locally in the module's file — use the original package specifier
+        // Look up how the importing module imported this module to get the npm specifier
+        const specifier = importingModule.importSources[moduleName]
+        if (specifier) {
+          scope.push({ name: exportName, module: specifier, kind })
+        } else {
+          scope.push({ name: exportName, module: moduleInfo.filePath, kind })
+        }
       }
+    }
+  }
+
+  /**
+   * Resolve an external module by reading and parsing its source from node_modules.
+   *
+   * Uses the `resolveAndRead` callback to locate the file, then parses it with
+   * the same OXC parser to extract NgModule metadata. Results are cached.
+   */
+  private resolveExternalModule(
+    moduleName: string,
+    importingModule: NgModuleInfo,
+  ): void {
+    if (!this.resolveAndRead) return
+
+    // Look up the npm specifier for this module name
+    const specifier = importingModule.importSources[moduleName]
+    if (!specifier) return
+
+    // Check cache — don't re-parse the same specifier
+    if (this.resolvedModuleCache.has(specifier)) return
+    this.resolvedModuleCache.set(specifier, true)
+
+    const resolved = this.resolveAndRead(specifier)
+    if (!resolved) return
+
+    const fileInfo = extractNgModuleInfoSync(resolved.source, resolved.filePath)
+
+    // Accumulate class kinds from the resolved file
+    for (const [className, kind] of Object.entries(fileInfo.classKinds)) {
+      this.classKindsByName.set(className, kind)
+    }
+
+    // Store all modules found in the resolved file
+    for (const mod of fileInfo.modules) {
+      if (this.modules.has(mod.className)) continue
+
+      const info: NgModuleInfo = {
+        className: mod.className,
+        declarations: mod.declarations,
+        imports: mod.imports,
+        exports: mod.exports,
+        filePath: resolved.filePath,
+        importSources: fileInfo.importSources,
+        classKinds: fileInfo.classKinds,
+      }
+
+      this.modules.set(mod.className, info)
     }
   }
 
@@ -463,5 +340,6 @@ export class NgModuleScopeCollector {
     this.modules.clear()
     this.declarationToModule.clear()
     this.classKindsByName.clear()
+    this.resolvedModuleCache.clear()
   }
 }

@@ -403,6 +403,9 @@ export interface ExtractedQueryMetadata {
  * correctly handling nested objects, complex expressions, and all
  * TypeScript syntax.
  *
+ * Handles both source-level `@NgModule({...})` decorators and compiled
+ * Angular output (`ɵɵngDeclareNgModule`, `ɵɵngDeclareDirective`, etc.).
+ *
  * Returns the NgModule metadata plus an import source map that tracks
  * where each referenced identifier was imported from.
  */

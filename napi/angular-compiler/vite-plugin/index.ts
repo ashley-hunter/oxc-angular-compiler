@@ -8,9 +8,10 @@
  * - Hot Module Replacement (HMR)
  */
 
-import { watch } from 'node:fs'
+import { readFileSync, watch } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { ServerResponse } from 'node:http'
+import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 
 import { createDebug } from 'obug'
@@ -140,8 +141,19 @@ export function angular(options: PluginOptions = {}): Plugin[] {
   // Track component files with pending HMR updates (set by fs.watch, checked by HMR endpoint)
   const pendingHmrUpdates = new Set<string>()
 
-  // NgModule scope collector for compile-time dependency resolution
-  const ngModuleScopeCollector = new NgModuleScopeCollector()
+  // NgModule scope collector for compile-time dependency resolution.
+  // The resolveAndRead callback resolves module specifiers (e.g., "@angular/common")
+  // to their actual file paths in node_modules and reads the source.
+  const require_ = createRequire(resolve(workspaceRoot, 'package.json'))
+  const ngModuleScopeCollector = new NgModuleScopeCollector((specifier) => {
+    try {
+      const filePath = require_.resolve(specifier)
+      const source = readFileSync(filePath, 'utf-8')
+      return { source, filePath }
+    } catch {
+      return undefined
+    }
+  })
 
   /**
    * Resolve external template/style URLs and read their contents.

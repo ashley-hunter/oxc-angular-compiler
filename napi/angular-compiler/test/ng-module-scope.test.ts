@@ -1,11 +1,109 @@
 import { describe, it, expect } from 'vitest'
 import { NgModuleScopeCollector } from '../vite-plugin/ng-module-scope.js'
+import type { ResolveAndReadFn } from '../vite-plugin/ng-module-scope.js'
 import { extractNgModuleInfoSync } from '#binding'
+
+/**
+ * Mock compiled Angular module sources for testing.
+ *
+ * These simulate the fesm2022 output format that Angular ships in node_modules,
+ * using `ɵɵngDeclareNgModule`, `ɵɵngDeclareDirective`, and `ɵɵngDeclarePipe`.
+ */
+const MOCK_MODULES: Record<string, string> = {
+  '@angular/common': `
+    import * as i0 from "@angular/core";
+    class NgForOf { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgForOf, selector: "[ngFor][ngForOf]" }); }
+    class NgIf { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgIf, selector: "[ngIf]" }); }
+    class NgSwitch { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgSwitch, selector: "[ngSwitch]" }); }
+    class NgSwitchCase { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgSwitchCase, selector: "[ngSwitchCase]" }); }
+    class NgSwitchDefault { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgSwitchDefault, selector: "[ngSwitchDefault]" }); }
+    class NgTemplateOutlet { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgTemplateOutlet, selector: "[ngTemplateOutlet]" }); }
+    class NgComponentOutlet { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgComponentOutlet, selector: "[ngComponentOutlet]" }); }
+    class NgClass { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgClass, selector: "[ngClass]" }); }
+    class NgStyle { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgStyle, selector: "[ngStyle]" }); }
+    class NgPlural { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgPlural, selector: "[ngPlural]" }); }
+    class NgPluralCase { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgPluralCase, selector: "[ngPluralCase]" }); }
+    class AsyncPipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: AsyncPipe, name: "async" }); }
+    class UpperCasePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: UpperCasePipe, name: "uppercase" }); }
+    class LowerCasePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: LowerCasePipe, name: "lowercase" }); }
+    class DatePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: DatePipe, name: "date" }); }
+    class JsonPipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: JsonPipe, name: "json" }); }
+    class SlicePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: SlicePipe, name: "slice" }); }
+    class KeyValuePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: KeyValuePipe, name: "keyvalue" }); }
+    class CommonModule {
+      static ɵmod = i0.ɵɵngDeclareNgModule({
+        type: CommonModule,
+        imports: [NgForOf, NgIf, NgSwitch, NgSwitchCase, NgSwitchDefault, NgTemplateOutlet, NgComponentOutlet, NgClass, NgStyle, NgPlural, NgPluralCase, AsyncPipe, UpperCasePipe, LowerCasePipe, DatePipe, JsonPipe, SlicePipe, KeyValuePipe],
+        exports: [NgForOf, NgIf, NgSwitch, NgSwitchCase, NgSwitchDefault, NgTemplateOutlet, NgComponentOutlet, NgClass, NgStyle, NgPlural, NgPluralCase, AsyncPipe, UpperCasePipe, LowerCasePipe, DatePipe, JsonPipe, SlicePipe, KeyValuePipe]
+      });
+    }
+  `,
+  '@angular/platform-browser': `
+    import * as i0 from "@angular/core";
+    import { CommonModule } from "@angular/common";
+    import { ApplicationModule } from "@angular/core";
+    class BrowserModule {
+      static ɵmod = i0.ɵɵngDeclareNgModule({
+        type: BrowserModule,
+        exports: [CommonModule, ApplicationModule]
+      });
+    }
+  `,
+  '@angular/router': `
+    import * as i0 from "@angular/core";
+    class RouterOutlet { static ɵdir = i0.ɵɵngDeclareDirective({ type: RouterOutlet, selector: "router-outlet" }); }
+    class RouterLink { static ɵdir = i0.ɵɵngDeclareDirective({ type: RouterLink, selector: "[routerLink]" }); }
+    class RouterLinkActive { static ɵdir = i0.ɵɵngDeclareDirective({ type: RouterLinkActive, selector: "[routerLinkActive]" }); }
+    class RouterModule {
+      static ɵmod = i0.ɵɵngDeclareNgModule({
+        type: RouterModule,
+        imports: [RouterOutlet, RouterLink, RouterLinkActive],
+        exports: [RouterOutlet, RouterLink, RouterLinkActive]
+      });
+    }
+  `,
+  '@angular/forms': `
+    import * as i0 from "@angular/core";
+    class NgModel { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgModel, selector: "[ngModel]" }); }
+    class NgForm { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgForm, selector: "form:not([ngNoForm])" }); }
+    class NgModelGroup { static ɵdir = i0.ɵɵngDeclareDirective({ type: NgModelGroup, selector: "[ngModelGroup]" }); }
+    class FormsModule {
+      static ɵmod = i0.ɵɵngDeclareNgModule({
+        type: FormsModule,
+        declarations: [NgModel, NgModelGroup, NgForm],
+        exports: [NgModel, NgModelGroup, NgForm]
+      });
+    }
+    class FormControlDirective { static ɵdir = i0.ɵɵngDeclareDirective({ type: FormControlDirective, selector: "[formControl]" }); }
+    class FormControlName { static ɵdir = i0.ɵɵngDeclareDirective({ type: FormControlName, selector: "[formControlName]" }); }
+    class FormGroupDirective { static ɵdir = i0.ɵɵngDeclareDirective({ type: FormGroupDirective, selector: "[formGroup]" }); }
+    class FormGroupName { static ɵdir = i0.ɵɵngDeclareDirective({ type: FormGroupName, selector: "[formGroupName]" }); }
+    class FormArrayName { static ɵdir = i0.ɵɵngDeclareDirective({ type: FormArrayName, selector: "[formArrayName]" }); }
+    class ReactiveFormsModule {
+      static ɵmod = i0.ɵɵngDeclareNgModule({
+        type: ReactiveFormsModule,
+        declarations: [FormControlDirective, FormControlName, FormGroupDirective, FormGroupName, FormArrayName],
+        exports: [FormControlDirective, FormControlName, FormGroupDirective, FormGroupName, FormArrayName]
+      });
+    }
+  `,
+}
+
+/**
+ * Create a mock resolveAndRead function for tests.
+ */
+function createMockResolver(): ResolveAndReadFn {
+  return (specifier: string) => {
+    const source = MOCK_MODULES[specifier]
+    if (!source) return undefined
+    return { source, filePath: `/node_modules/${specifier}/fesm2022/index.mjs` }
+  }
+}
 
 describe('NgModuleScopeCollector', () => {
   describe('collectFromSource', () => {
     it('should extract NgModule declarations and imports', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
@@ -35,10 +133,13 @@ describe('NgModuleScopeCollector', () => {
     })
 
     it('should handle Module.forRoot() imports', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+        import { RouterModule } from '@angular/router';
+
         @NgModule({
           declarations: [AppComponent],
           imports: [CommonModule, RouterModule.forRoot(routes)]
@@ -73,10 +174,13 @@ describe('NgModuleScopeCollector', () => {
     })
 
     it('should handle multiple NgModules in one file', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+        import { RouterModule } from '@angular/router';
+
         @NgModule({
           declarations: [CompA],
           imports: [CommonModule]
@@ -111,11 +215,13 @@ describe('NgModuleScopeCollector', () => {
     })
 
     it('should collect across multiple files', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       // File 1: just the module
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+
         @NgModule({
           declarations: [MyComponent],
           imports: [CommonModule]
@@ -145,10 +251,12 @@ describe('NgModuleScopeCollector', () => {
     })
 
     it('should handle BrowserModule (re-exports CommonModule)', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { BrowserModule } from '@angular/platform-browser';
+
         @NgModule({
           declarations: [AppComponent],
           imports: [BrowserModule]
@@ -168,11 +276,13 @@ describe('NgModuleScopeCollector', () => {
       expect(names).toContain('UpperCasePipe')
     })
 
-    it('should include pipe metadata', () => {
-      const collector = new NgModuleScopeCollector()
+    it('should detect pipe kind from resolved modules', () => {
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+
         @NgModule({
           declarations: [MyComponent],
           imports: [CommonModule]
@@ -187,15 +297,16 @@ describe('NgModuleScopeCollector', () => {
 
       expect(upperCasePipe).toBeDefined()
       expect(upperCasePipe!.kind).toBe('pipe')
-      expect(upperCasePipe!.pipeName).toBe('uppercase')
       expect(upperCasePipe!.module).toBe('@angular/common')
     })
 
-    it('should include directive metadata with selectors', () => {
-      const collector = new NgModuleScopeCollector()
+    it('should detect directive kind from resolved modules', () => {
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+
         @NgModule({
           declarations: [MyComponent],
           imports: [CommonModule]
@@ -210,17 +321,18 @@ describe('NgModuleScopeCollector', () => {
 
       expect(ngForOf).toBeDefined()
       expect(ngForOf!.kind).toBe('directive')
-      expect(ngForOf!.selector).toBe('[ngFor][ngForOf]')
       expect(ngForOf!.module).toBe('@angular/common')
     })
   })
 
   describe('buildScopeMap', () => {
     it('should return a map of all component scopes', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+
         @NgModule({
           declarations: [CompA, CompB],
           imports: [CommonModule]
@@ -242,10 +354,12 @@ describe('NgModuleScopeCollector', () => {
 
   describe('clear', () => {
     it('should clear all collected data', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
+        import { CommonModule } from '@angular/common';
+
         @NgModule({ declarations: [Comp], imports: [CommonModule] })
         export class Mod {}
         `,
@@ -261,7 +375,7 @@ describe('NgModuleScopeCollector', () => {
 
   describe('nested braces handling', () => {
     it('should handle NgModule with providers containing nested objects', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
@@ -289,7 +403,7 @@ describe('NgModuleScopeCollector', () => {
 
   describe('sibling declarations', () => {
     it('should include imported sibling declarations in scope', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       collector.collectFromSource(
         `
@@ -402,14 +516,14 @@ describe('NgModuleScopeCollector', () => {
 
       const highlight = scope!.find((d) => d.name === 'HighlightDirective')
       expect(highlight).toBeDefined()
-      // Locally defined — falls back to file path as source
-      expect(highlight!.module).toBe('shared.module.ts')
+      // Locally defined in SharedModule — uses the import specifier from AppModule
+      expect(highlight!.module).toBe('./shared.module')
     })
   })
 
   describe('HMR re-parse cleanup', () => {
     it('should remove stale declarations when a module is re-parsed', () => {
-      const collector = new NgModuleScopeCollector()
+      const collector = new NgModuleScopeCollector(createMockResolver())
 
       // Initial parse: module with two declarations
       collector.collectFromSource(
@@ -541,6 +655,154 @@ describe('NgModuleScopeCollector', () => {
       expect(formatPipe!.kind).toBe('pipe')
     })
   })
+
+  describe('dynamic module resolution', () => {
+    it('should resolve third-party modules dynamically', () => {
+      const collector = new NgModuleScopeCollector((specifier) => {
+        if (specifier === 'ngx-translate') {
+          return {
+            source: `
+              import * as i0 from "@angular/core";
+              class TranslatePipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: TranslatePipe, name: "translate" }); }
+              class TranslateDirective { static ɵdir = i0.ɵɵngDeclareDirective({ type: TranslateDirective, selector: "[translate]" }); }
+              class TranslateModule {
+                static ɵmod = i0.ɵɵngDeclareNgModule({
+                  type: TranslateModule,
+                  declarations: [TranslatePipe, TranslateDirective],
+                  exports: [TranslatePipe, TranslateDirective]
+                });
+              }
+            `,
+            filePath: '/node_modules/ngx-translate/fesm2022/index.mjs',
+          }
+        }
+        return undefined
+      })
+
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { TranslateModule } from 'ngx-translate';
+
+        @NgModule({
+          declarations: [AppComponent],
+          imports: [TranslateModule]
+        })
+        export class AppModule {}
+        `,
+        'app.module.ts',
+      )
+
+      const scope = collector.getScopeForComponent('AppComponent')
+      expect(scope).toBeDefined()
+
+      const names = scope!.map((d) => d.name)
+      expect(names).toContain('TranslatePipe')
+      expect(names).toContain('TranslateDirective')
+
+      const pipe = scope!.find((d) => d.name === 'TranslatePipe')
+      expect(pipe!.kind).toBe('pipe')
+
+      const directive = scope!.find((d) => d.name === 'TranslateDirective')
+      expect(directive!.kind).toBe('directive')
+    })
+
+    it('should cache resolved modules', () => {
+      let resolveCount = 0
+      const collector = new NgModuleScopeCollector((specifier) => {
+        if (specifier === '@angular/common') {
+          resolveCount++
+          return {
+            source: MOCK_MODULES['@angular/common'],
+            filePath: '/node_modules/@angular/common/fesm2022/index.mjs',
+          }
+        }
+        return undefined
+      })
+
+      // Parse two modules both importing CommonModule
+      collector.collectFromSource(
+        `
+        import { CommonModule } from '@angular/common';
+        @NgModule({ declarations: [CompA], imports: [CommonModule] })
+        export class ModA {}
+        `,
+        'mod-a.ts',
+      )
+
+      collector.collectFromSource(
+        `
+        import { CommonModule } from '@angular/common';
+        @NgModule({ declarations: [CompB], imports: [CommonModule] })
+        export class ModB {}
+        `,
+        'mod-b.ts',
+      )
+
+      // Build scope for both — should only resolve @angular/common once
+      collector.buildScopeMap()
+      expect(resolveCount).toBe(1)
+    })
+
+    it('should handle external assignment pattern (older Angular)', () => {
+      const info = extractNgModuleInfoSync(
+        `
+        import * as i0 from "@angular/core";
+        class MyComponent {}
+        class MyModule {}
+        MyModule.ɵmod = i0.ɵɵngDeclareNgModule({
+          type: MyModule,
+          declarations: [MyComponent],
+          exports: [MyComponent]
+        });
+        `,
+        'test.mjs',
+      )
+
+      expect(info.modules).toHaveLength(1)
+      expect(info.modules[0].className).toBe('MyModule')
+      expect(info.modules[0].declarations).toEqual(['MyComponent'])
+      expect(info.modules[0].exports).toEqual(['MyComponent'])
+    })
+
+    it('should detect class kinds from ɵɵngDeclare* calls', () => {
+      const info = extractNgModuleInfoSync(
+        `
+        import * as i0 from "@angular/core";
+        class MyDirective { static ɵdir = i0.ɵɵngDeclareDirective({ type: MyDirective, selector: "[my]" }); }
+        class MyPipe { static ɵpipe = i0.ɵɵngDeclarePipe({ type: MyPipe, name: "my" }); }
+        class MyComponent { static ɵcmp = i0.ɵɵngDeclareComponent({ type: MyComponent }); }
+        `,
+        'test.mjs',
+      )
+
+      expect(info.classKinds['MyDirective']).toBe('directive')
+      expect(info.classKinds['MyPipe']).toBe('pipe')
+      expect(info.classKinds['MyComponent']).toBe('component')
+    })
+
+    it('should work without resolveAndRead callback', () => {
+      const collector = new NgModuleScopeCollector()
+
+      collector.collectFromSource(
+        `
+        @NgModule({
+          declarations: [AppComponent],
+          imports: [CommonModule]
+        })
+        export class AppModule {}
+        `,
+        'app.module.ts',
+      )
+
+      // Without resolveAndRead, CommonModule won't be resolved
+      // but the collector should still work without errors
+      const scope = collector.getScopeForComponent('AppComponent')
+      expect(scope).toBeDefined()
+      // No CommonModule exports since it can't be resolved
+      expect(scope!.length).toBe(0)
+    })
+  })
 })
 
 describe('extractNgModuleInfoSync', () => {
@@ -656,5 +918,29 @@ describe('extractNgModuleInfoSync', () => {
     expect(info.modules[0].imports).toContain('RouterModule')
     expect(info.modules[0].imports).toContain('LazyModule')
     expect(info.modules[0].containsForwardDecls).toBe(true)
+  })
+
+  it('should extract from ɵɵngDeclareNgModule static fields', () => {
+    const info = extractNgModuleInfoSync(
+      `
+      import * as i0 from "@angular/core";
+      class NgForOf {}
+      class NgIf {}
+      class AsyncPipe {}
+      class CommonModule {
+        static ɵmod = i0.ɵɵngDeclareNgModule({
+          type: CommonModule,
+          imports: [NgForOf, NgIf, AsyncPipe],
+          exports: [NgForOf, NgIf, AsyncPipe]
+        });
+      }
+      `,
+      'common.mjs',
+    )
+
+    expect(info.modules).toHaveLength(1)
+    expect(info.modules[0].className).toBe('CommonModule')
+    expect(info.modules[0].imports).toEqual(['NgForOf', 'NgIf', 'AsyncPipe'])
+    expect(info.modules[0].exports).toEqual(['NgForOf', 'NgIf', 'AsyncPipe'])
   })
 })

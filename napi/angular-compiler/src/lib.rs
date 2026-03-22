@@ -898,12 +898,17 @@ pub struct FileNgModuleInfo {
 /// correctly handling nested objects, complex expressions, and all
 /// TypeScript syntax.
 ///
+/// Handles both source-level `@NgModule({...})` decorators and compiled
+/// Angular output (`ɵɵngDeclareNgModule`, `ɵɵngDeclareDirective`, etc.).
+///
 /// Returns the NgModule metadata plus an import source map that tracks
 /// where each referenced identifier was imported from.
 #[napi]
 pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgModuleInfo {
     use oxc_angular_compiler::{build_import_map, extract_ng_module_metadata};
-    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Expression, Statement};
+    use oxc_ast::ast::{
+        ClassElement, Declaration, ExportDefaultDeclarationKind, Expression, PropertyKey, Statement,
+    };
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
@@ -972,7 +977,7 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                 }
             }
 
-            // Extract NgModule metadata
+            // Extract NgModule metadata from @NgModule decorator
             if let Some(metadata) = extract_ng_module_metadata(&allocator, class) {
                 let declarations: Vec<String> =
                     metadata.declarations.iter().map(|a| a.to_string()).collect();
@@ -994,6 +999,116 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                     contains_forward_decls: metadata.contains_forward_decls,
                 });
             }
+
+            // Also check for compiled Angular output: static ɵmod/ɵdir/ɵpipe/ɵcmp fields
+            for element in &class.body.body {
+                if let ClassElement::PropertyDefinition(prop_def) = element {
+                    if !prop_def.r#static {
+                        continue;
+                    }
+                    let prop_name = match &prop_def.key {
+                        PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+                        _ => continue,
+                    };
+                    let Some(init) = &prop_def.value else {
+                        continue;
+                    };
+                    let Expression::CallExpression(call) = init else {
+                        continue;
+                    };
+                    let callee_name = match &call.callee {
+                        Expression::StaticMemberExpression(member) => {
+                            member.property.name.as_str()
+                        }
+                        Expression::Identifier(id) => id.name.as_str(),
+                        _ => continue,
+                    };
+
+                    match (prop_name, callee_name) {
+                        ("\u{0275}mod", "\u{0275}\u{0275}ngDeclareNgModule") => {
+                            if let Some(module_info) = extract_declare_ng_module_info(call) {
+                                referenced_identifiers
+                                    .extend(module_info.declarations.iter().cloned());
+                                referenced_identifiers
+                                    .extend(module_info.imports.iter().cloned());
+                                referenced_identifiers
+                                    .extend(module_info.exports.iter().cloned());
+                                modules.push(module_info);
+                            }
+                        }
+                        ("\u{0275}dir", "\u{0275}\u{0275}ngDeclareDirective") => {
+                            if let Some(type_name) = extract_declare_type_name(call) {
+                                class_kinds.insert(type_name, "directive".to_string());
+                            }
+                        }
+                        ("\u{0275}pipe", "\u{0275}\u{0275}ngDeclarePipe") => {
+                            if let Some(type_name) = extract_declare_type_name(call) {
+                                class_kinds.insert(type_name, "pipe".to_string());
+                            }
+                        }
+                        ("\u{0275}cmp", "\u{0275}\u{0275}ngDeclareComponent") => {
+                            if let Some(type_name) = extract_declare_type_name(call) {
+                                class_kinds.insert(type_name, "component".to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Also handle external assignment pattern: ClassName.ɵmod = i0.ɵɵngDeclareNgModule({...})
+        if let Statement::ExpressionStatement(expr_stmt) = stmt {
+            if let Expression::AssignmentExpression(assign) = &expr_stmt.expression {
+                if let oxc_ast::ast::AssignmentTarget::StaticMemberExpression(static_member) =
+                    &assign.left
+                {
+                    let prop_name = static_member.property.name.as_str();
+                    if let Expression::CallExpression(call) = &assign.right {
+                        let callee_name = match &call.callee {
+                            Expression::StaticMemberExpression(m) => {
+                                m.property.name.as_str()
+                            }
+                            Expression::Identifier(id) => id.name.as_str(),
+                            _ => continue,
+                        };
+
+                        match (prop_name, callee_name) {
+                            ("\u{0275}mod", "\u{0275}\u{0275}ngDeclareNgModule") => {
+                                if let Some(module_info) =
+                                    extract_declare_ng_module_info(call)
+                                {
+                                    referenced_identifiers
+                                        .extend(module_info.declarations.iter().cloned());
+                                    referenced_identifiers
+                                        .extend(module_info.imports.iter().cloned());
+                                    referenced_identifiers
+                                        .extend(module_info.exports.iter().cloned());
+                                    modules.push(module_info);
+                                }
+                            }
+                            ("\u{0275}dir", "\u{0275}\u{0275}ngDeclareDirective") => {
+                                if let Some(type_name) = extract_declare_type_name(call) {
+                                    class_kinds
+                                        .insert(type_name, "directive".to_string());
+                                }
+                            }
+                            ("\u{0275}pipe", "\u{0275}\u{0275}ngDeclarePipe") => {
+                                if let Some(type_name) = extract_declare_type_name(call) {
+                                    class_kinds.insert(type_name, "pipe".to_string());
+                                }
+                            }
+                            ("\u{0275}cmp", "\u{0275}\u{0275}ngDeclareComponent") => {
+                                if let Some(type_name) = extract_declare_type_name(call) {
+                                    class_kinds
+                                        .insert(type_name, "component".to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1013,6 +1128,164 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
         import_sources,
         class_kinds,
     }
+}
+
+/// Extract NgModule metadata from a `ɵɵngDeclareNgModule({...})` call expression.
+///
+/// Parses the `type`, `declarations`, `imports`, and `exports` properties from
+/// the object argument to build an `NgModuleExtractedInfo`.
+fn extract_declare_ng_module_info(
+    call: &oxc_ast::ast::CallExpression<'_>,
+) -> Option<NgModuleExtractedInfo> {
+    use oxc_ast::ast::{Argument, Expression, ObjectPropertyKind, PropertyKey};
+
+    let arg = call.arguments.first()?;
+    let obj = match arg {
+        Argument::ObjectExpression(obj) => obj,
+        _ => return None,
+    };
+
+    let mut class_name = String::new();
+    let mut declarations = Vec::new();
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+            let key_name = match &prop.key {
+                PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+                _ => continue,
+            };
+
+            match key_name {
+                "type" => {
+                    if let Expression::Identifier(id) = &prop.value {
+                        class_name = id.name.to_string();
+                    }
+                }
+                "declarations" | "imports" | "exports" => {
+                    let identifiers =
+                        extract_identifiers_from_declare_array(&prop.value);
+                    match key_name {
+                        "declarations" => declarations = identifiers,
+                        "imports" => imports = identifiers,
+                        "exports" => exports = identifiers,
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if class_name.is_empty() {
+        return None;
+    }
+
+    Some(NgModuleExtractedInfo {
+        class_name,
+        declarations,
+        imports,
+        exports,
+        contains_forward_decls: false,
+    })
+}
+
+/// Extract identifier names from an array expression, handling both direct arrays
+/// and function-wrapped arrays (forward declarations).
+///
+/// Handles: `[A, B, C]`, `function() { return [A, B, C]; }`, `() => [A, B, C]`
+fn extract_identifiers_from_declare_array(expr: &oxc_ast::ast::Expression<'_>) -> Vec<String> {
+    use oxc_ast::ast::{Expression, Statement};
+
+    // Try direct array first
+    if let Some(identifiers) = extract_identifiers_from_array_expr(expr) {
+        return identifiers;
+    }
+
+    // Try function() { return [...]; }
+    if let Expression::FunctionExpression(func) = expr {
+        if let Some(body) = &func.body {
+            for stmt in &body.statements {
+                if let Statement::ReturnStatement(ret) = stmt {
+                    if let Some(arg) = &ret.argument {
+                        if let Some(identifiers) = extract_identifiers_from_array_expr(arg) {
+                            return identifiers;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try () => [...]
+    if let Expression::ArrowFunctionExpression(arrow) = expr {
+        if arrow.expression {
+            if let Some(stmt) = arrow.body.statements.first() {
+                if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                    if let Some(identifiers) =
+                        extract_identifiers_from_array_expr(&expr_stmt.expression)
+                    {
+                        return identifiers;
+                    }
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Extract identifier names from an array expression like `[A, B, C]`.
+fn extract_identifiers_from_array_expr(
+    expr: &oxc_ast::ast::Expression<'_>,
+) -> Option<Vec<String>> {
+    use oxc_ast::ast::{ArrayExpressionElement, Expression};
+
+    let Expression::ArrayExpression(arr) = expr else {
+        return None;
+    };
+
+    let mut result = Vec::new();
+    for element in &arr.elements {
+        match element {
+            ArrayExpressionElement::Identifier(id) => {
+                result.push(id.name.to_string());
+            }
+            // Handle Module.forRoot(...) pattern — extract base class name
+            ArrayExpressionElement::CallExpression(call) => {
+                if let Expression::StaticMemberExpression(member) = &call.callee {
+                    if let Expression::Identifier(id) = &member.object {
+                        result.push(id.name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(result)
+}
+
+/// Extract the `type` property value (class name) from a `ɵɵngDeclare*({type: ClassName})` call.
+fn extract_declare_type_name(call: &oxc_ast::ast::CallExpression<'_>) -> Option<String> {
+    use oxc_ast::ast::{Argument, Expression, ObjectPropertyKind, PropertyKey};
+
+    let arg = call.arguments.first()?;
+    let obj = match arg {
+        Argument::ObjectExpression(obj) => obj,
+        _ => return None,
+    };
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+            if matches!(&prop.key, PropertyKey::StaticIdentifier(id) if id.name == "type") {
+                if let Expression::Identifier(id) = &prop.value {
+                    return Some(id.name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Top-level declarations extracted from a TypeScript file for HMR.
