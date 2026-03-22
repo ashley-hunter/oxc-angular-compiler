@@ -8,6 +8,18 @@
  * This enables the OXC Angular compiler to emit compile-time resolved
  * `dependencies: [NgForOf, UpperCasePipe]` instead of runtime-resolved
  * `ɵɵgetComponentDepsFactory(Component)`.
+ *
+ * Design choice: We emit ALL directives/pipes visible in the NgModule scope
+ * without template selector matching ("full scope" / Option B). Trade-offs:
+ *
+ * - Pro: Always correct — over-inclusion is safe (Angular ignores non-matching deps)
+ * - Pro: No need to reimplement Angular's selector matching (complex, error-prone)
+ * - Pro: Matches Angular's local compilation mode behavior for standalone components
+ * - Con: Slightly larger output — unused deps appear in the dependency array
+ * - Con: No compile-time tree-shaking of unused directives/pipes
+ *
+ * The runtime cost is negligible: Angular simply skips directives whose selectors
+ * don't match any template element.
  */
 
 import { readFile } from 'node:fs/promises'

@@ -181,6 +181,13 @@ pub struct TransformOptions {
     /// NgModule's compilation scope. When provided, the compiler emits compile-time
     /// resolved `dependencies: [...]` instead of `ɵɵgetComponentDepsFactory()`.
     ///
+    /// This uses a "full scope" strategy (Option B): all directives/pipes visible in
+    /// the NgModule scope are emitted as dependencies, without template selector matching.
+    /// This trades slightly larger output for correctness guarantees — over-inclusion is
+    /// always safe (Angular's runtime ignores non-matching directives), while
+    /// under-inclusion from selector matching bugs would cause runtime failures.
+    /// This matches Angular's own local compilation mode behavior for standalone components.
+    ///
     /// This is populated by the build tool (e.g., Vite plugin) which has cross-file
     /// visibility to resolve NgModule scopes.
     pub ng_module_scope: Option<HashMap<String, Vec<NgModuleScopeDep>>>,
@@ -649,6 +656,11 @@ fn resolve_host_directive_namespaces<'a>(
 /// and sets the emit mode to `Direct` so that dependencies are emitted inline
 /// (`dependencies: [i1.NgForOf, i1.UpperCasePipe]`) instead of using runtime resolution
 /// (`ɵɵgetComponentDepsFactory(Component)`).
+///
+/// Note: This emits ALL deps from the NgModule scope without template selector matching.
+/// Over-inclusion is safe — Angular's runtime ignores directives whose selectors don't
+/// match any template element. This avoids the complexity and correctness risks of
+/// reimplementing Angular's template selector matching in a single-file compiler.
 fn apply_ng_module_scope<'a>(
     allocator: &'a Allocator,
     metadata: &mut ComponentMetadata<'a>,
