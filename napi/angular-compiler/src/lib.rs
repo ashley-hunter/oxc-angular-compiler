@@ -885,6 +885,11 @@ pub struct FileNgModuleInfo {
     /// Only includes identifiers that appear in NgModule declarations,
     /// imports, or exports arrays.
     pub import_sources: HashMap<String, String>,
+    /// Angular decorator kinds for classes in this file.
+    ///
+    /// Maps class name → kind string ("pipe", "directive", or "component").
+    /// Used to correctly classify declarations when building NgModule scope.
+    pub class_kinds: HashMap<String, String>,
 }
 
 /// Extract @NgModule metadata from all classes in a TypeScript file.
@@ -898,7 +903,7 @@ pub struct FileNgModuleInfo {
 #[napi]
 pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgModuleInfo {
     use oxc_angular_compiler::{build_import_map, extract_ng_module_metadata};
-    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
+    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Expression, Statement};
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
@@ -913,8 +918,9 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
 
     let mut modules = Vec::new();
     let mut referenced_identifiers = Vec::new();
+    let mut class_kinds = HashMap::new();
 
-    // Walk statements looking for class declarations with @NgModule
+    // Walk statements looking for class declarations
     for stmt in &program.body {
         let class = match stmt {
             Statement::ClassDeclaration(class) => Some(class.as_ref()),
@@ -930,6 +936,43 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
         };
 
         if let Some(class) = class {
+            // Detect Angular decorator kind by checking decorator names.
+            // Single pass: just inspect decorator callee names.
+            if let Some(id) = &class.id {
+                for decorator in &class.decorators {
+                    let name = match &decorator.expression {
+                        Expression::CallExpression(call) => match &call.callee {
+                            Expression::Identifier(id) => Some(id.name.as_str()),
+                            Expression::StaticMemberExpression(m) => {
+                                Some(m.property.name.as_str())
+                            }
+                            _ => None,
+                        },
+                        Expression::Identifier(id) => Some(id.name.as_str()),
+                        _ => None,
+                    };
+                    match name {
+                        Some("Pipe") => {
+                            class_kinds
+                                .insert(id.name.to_string(), "pipe".to_string());
+                            break;
+                        }
+                        Some("Component") => {
+                            class_kinds
+                                .insert(id.name.to_string(), "component".to_string());
+                            break;
+                        }
+                        Some("Directive") => {
+                            class_kinds
+                                .insert(id.name.to_string(), "directive".to_string());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Extract NgModule metadata
             if let Some(metadata) = extract_ng_module_metadata(&allocator, class) {
                 let declarations: Vec<String> =
                     metadata.declarations.iter().map(|a| a.to_string()).collect();
@@ -968,6 +1011,7 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
     FileNgModuleInfo {
         modules,
         import_sources,
+        class_kinds,
     }
 }
 

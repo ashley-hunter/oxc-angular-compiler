@@ -56,6 +56,8 @@ interface NgModuleInfo {
   filePath: string
   /** Import source map: identifier name → source module path */
   importSources: Record<string, string>
+  /** Angular decorator kinds for classes in the NgModule's file: class name → "pipe" | "directive" | "component" */
+  classKinds: Record<string, string>
 }
 
 /**
@@ -279,6 +281,9 @@ export class NgModuleScopeCollector {
   /** Map of component/directive/pipe class name → declaring NgModule class name */
   private declarationToModule = new Map<string, string>()
 
+  /** Map of class name → Angular decorator kind ("pipe", "directive", "component"), accumulated across all files */
+  private classKindsByName = new Map<string, string>()
+
   /**
    * Parse a TypeScript file and extract any @NgModule metadata.
    *
@@ -286,7 +291,24 @@ export class NgModuleScopeCollector {
    * handles nested braces, complex expressions, and all TypeScript syntax.
    */
   collectFromSource(source: string, filePath: string): void {
+    // Remove stale data from any previous parse of this file.
+    // This is critical for HMR: if a declaration was removed from a module,
+    // the old declarationToModule mapping must be cleaned up.
+    for (const [moduleName, moduleInfo] of this.modules) {
+      if (moduleInfo.filePath === filePath) {
+        for (const decl of moduleInfo.declarations) {
+          this.declarationToModule.delete(decl)
+        }
+        this.modules.delete(moduleName)
+      }
+    }
+
     const fileInfo = extractNgModuleInfoSync(source, filePath)
+
+    // Accumulate class decorator kinds across all files
+    for (const [className, kind] of Object.entries(fileInfo.classKinds)) {
+      this.classKindsByName.set(className, kind)
+    }
 
     for (const mod of fileInfo.modules) {
       const info: NgModuleInfo = {
@@ -296,6 +318,7 @@ export class NgModuleScopeCollector {
         exports: mod.exports,
         filePath,
         importSources: fileInfo.importSources,
+        classKinds: fileInfo.classKinds,
       }
 
       this.modules.set(mod.className, info)
@@ -364,7 +387,7 @@ export class NgModuleScopeCollector {
         scope.push({
           name: decl,
           module: sourceModule,
-          kind: 'directive',
+          kind: this.getClassKind(decl),
         })
       }
     }
@@ -412,15 +435,25 @@ export class NgModuleScopeCollector {
 
       // It's a directive/pipe — look up its source module
       seen.add(exportName)
+      const kind = this.getClassKind(exportName)
       const sourceModule = moduleInfo.importSources[exportName]
       if (sourceModule) {
         // Imported from another file — use the import source
-        scope.push({ name: exportName, module: sourceModule, kind: 'directive' })
+        scope.push({ name: exportName, module: sourceModule, kind })
       } else {
         // Defined locally in the module's file — use the file path as source
-        scope.push({ name: exportName, module: moduleInfo.filePath, kind: 'directive' })
+        scope.push({ name: exportName, module: moduleInfo.filePath, kind })
       }
     }
+  }
+
+  /**
+   * Look up the Angular decorator kind for a class name.
+   * Returns "pipe", "directive", or "component" if known from a previously parsed file,
+   * otherwise defaults to "directive" (safe — Angular resolves at runtime from ɵdir/ɵpipe).
+   */
+  private getClassKind(className: string): string {
+    return this.classKindsByName.get(className) === 'pipe' ? 'pipe' : 'directive'
   }
 
   /**
@@ -429,5 +462,6 @@ export class NgModuleScopeCollector {
   clear(): void {
     this.modules.clear()
     this.declarationToModule.clear()
+    this.classKindsByName.clear()
   }
 }

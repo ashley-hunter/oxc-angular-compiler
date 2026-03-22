@@ -468,6 +468,13 @@ export interface FileNgModuleInfo {
    * imports, or exports arrays.
    */
   importSources: Record<string, string>
+  /**
+   * Angular decorator kinds for classes in this file.
+   *
+   * Maps class name → kind string ("pipe", "directive", or "component").
+   * Used to correctly classify declarations when building NgModule scope.
+   */
+  classKinds: Record<string, string>
 }
 
 /**

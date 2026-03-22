@@ -406,6 +406,141 @@ describe('NgModuleScopeCollector', () => {
       expect(highlight!.module).toBe('shared.module.ts')
     })
   })
+
+  describe('HMR re-parse cleanup', () => {
+    it('should remove stale declarations when a module is re-parsed', () => {
+      const collector = new NgModuleScopeCollector()
+
+      // Initial parse: module with two declarations
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { CommonModule } from '@angular/common';
+
+        @NgModule({
+          declarations: [CompA, CompB],
+          imports: [CommonModule]
+        })
+        export class MyModule {}
+        `,
+        'my.module.ts',
+      )
+
+      expect(collector.getScopeForComponent('CompA')).toBeDefined()
+      expect(collector.getScopeForComponent('CompB')).toBeDefined()
+
+      // Re-parse: CompB removed from declarations
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { CommonModule } from '@angular/common';
+
+        @NgModule({
+          declarations: [CompA],
+          imports: [CommonModule]
+        })
+        export class MyModule {}
+        `,
+        'my.module.ts',
+      )
+
+      expect(collector.getScopeForComponent('CompA')).toBeDefined()
+      expect(collector.getScopeForComponent('CompB')).toBeUndefined()
+    })
+  })
+
+  describe('pipe kind detection', () => {
+    it('should detect pipes and set correct kind for same-file declarations', () => {
+      const collector = new NgModuleScopeCollector()
+
+      // File with a pipe
+      collector.collectFromSource(
+        `
+        import { Pipe, PipeTransform } from '@angular/core';
+
+        @Pipe({ name: 'myPipe' })
+        export class MyPipe implements PipeTransform {
+          transform(value: string): string { return value; }
+        }
+        `,
+        'my.pipe.ts',
+      )
+
+      // Module that imports and declares the pipe
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { MyPipe } from './my.pipe';
+
+        @NgModule({
+          declarations: [MyComponent, MyPipe],
+          exports: [MyPipe]
+        })
+        export class SharedModule {}
+        `,
+        'shared.module.ts',
+      )
+
+      // Another module importing SharedModule
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { SharedModule } from './shared.module';
+
+        @NgModule({
+          declarations: [AppComponent],
+          imports: [SharedModule]
+        })
+        export class AppModule {}
+        `,
+        'app.module.ts',
+      )
+
+      const scope = collector.getScopeForComponent('AppComponent')
+      expect(scope).toBeDefined()
+
+      const myPipe = scope!.find((d) => d.name === 'MyPipe')
+      expect(myPipe).toBeDefined()
+      expect(myPipe!.kind).toBe('pipe')
+    })
+
+    it('should detect pipes in sibling declarations', () => {
+      const collector = new NgModuleScopeCollector()
+
+      // File with a pipe
+      collector.collectFromSource(
+        `
+        import { Pipe } from '@angular/core';
+
+        @Pipe({ name: 'format' })
+        export class FormatPipe {}
+        `,
+        'format.pipe.ts',
+      )
+
+      // Module with pipe as sibling declaration
+      collector.collectFromSource(
+        `
+        import { NgModule } from '@angular/core';
+        import { FormatPipe } from './format.pipe';
+
+        @NgModule({
+          declarations: [MyComponent, FormatPipe],
+          imports: []
+        })
+        export class MyModule {}
+        `,
+        'my.module.ts',
+      )
+
+      const scope = collector.getScopeForComponent('MyComponent')
+      expect(scope).toBeDefined()
+
+      const formatPipe = scope!.find((d) => d.name === 'FormatPipe')
+      expect(formatPipe).toBeDefined()
+      expect(formatPipe!.kind).toBe('pipe')
+    })
+  })
 })
 
 describe('extractNgModuleInfoSync', () => {
@@ -476,6 +611,31 @@ describe('extractNgModuleInfoSync', () => {
 
     expect(info.importSources['CommonModule']).toBe('@angular/common')
     expect(info.importSources['MyDirective']).toBe('./my.directive')
+  })
+
+  it('should detect class decorator kinds', () => {
+    const info = extractNgModuleInfoSync(
+      `
+      import { Component, Directive, Pipe, NgModule } from '@angular/core';
+
+      @Component({ selector: 'app-root', template: '' })
+      export class AppComponent {}
+
+      @Directive({ selector: '[highlight]' })
+      export class HighlightDirective {}
+
+      @Pipe({ name: 'format' })
+      export class FormatPipe {}
+
+      @NgModule({ declarations: [AppComponent, HighlightDirective, FormatPipe] })
+      export class AppModule {}
+      `,
+      'app.module.ts',
+    )
+
+    expect(info.classKinds['AppComponent']).toBe('component')
+    expect(info.classKinds['HighlightDirective']).toBe('directive')
+    expect(info.classKinds['FormatPipe']).toBe('pipe')
   })
 
   it('should handle forwardRef and Module.forRoot', () => {
