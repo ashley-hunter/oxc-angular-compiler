@@ -10,7 +10,7 @@
  * `ɵɵgetComponentDepsFactory(Component)`.
  *
  * Design choice: We emit ALL directives/pipes visible in the NgModule scope
- * without template selector matching ("full scope" / Option B). Trade-offs:
+ * without template selector matching. Trade-offs:
  *
  * - Pro: Always correct — over-inclusion is safe (Angular ignores non-matching deps)
  * - Pro: No need to reimplement Angular's selector matching (complex, error-prone)
