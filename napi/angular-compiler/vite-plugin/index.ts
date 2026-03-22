@@ -85,6 +85,25 @@ export interface PluginOptions {
    */
   angularVersion?: AngularVersion
 
+  /**
+   * Enable NgModule interop for non-standalone components.
+   *
+   * When enabled, the compiler resolves NgModule scopes at compile time and
+   * emits static `dependencies: [...]` arrays for components declared in
+   * NgModules. Without this, components use runtime resolution via
+   * `ɵɵgetComponentDepsFactory()`.
+   *
+   * **Trade-off:** Enabling this prevents tree-shaking of unused directives
+   * and pipes within NgModule scopes, since all scope members are statically
+   * imported regardless of template usage.
+   *
+   * Only needed for projects that use NgModule-declared (non-standalone)
+   * components. Standalone-only projects can leave this off.
+   *
+   * @default false
+   */
+  ngModuleInterop?: boolean
+
   /** Optional callback to transform template content before compilation. Applied during both initial build and HMR. */
   templateTransform?: (content: string, filePath: string) => string
 }
@@ -142,18 +161,21 @@ export function angular(options: PluginOptions = {}): Plugin[] {
   const pendingHmrUpdates = new Set<string>()
 
   // NgModule scope collector for compile-time dependency resolution.
-  // The resolveAndRead callback resolves module specifiers (e.g., "@angular/common")
-  // to their actual file paths in node_modules and reads the source.
-  const require_ = createRequire(resolve(workspaceRoot, 'package.json'))
-  const ngModuleScopeCollector = new NgModuleScopeCollector((specifier) => {
-    try {
-      const filePath = require_.resolve(specifier)
-      const source = readFileSync(filePath, 'utf-8')
-      return { source, filePath }
-    } catch {
-      return undefined
-    }
-  })
+  // Only created when ngModuleInterop is enabled — otherwise non-standalone
+  // components fall back to runtime resolution via ɵɵgetComponentDepsFactory().
+  let ngModuleScopeCollector: NgModuleScopeCollector | undefined
+  if (options.ngModuleInterop) {
+    const require_ = createRequire(resolve(workspaceRoot, 'package.json'))
+    ngModuleScopeCollector = new NgModuleScopeCollector((specifier) => {
+      try {
+        const filePath = require_.resolve(specifier)
+        const source = readFileSync(filePath, 'utf-8')
+        return { source, filePath }
+      } catch {
+        return undefined
+      }
+    })
+  }
 
   /**
    * Resolve external template/style URLs and read their contents.
@@ -517,13 +539,13 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             }
           }
 
-          // Collect NgModule metadata from this file for scope resolution.
-          // This runs on every TypeScript file to build up the cross-file
-          // NgModule → declarations mapping needed for dependency resolution.
-          ngModuleScopeCollector.collectFromSource(code, actualId)
-
-          // Build the scope map for any non-standalone components in this file
-          const scopeMap = ngModuleScopeCollector.buildScopeMap()
+          // When ngModuleInterop is enabled, collect NgModule metadata from
+          // this file and build the scope map for dependency resolution.
+          let scopeMap: ReturnType<NgModuleScopeCollector['buildScopeMap']> | undefined
+          if (ngModuleScopeCollector) {
+            ngModuleScopeCollector.collectFromSource(code, actualId)
+            scopeMap = ngModuleScopeCollector.buildScopeMap()
+          }
 
           // Transform with Rust compiler
           const transformOptions: TransformOptions = {
@@ -532,7 +554,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             hmr: pluginOptions.liveReload && watchMode && !isSSR,
             angularVersion: pluginOptions.angularVersion,
             // Pass NgModule scope for non-standalone component dependency resolution
-            ...(scopeMap.size > 0 && {
+            ...(scopeMap && scopeMap.size > 0 && {
               ngModuleScope: Object.fromEntries(scopeMap),
             }),
           }
