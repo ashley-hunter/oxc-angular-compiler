@@ -200,6 +200,14 @@ pub struct TransformOptions {
     /// and provide the actual file paths here.
     #[napi(ts_type = "Map<string, string>")]
     pub resolved_imports: Option<HashMap<String, String>>,
+
+    /// NgModule scope for non-standalone components in this file.
+    ///
+    /// Maps component class name to an array of available dependencies from the
+    /// NgModule's compilation scope. When provided, the compiler emits compile-time
+    /// resolved `dependencies: [...]` instead of `ɵɵgetComponentDepsFactory()`.
+    #[napi(ts_type = "Map<string, Array<NgModuleScopeDep>>")]
+    pub ng_module_scope: Option<HashMap<String, Vec<NgModuleScopeDep>>>,
 }
 
 impl From<TransformOptions> for RustTransformOptions {
@@ -231,6 +239,15 @@ impl From<TransformOptions> for RustTransformOptions {
             resolved_imports: options.resolved_imports,
             // Class metadata for TestBed support
             emit_class_metadata: options.emit_class_metadata.unwrap_or(false),
+            // NgModule scope for non-standalone components
+            ng_module_scope: options.ng_module_scope.map(|scope| {
+                scope
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (k, v.into_iter().map(Into::into).collect())
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -255,6 +272,37 @@ fn parse_change_detection_strategy(s: &str) -> Option<RustChangeDetectionStrateg
         "Default" => Some(RustChangeDetectionStrategy::Default),
         "OnPush" => Some(RustChangeDetectionStrategy::OnPush),
         _ => None,
+    }
+}
+
+/// A dependency from an NgModule's compilation scope.
+///
+/// Represents a directive or pipe that is visible to components declared
+/// in the NgModule (from the module's declarations and imported modules' exports).
+#[derive(Default, Clone)]
+#[napi(object)]
+pub struct NgModuleScopeDep {
+    /// The class name (e.g., "NgForOf", "UpperCasePipe").
+    pub name: String,
+    /// The module path (e.g., "@angular/common").
+    pub module: String,
+    /// The kind: "directive" or "pipe".
+    pub kind: String,
+    /// CSS selector for directives (e.g., "[ngFor][ngForOf]").
+    pub selector: Option<String>,
+    /// Pipe name for pipes (e.g., "uppercase").
+    pub pipe_name: Option<String>,
+}
+
+impl From<NgModuleScopeDep> for oxc_angular_compiler::NgModuleScopeDep {
+    fn from(dep: NgModuleScopeDep) -> Self {
+        Self {
+            name: dep.name,
+            module: dep.module,
+            kind: dep.kind,
+            selector: dep.selector,
+            pipe_name: dep.pipe_name,
+        }
     }
 }
 

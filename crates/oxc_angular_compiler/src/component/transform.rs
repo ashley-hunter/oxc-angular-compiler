@@ -174,6 +174,34 @@ pub struct TransformOptions {
     ///
     /// Default: false (metadata is dev-only and usually stripped in production)
     pub emit_class_metadata: bool,
+
+    /// NgModule scope for non-standalone components.
+    ///
+    /// Maps component class name to an array of available dependencies from the
+    /// NgModule's compilation scope. When provided, the compiler emits compile-time
+    /// resolved `dependencies: [...]` instead of `ɵɵgetComponentDepsFactory()`.
+    ///
+    /// This is populated by the build tool (e.g., Vite plugin) which has cross-file
+    /// visibility to resolve NgModule scopes.
+    pub ng_module_scope: Option<HashMap<String, Vec<NgModuleScopeDep>>>,
+}
+
+/// A dependency from an NgModule's compilation scope.
+///
+/// Represents a directive or pipe that is visible to components declared
+/// in the NgModule (from the module's declarations and imported modules' exports).
+#[derive(Debug, Clone)]
+pub struct NgModuleScopeDep {
+    /// The class name (e.g., "NgForOf", "UpperCasePipe").
+    pub name: String,
+    /// The module path (e.g., "@angular/common").
+    pub module: String,
+    /// The kind: "directive" or "pipe".
+    pub kind: String,
+    /// CSS selector for directives (e.g., "[ngFor][ngForOf]").
+    pub selector: Option<String>,
+    /// Pipe name for pipes (e.g., "uppercase").
+    pub pipe_name: Option<String>,
 }
 
 /// Input for host metadata when passed via TransformOptions.
@@ -223,6 +251,8 @@ impl Default for TransformOptions {
             resolved_imports: None,
             // Class metadata for TestBed support (disabled by default)
             emit_class_metadata: false,
+            // NgModule scope (not provided by default)
+            ng_module_scope: None,
         }
     }
 }
@@ -610,6 +640,56 @@ fn resolve_host_directive_namespaces<'a>(
             },
             allocator,
         ));
+    }
+}
+
+/// Apply NgModule scope data to a non-standalone component's metadata.
+///
+/// Converts the provided `NgModuleScopeDep` entries into `TemplateDependency` entries
+/// and sets the emit mode to `Direct` so that dependencies are emitted inline
+/// (`dependencies: [i1.NgForOf, i1.UpperCasePipe]`) instead of using runtime resolution
+/// (`ɵɵgetComponentDepsFactory(Component)`).
+fn apply_ng_module_scope<'a>(
+    allocator: &'a Allocator,
+    metadata: &mut ComponentMetadata<'a>,
+    scope_deps: &[NgModuleScopeDep],
+    namespace_registry: &mut NamespaceRegistry<'a>,
+) {
+    use super::metadata::{DeclarationListEmitMode, TemplateDependency};
+
+    // Switch from RuntimeResolved to Direct mode
+    metadata.declaration_list_emit_mode = DeclarationListEmitMode::Direct;
+
+    // Clear any existing declarations and populate from scope
+    metadata.declarations = oxc_allocator::Vec::with_capacity_in(scope_deps.len(), allocator);
+
+    for dep in scope_deps {
+        let type_name: Atom<'a> = Atom::from(allocator.alloc_str(&dep.name) as &str);
+        let source_module: Atom<'a> = Atom::from(allocator.alloc_str(&dep.module) as &str);
+
+        // Register the source module in the namespace registry
+        // so it gets a proper namespace alias (i1, i2, etc.)
+        namespace_registry.get_or_assign(&source_module);
+
+        let template_dep = match dep.kind.as_str() {
+            "pipe" => {
+                let pipe_name_str = dep.pipe_name.as_deref().unwrap_or(&dep.name);
+                let pipe_name: Atom<'a> =
+                    Atom::from(allocator.alloc_str(pipe_name_str) as &str);
+                TemplateDependency::pipe(allocator, type_name, pipe_name)
+                    .with_source_module(source_module)
+            }
+            _ => {
+                // "directive" or any other kind — treat as directive
+                let selector_str = dep.selector.as_deref().unwrap_or("*");
+                let selector: Atom<'a> =
+                    Atom::from(allocator.alloc_str(selector_str) as &str);
+                TemplateDependency::directive(allocator, type_name, selector, false)
+                    .with_source_module(source_module)
+            }
+        };
+
+        metadata.declarations.push(template_dep);
     }
 }
 
@@ -1561,6 +1641,22 @@ pub fn transform_angular_file(
             if let Some(mut metadata) =
                 extract_component_metadata(allocator, class, implicit_standalone, &import_map)
             {
+                // 2.5. Apply NgModule scope for non-standalone components.
+                // When the build tool provides resolved NgModule scope data,
+                // use compile-time dependency resolution instead of runtime resolution.
+                if !metadata.standalone {
+                    if let Some(ref scope_map) = options.ng_module_scope {
+                        if let Some(scope_deps) = scope_map.get(metadata.class_name.as_str()) {
+                            apply_ng_module_scope(
+                                allocator,
+                                &mut metadata,
+                                scope_deps,
+                                &mut file_namespace_registry,
+                            );
+                        }
+                    }
+                }
+
                 // 3. Resolve external styles and merge into metadata
                 resolve_styles(allocator, &mut metadata, resolved_resources);
 
@@ -1981,6 +2077,17 @@ pub fn transform_angular_file(
                             &import_map,
                             &mut file_namespace_registry,
                         );
+                    }
+
+                    // When ng_module_scope is provided, emit minimal ɵmod
+                    // (just {type: Module}) without declarations/imports/exports,
+                    // since those were consumed at compile time for dependency resolution.
+                    if options.ng_module_scope.is_some() {
+                        ng_module_metadata.declarations =
+                            oxc_allocator::Vec::new_in(allocator);
+                        ng_module_metadata.imports = oxc_allocator::Vec::new_in(allocator);
+                        ng_module_metadata.exports = oxc_allocator::Vec::new_in(allocator);
+                        ng_module_metadata.bootstrap = oxc_allocator::Vec::new_in(allocator);
                     }
 
                     // Compile NgModule and generate all definitions as external property assignments
@@ -5869,6 +5976,231 @@ export class UnityTooltipTrigger {}
                 !features.contains("BrnTooltipTrigger")
                     || features.contains("i1.BrnTooltipTrigger"),
                 "Features should NOT contain bare BrnTooltipTrigger reference, but got:\n{}",
+                result.code
+            );
+        }
+    }
+
+    // =========================================================================
+    // NgModule scope resolution tests
+    // =========================================================================
+
+    #[test]
+    fn test_non_standalone_component_with_ng_module_scope_gets_direct_deps() {
+        // When ng_module_scope provides resolved dependencies for a non-standalone component,
+        // the output should use dependencies: [...] instead of ɵɵgetComponentDepsFactory().
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-user-list',
+    standalone: false,
+    template: `
+        <div *ngFor="let user of users">
+            {{ user.name | uppercase }}
+        </div>
+    `
+})
+export class UserListComponent {
+    users = [{ name: 'Alice' }, { name: 'Bob' }];
+}
+"#;
+
+        let mut options = TransformOptions::default();
+        let mut scope_map = HashMap::new();
+        scope_map.insert(
+            "UserListComponent".to_string(),
+            vec![
+                NgModuleScopeDep {
+                    name: "NgForOf".to_string(),
+                    module: "@angular/common".to_string(),
+                    kind: "directive".to_string(),
+                    selector: Some("[ngFor][ngForOf]".to_string()),
+                    pipe_name: None,
+                },
+                NgModuleScopeDep {
+                    name: "UpperCasePipe".to_string(),
+                    module: "@angular/common".to_string(),
+                    kind: "pipe".to_string(),
+                    selector: None,
+                    pipe_name: Some("uppercase".to_string()),
+                },
+            ],
+        );
+        options.ng_module_scope = Some(scope_map);
+
+        let result = transform_angular_file(
+            &allocator,
+            "user-list.component.ts",
+            source,
+            &options,
+            None,
+        );
+
+        // Should NOT use runtime dependency resolution
+        assert!(
+            !result.code.contains("ɵɵgetComponentDepsFactory"),
+            "Should NOT contain ɵɵgetComponentDepsFactory, but got:\n{}",
+            result.code
+        );
+
+        // Should have inline dependencies array with namespace-prefixed references
+        assert!(
+            result.code.contains("NgForOf"),
+            "Should contain NgForOf dependency, but got:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("UpperCasePipe"),
+            "Should contain UpperCasePipe dependency, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_same_file_ng_module_component_resolves_scope() {
+        // When an NgModule and its declared non-standalone component are in the same file,
+        // the compiler should resolve the NgModule's imports as the component's dependencies.
+        let allocator = Allocator::default();
+        let source = r#"
+import { NgModule, Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Component({
+    selector: 'app-user-list',
+    standalone: false,
+    template: `
+        <div *ngFor="let user of users">
+            {{ user.name | uppercase }}
+        </div>
+    `
+})
+export class UserListComponent {
+    users = [{ name: 'Alice' }, { name: 'Bob' }];
+}
+
+@NgModule({
+    declarations: [UserListComponent],
+    imports: [CommonModule],
+    exports: [UserListComponent]
+})
+export class UsersModule {}
+"#;
+
+        let mut options = TransformOptions::default();
+        // Provide the scope for CommonModule's exports so the compiler
+        // knows what directives/pipes are available
+        let mut scope_map = HashMap::new();
+        scope_map.insert(
+            "UserListComponent".to_string(),
+            vec![
+                NgModuleScopeDep {
+                    name: "NgForOf".to_string(),
+                    module: "@angular/common".to_string(),
+                    kind: "directive".to_string(),
+                    selector: Some("[ngFor][ngForOf]".to_string()),
+                    pipe_name: None,
+                },
+                NgModuleScopeDep {
+                    name: "NgIf".to_string(),
+                    module: "@angular/common".to_string(),
+                    kind: "directive".to_string(),
+                    selector: Some("[ngIf]".to_string()),
+                    pipe_name: None,
+                },
+                NgModuleScopeDep {
+                    name: "UpperCasePipe".to_string(),
+                    module: "@angular/common".to_string(),
+                    kind: "pipe".to_string(),
+                    selector: None,
+                    pipe_name: Some("uppercase".to_string()),
+                },
+            ],
+        );
+        options.ng_module_scope = Some(scope_map);
+
+        let result = transform_angular_file(
+            &allocator,
+            "users.module.ts",
+            source,
+            &options,
+            None,
+        );
+
+        // Component should NOT use runtime dependency resolution
+        assert!(
+            !result.code.contains("ɵɵgetComponentDepsFactory"),
+            "Should NOT contain ɵɵgetComponentDepsFactory, but got:\n{}",
+            result.code
+        );
+
+        // Component should have compile-time resolved dependencies
+        assert!(
+            result.code.contains("NgForOf"),
+            "Should contain NgForOf dependency, but got:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("UpperCasePipe"),
+            "Should contain UpperCasePipe dependency, but got:\n{}",
+            result.code
+        );
+
+        // NgModule should still have ɵmod
+        assert!(
+            result.code.contains("ɵɵdefineNgModule"),
+            "Should contain ɵɵdefineNgModule, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_ng_module_scope_emits_minimal_mod_definition() {
+        // When ng_module_scope is provided, the NgModule ɵmod should be minimal:
+        // just ɵɵdefineNgModule({type: Module}) without declarations/imports/exports
+        // since those were consumed at compile time.
+        let allocator = Allocator::default();
+        let source = r#"
+import { NgModule, Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@Component({
+    selector: 'app-test',
+    standalone: false,
+    template: '<div>hello</div>'
+})
+export class TestComponent {}
+
+@NgModule({
+    declarations: [TestComponent],
+    imports: [CommonModule],
+    exports: [TestComponent]
+})
+export class TestModule {}
+"#;
+
+        let mut options = TransformOptions::default();
+        let mut scope_map = HashMap::new();
+        scope_map.insert("TestComponent".to_string(), vec![]);
+        options.ng_module_scope = Some(scope_map);
+
+        let result = transform_angular_file(
+            &allocator,
+            "test.module.ts",
+            source,
+            &options,
+            None,
+        );
+
+        // The ɵmod definition should NOT contain declarations, imports, or exports
+        // because those were resolved at compile time
+        let mod_section = result.code.split("ɵɵdefineNgModule(").nth(1)
+            .and_then(|s| s.split(")").next());
+        if let Some(mod_body) = mod_section {
+            assert!(
+                !mod_body.contains("declarations"),
+                "ɵɵdefineNgModule should NOT contain declarations when scope is resolved, but got:\n{}",
                 result.code
             );
         }

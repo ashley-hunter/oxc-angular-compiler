@@ -35,6 +35,7 @@ import { buildOptimizerPlugin } from './angular-build-optimizer-plugin.js'
 import { jitPlugin } from './angular-jit-plugin.js'
 import { angularLinkerPlugin } from './angular-linker-plugin.js'
 import { ssrManifestPlugin } from './angular-ssr-manifest-plugin.js'
+import { NgModuleScopeCollector } from './ng-module-scope.js'
 
 /**
  * Plugin options for the Angular Vite plugin.
@@ -138,6 +139,9 @@ export function angular(options: PluginOptions = {}): Plugin[] {
 
   // Track component files with pending HMR updates (set by fs.watch, checked by HMR endpoint)
   const pendingHmrUpdates = new Set<string>()
+
+  // NgModule scope collector for compile-time dependency resolution
+  const ngModuleScopeCollector = new NgModuleScopeCollector()
 
   /**
    * Resolve external template/style URLs and read their contents.
@@ -501,12 +505,33 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             }
           }
 
+          // Collect NgModule metadata from this file for scope resolution.
+          // This runs on every TypeScript file to build up the cross-file
+          // NgModule → declarations mapping needed for dependency resolution.
+          ngModuleScopeCollector.collectFromSource(code, actualId)
+
+          // Build the scope map for any non-standalone components in this file
+          const scopeMap = ngModuleScopeCollector.buildScopeMap()
+
           // Transform with Rust compiler
           const transformOptions: TransformOptions = {
             sourcemap: pluginOptions.sourceMap,
             jit: pluginOptions.jit,
             hmr: pluginOptions.liveReload && watchMode && !isSSR,
             angularVersion: pluginOptions.angularVersion,
+            // Pass NgModule scope for non-standalone component dependency resolution
+            ...(scopeMap.size > 0 && {
+              ngModuleScope: Object.fromEntries(scopeMap) as unknown as Map<
+                string,
+                Array<{
+                  name: string
+                  module: string
+                  kind: string
+                  selector?: string
+                  pipeName?: string
+                }>
+              >,
+            }),
           }
 
           const result = await transformAngularFile(code, actualId, transformOptions, resources)
