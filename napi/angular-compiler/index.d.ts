@@ -397,6 +397,18 @@ export interface ExtractedQueryMetadata {
 }
 
 /**
+ * Extract @NgModule metadata from all classes in a TypeScript file.
+ *
+ * This uses OXC's parser for robust TypeScript parsing (not regex),
+ * correctly handling nested objects, complex expressions, and all
+ * TypeScript syntax.
+ *
+ * Returns the NgModule metadata plus an import source map that tracks
+ * where each referenced identifier was imported from.
+ */
+export declare function extractNgModuleInfoSync(source: string, filename: string): FileNgModuleInfo
+
+/**
  * Input for compiling a factory function.
  *
  * Factory functions are generated as part of directive, component, pipe,
@@ -435,6 +447,27 @@ export interface FactoryNapiCompileResult {
   code: string
   /** Compilation errors. */
   errors: Array<OxcError>
+}
+
+/**
+ * Result of extracting NgModule info from a file.
+ *
+ * Contains all NgModules found in the file plus an import source map
+ * that tracks where each identifier was imported from.
+ */
+export interface FileNgModuleInfo {
+  /** All NgModules found in this file. */
+  modules: Array<NgModuleExtractedInfo>
+  /**
+   * Import source map: identifier name → source module path.
+   *
+   * For example: `"CommonModule"` → `"@angular/common"`,
+   * `"SharedDirective"` → `"./shared.directive"`.
+   *
+   * Only includes identifiers that appear in NgModule declarations,
+   * imports, or exports arrays.
+   */
+  importSources: Record<string, string>
 }
 
 /**
@@ -588,6 +621,44 @@ export interface LinkResult {
   map?: string
   /** Whether any declarations were linked. */
   linked: boolean
+}
+
+/**
+ * Extracted metadata from an @NgModule decorator.
+ *
+ * Contains just the identifier names from declarations/imports/exports arrays,
+ * without full compilation. Used by the Vite plugin for scope resolution.
+ */
+export interface NgModuleExtractedInfo {
+  /** The NgModule class name. */
+  className: string
+  /** Declared class names (components, directives, pipes). */
+  declarations: Array<string>
+  /** Imported module class names. */
+  imports: Array<string>
+  /** Exported class names. */
+  exports: Array<string>
+  /** Whether any `forwardRef()` calls were detected. */
+  containsForwardDecls: boolean
+}
+
+/**
+ * A dependency from an NgModule's compilation scope.
+ *
+ * Represents a directive or pipe that is visible to components declared
+ * in the NgModule (from the module's declarations and imported modules' exports).
+ */
+export interface NgModuleScopeDep {
+  /** The class name (e.g., "NgForOf", "UpperCasePipe"). */
+  name: string
+  /** The module path (e.g., "@angular/common"). */
+  module: string
+  /** The kind: "directive" or "pipe". */
+  kind: string
+  /** CSS selector for directives (e.g., "[ngFor][ngForOf]"). */
+  selector?: string
+  /** Pipe name for pipes (e.g., "uppercase"). */
+  pipeName?: string
 }
 
 /**
@@ -837,6 +908,14 @@ export interface TransformOptions {
    * and provide the actual file paths here.
    */
   resolvedImports?: Map<string, string>
+  /**
+   * NgModule scope for non-standalone components in this file.
+   *
+   * Maps component class name to an array of available dependencies from the
+   * NgModule's compilation scope. When provided, the compiler emits compile-time
+   * resolved `dependencies: [...]` instead of `ɵɵgetComponentDepsFactory()`.
+   */
+  ngModuleScope?: Record<string, Array<NgModuleScopeDep>>
 }
 
 /** Result of transforming an Angular file. */

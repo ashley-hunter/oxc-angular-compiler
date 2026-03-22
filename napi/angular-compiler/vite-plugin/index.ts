@@ -521,16 +521,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             angularVersion: pluginOptions.angularVersion,
             // Pass NgModule scope for non-standalone component dependency resolution
             ...(scopeMap.size > 0 && {
-              ngModuleScope: Object.fromEntries(scopeMap) as unknown as Map<
-                string,
-                Array<{
-                  name: string
-                  module: string
-                  kind: string
-                  selector?: string
-                  pipeName?: string
-                }>
-              >,
+              ngModuleScope: Object.fromEntries(scopeMap),
             }),
           }
 

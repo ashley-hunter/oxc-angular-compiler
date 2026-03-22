@@ -206,7 +206,7 @@ pub struct TransformOptions {
     /// Maps component class name to an array of available dependencies from the
     /// NgModule's compilation scope. When provided, the compiler emits compile-time
     /// resolved `dependencies: [...]` instead of `ɵɵgetComponentDepsFactory()`.
-    #[napi(ts_type = "Map<string, Array<NgModuleScopeDep>>")]
+    #[napi(ts_type = "Record<string, Array<NgModuleScopeDep>>")]
     pub ng_module_scope: Option<HashMap<String, Vec<NgModuleScopeDep>>>,
 }
 
@@ -849,6 +849,126 @@ pub fn extract_component_urls(
     filename: String,
 ) -> AsyncTask<ExtractComponentUrlsTask> {
     AsyncTask::new(ExtractComponentUrlsTask { source, filename })
+}
+
+/// Extracted metadata from an @NgModule decorator.
+///
+/// Contains just the identifier names from declarations/imports/exports arrays,
+/// without full compilation. Used by the Vite plugin for scope resolution.
+#[napi(object)]
+pub struct NgModuleExtractedInfo {
+    /// The NgModule class name.
+    pub class_name: String,
+    /// Declared class names (components, directives, pipes).
+    pub declarations: Vec<String>,
+    /// Imported module class names.
+    pub imports: Vec<String>,
+    /// Exported class names.
+    pub exports: Vec<String>,
+    /// Whether any `forwardRef()` calls were detected.
+    pub contains_forward_decls: bool,
+}
+
+/// Result of extracting NgModule info from a file.
+///
+/// Contains all NgModules found in the file plus an import source map
+/// that tracks where each identifier was imported from.
+#[napi(object)]
+pub struct FileNgModuleInfo {
+    /// All NgModules found in this file.
+    pub modules: Vec<NgModuleExtractedInfo>,
+    /// Import source map: identifier name → source module path.
+    ///
+    /// For example: `"CommonModule"` → `"@angular/common"`,
+    /// `"SharedDirective"` → `"./shared.directive"`.
+    ///
+    /// Only includes identifiers that appear in NgModule declarations,
+    /// imports, or exports arrays.
+    pub import_sources: HashMap<String, String>,
+}
+
+/// Extract @NgModule metadata from all classes in a TypeScript file.
+///
+/// This uses OXC's parser for robust TypeScript parsing (not regex),
+/// correctly handling nested objects, complex expressions, and all
+/// TypeScript syntax.
+///
+/// Returns the NgModule metadata plus an import source map that tracks
+/// where each referenced identifier was imported from.
+#[napi]
+pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgModuleInfo {
+    use oxc_angular_compiler::{build_import_map, extract_ng_module_metadata};
+    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(&filename).unwrap_or_default();
+
+    let parser_ret = Parser::new(&allocator, &source, source_type).parse();
+    let program = &parser_ret.program;
+
+    // Build import map to resolve where identifiers come from
+    let import_map = build_import_map(&allocator, &program.body, None);
+
+    let mut modules = Vec::new();
+    let mut referenced_identifiers = Vec::new();
+
+    // Walk statements looking for class declarations with @NgModule
+    for stmt in &program.body {
+        let class = match stmt {
+            Statement::ClassDeclaration(class) => Some(class.as_ref()),
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
+                _ => None,
+            },
+            Statement::ExportNamedDeclaration(export) => match &export.declaration {
+                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(class) = class {
+            if let Some(metadata) = extract_ng_module_metadata(&allocator, class) {
+                let declarations: Vec<String> =
+                    metadata.declarations.iter().map(|a| a.to_string()).collect();
+                let imports: Vec<String> =
+                    metadata.imports.iter().map(|a| a.to_string()).collect();
+                let exports: Vec<String> =
+                    metadata.exports.iter().map(|a| a.to_string()).collect();
+
+                // Track all referenced identifiers for import source resolution
+                referenced_identifiers.extend(declarations.iter().cloned());
+                referenced_identifiers.extend(imports.iter().cloned());
+                referenced_identifiers.extend(exports.iter().cloned());
+
+                modules.push(NgModuleExtractedInfo {
+                    class_name: metadata.class_name.to_string(),
+                    declarations,
+                    imports,
+                    exports,
+                    contains_forward_decls: metadata.contains_forward_decls,
+                });
+            }
+        }
+    }
+
+    // Build import sources map for referenced identifiers only
+    let mut import_sources = HashMap::new();
+    for ident in &referenced_identifiers {
+        let atom = oxc_span::Atom::from(ident.as_str());
+        if let Some(info) = import_map.get(&atom) {
+            if !info.is_type_only {
+                import_sources.insert(ident.clone(), info.source_module.to_string());
+            }
+        }
+    }
+
+    FileNgModuleInfo {
+        modules,
+        import_sources,
+    }
 }
 
 /// Top-level declarations extracted from a TypeScript file for HMR.

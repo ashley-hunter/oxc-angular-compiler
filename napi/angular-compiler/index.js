@@ -775,6 +775,7 @@ const {
   encodeComponentId,
   extractAngularComponentByAst,
   extractComponentUrls,
+  extractNgModuleInfoSync,
   generateHmrModule,
   generateStyleModule,
   linkAngularPackage,
@@ -795,6 +796,7 @@ export { encapsulateStyle }
 export { encodeComponentId }
 export { extractAngularComponentByAst }
 export { extractComponentUrls }
+export { extractNgModuleInfoSync }
 export { generateHmrModule }
 export { generateStyleModule }
 export { linkAngularPackage }

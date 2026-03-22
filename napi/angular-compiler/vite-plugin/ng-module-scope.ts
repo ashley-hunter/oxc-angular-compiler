@@ -1,7 +1,7 @@
 /**
  * NgModule scope collector for compile-time dependency resolution.
  *
- * This module scans TypeScript files for @NgModule decorators and builds
+ * This module collects @NgModule metadata from TypeScript files and builds
  * a scope map that maps component class names to their available dependencies
  * (directives and pipes from the NgModule's imports and declarations).
  *
@@ -22,8 +22,7 @@
  * don't match any template element.
  */
 
-import { readFile } from 'node:fs/promises'
-import { resolve, dirname } from 'node:path'
+import { extractNgModuleInfoSync } from '#binding'
 
 /**
  * A dependency from an NgModule's compilation scope.
@@ -55,6 +54,8 @@ interface NgModuleInfo {
   exports: string[]
   /** The file path of the NgModule */
   filePath: string
+  /** Import source map: identifier name → source module path */
+  importSources: Record<string, string>
 }
 
 /**
@@ -267,6 +268,9 @@ WELL_KNOWN_MODULES['BrowserModule'] = [...WELL_KNOWN_MODULES['CommonModule']]
  *
  * Collects @NgModule metadata from TypeScript files and builds a scope map
  * for compile-time dependency resolution.
+ *
+ * Uses OXC's Rust-based parser via NAPI for robust TypeScript parsing,
+ * correctly handling nested objects, complex expressions, and all TS syntax.
  */
 export class NgModuleScopeCollector {
   /** Map of NgModule class name → NgModuleInfo */
@@ -278,32 +282,27 @@ export class NgModuleScopeCollector {
   /**
    * Parse a TypeScript file and extract any @NgModule metadata.
    *
-   * This uses simple regex-based extraction (not a full parser) since we only
-   * need to find @NgModule decorators and extract their metadata properties.
+   * Uses OXC's Rust-based parser via NAPI for robust parsing that correctly
+   * handles nested braces, complex expressions, and all TypeScript syntax.
    */
   collectFromSource(source: string, filePath: string): void {
-    // Match @NgModule({ ... }) class ClassName
-    const ngModuleRegex =
-      /@NgModule\s*\(\s*\{([\s\S]*?)\}\s*\)\s*(?:export\s+)?class\s+(\w+)/g
-    let match
+    const fileInfo = extractNgModuleInfoSync(source, filePath)
 
-    while ((match = ngModuleRegex.exec(source)) !== null) {
-      const configBody = match[1]
-      const className = match[2]
-
+    for (const mod of fileInfo.modules) {
       const info: NgModuleInfo = {
-        className,
-        declarations: extractIdentifierArray(configBody, 'declarations'),
-        imports: extractIdentifierArray(configBody, 'imports'),
-        exports: extractIdentifierArray(configBody, 'exports'),
+        className: mod.className,
+        declarations: mod.declarations,
+        imports: mod.imports,
+        exports: mod.exports,
         filePath,
+        importSources: fileInfo.importSources,
       }
 
-      this.modules.set(className, info)
+      this.modules.set(mod.className, info)
 
       // Map each declaration to its module
-      for (const decl of info.declarations) {
-        this.declarationToModule.set(decl, className)
+      for (const decl of mod.declarations) {
+        this.declarationToModule.set(decl, mod.className)
       }
     }
   }
@@ -345,21 +344,29 @@ export class NgModuleScopeCollector {
    * Resolve the compilation scope for an NgModule.
    *
    * The scope includes:
-   * - All declarations from the module itself
+   * - All declarations from the module itself (that have known import sources)
    * - All exported directives/pipes from imported modules (recursively)
    */
   private resolveModuleScope(moduleInfo: NgModuleInfo): NgModuleScopeDep[] {
     const scope: NgModuleScopeDep[] = []
     const seen = new Set<string>()
 
-    // Add declarations from the module itself (other directives/pipes declared alongside)
-    // These are local to the project, we don't know their module path
-    // The compiler handles local refs without module path
+    // Add sibling declarations from the module that have known import sources.
+    // If a declaration was imported from another file, we know its source module
+    // and can include it. If it's defined in the same file as the NgModule,
+    // the Rust compiler handles same-file references directly.
     for (const decl of moduleInfo.declarations) {
       if (seen.has(decl)) continue
       seen.add(decl)
-      // We don't include local declarations as deps for now
-      // since we don't know their selectors/pipe names without type info
+
+      const sourceModule = moduleInfo.importSources[decl]
+      if (sourceModule) {
+        scope.push({
+          name: decl,
+          module: sourceModule,
+          kind: 'directive',
+        })
+      }
     }
 
     // Add exports from imported modules
@@ -400,9 +407,19 @@ export class NgModuleScopeCollector {
       // Check if the export is a module itself (re-export pattern)
       if (this.modules.has(exportName) || WELL_KNOWN_MODULES[exportName]) {
         this.addImportedModuleExports(exportName, scope, seen)
+        continue
       }
-      // Otherwise it's a directive/pipe - but without type info we can't
-      // create proper NgModuleScopeDep entries for user-defined exports
+
+      // It's a directive/pipe — look up its source module
+      seen.add(exportName)
+      const sourceModule = moduleInfo.importSources[exportName]
+      if (sourceModule) {
+        // Imported from another file — use the import source
+        scope.push({ name: exportName, module: sourceModule, kind: 'directive' })
+      } else {
+        // Defined locally in the module's file — use the file path as source
+        scope.push({ name: exportName, module: moduleInfo.filePath, kind: 'directive' })
+      }
     }
   }
 
@@ -413,55 +430,4 @@ export class NgModuleScopeCollector {
     this.modules.clear()
     this.declarationToModule.clear()
   }
-}
-
-/**
- * Extract an array of identifiers from a property in an @NgModule config.
- *
- * Handles patterns like:
- * - `declarations: [Foo, Bar]`
- * - `imports: [CommonModule, RouterModule.forRoot(routes)]`
- * - `imports: [CommonModule, forwardRef(() => LazyModule)]`
- */
-function extractIdentifierArray(configBody: string, propertyName: string): string[] {
-  // Match the property and its array value
-  const regex = new RegExp(
-    `${propertyName}\\s*:\\s*\\[([^\\]]*?)\\]`,
-    's',
-  )
-  const match = regex.exec(configBody)
-  if (!match) return []
-
-  const arrayContent = match[1]
-  const identifiers: string[] = []
-
-  // Split by comma and extract identifier names
-  const items = arrayContent.split(',')
-  for (const item of items) {
-    const trimmed = item.trim()
-    if (!trimmed) continue
-
-    // Simple identifier: Foo
-    const simpleMatch = /^([A-Z]\w*)$/.exec(trimmed)
-    if (simpleMatch) {
-      identifiers.push(simpleMatch[1])
-      continue
-    }
-
-    // Method call: Module.forRoot(...) or Module.forChild(...)
-    const methodMatch = /^([A-Z]\w*)\.(?:forRoot|forChild|forFeature)\b/.exec(trimmed)
-    if (methodMatch) {
-      identifiers.push(methodMatch[1])
-      continue
-    }
-
-    // Forward ref: forwardRef(() => Foo)
-    const forwardRefMatch = /forwardRef\s*\(\s*\(\)\s*=>\s*([A-Z]\w*)/.exec(trimmed)
-    if (forwardRefMatch) {
-      identifiers.push(forwardRefMatch[1])
-      continue
-    }
-  }
-
-  return identifiers
 }
