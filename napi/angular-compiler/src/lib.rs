@@ -978,7 +978,9 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
             }
 
             // Extract NgModule metadata from @NgModule decorator
+            let mut found_decorator_module = false;
             if let Some(metadata) = extract_ng_module_metadata(&allocator, class) {
+                found_decorator_module = true;
                 let declarations: Vec<String> =
                     metadata.declarations.iter().map(|a| a.to_string()).collect();
                 let imports: Vec<String> =
@@ -1000,7 +1002,8 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                 });
             }
 
-            // Also check for compiled Angular output: static ɵmod/ɵdir/ɵpipe/ɵcmp fields
+            // Also check for compiled Angular output: static ɵmod/ɵdir/ɵpipe/ɵcmp fields.
+            // Skip ɵmod if we already extracted from @NgModule decorator to avoid duplicates.
             for element in &class.body.body {
                 if let ClassElement::PropertyDefinition(prop_def) = element {
                     if !prop_def.r#static {
@@ -1023,6 +1026,14 @@ pub fn extract_ng_module_info_sync(source: String, filename: String) -> FileNgMo
                         Expression::Identifier(id) => id.name.as_str(),
                         _ => continue,
                     };
+
+                    // Skip ɵmod extraction if @NgModule decorator already provided it
+                    if found_decorator_module
+                        && prop_name == "\u{0275}mod"
+                        && callee_name == "\u{0275}\u{0275}ngDeclareNgModule"
+                    {
+                        continue;
+                    }
 
                     process_declare_call(
                         prop_name,
@@ -1202,7 +1213,8 @@ fn extract_declare_ng_module_info(
 /// Extract identifier names from an array expression, handling both direct arrays
 /// and function-wrapped arrays (forward declarations).
 ///
-/// Handles: `[A, B, C]`, `function() { return [A, B, C]; }`, `() => [A, B, C]`
+/// Handles: `[A, B, C]`, `function() { return [A, B, C]; }`,
+/// `() => [A, B, C]`, `() => { return [A, B, C]; }`
 fn extract_identifiers_from_declare_array(expr: &oxc_ast::ast::Expression<'_>) -> Vec<String> {
     use oxc_ast::ast::{Expression, Statement};
 
@@ -1226,15 +1238,27 @@ fn extract_identifiers_from_declare_array(expr: &oxc_ast::ast::Expression<'_>) -
         }
     }
 
-    // Try () => [...]
+    // Try () => [...] (expression body) or () => { return [...]; } (block body)
     if let Expression::ArrowFunctionExpression(arrow) = expr {
         if arrow.expression {
+            // Expression body: () => [A, B, C]
             if let Some(stmt) = arrow.body.statements.first() {
                 if let Statement::ExpressionStatement(expr_stmt) = stmt {
                     if let Some(identifiers) =
                         extract_identifiers_from_array_expr(&expr_stmt.expression)
                     {
                         return identifiers;
+                    }
+                }
+            }
+        } else {
+            // Block body: () => { return [A, B, C]; }
+            for stmt in &arrow.body.statements {
+                if let Statement::ReturnStatement(ret) = stmt {
+                    if let Some(arg) = &ret.argument {
+                        if let Some(identifiers) = extract_identifiers_from_array_expr(arg) {
+                            return identifiers;
+                        }
                     }
                 }
             }
