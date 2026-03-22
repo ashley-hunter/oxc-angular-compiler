@@ -186,6 +186,31 @@ pub fn generate_full_ng_module_definition<'a>(
 ) -> Option<FullNgModuleDefinition<'a>> {
     let r3_metadata = metadata.to_r3_metadata(allocator)?;
 
+    generate_full_ng_module_definition_inner(allocator, metadata, r3_metadata)
+}
+
+/// Generate full NgModule definitions with namespace-aware references.
+///
+/// This variant resolves imported references in declarations/imports/exports
+/// to namespace-prefixed expressions (e.g., `i1.CommonModule` instead of bare `CommonModule`).
+pub fn generate_full_ng_module_definition_with_namespaces<'a>(
+    allocator: &'a Allocator,
+    metadata: &NgModuleMetadata<'a>,
+    import_map: &crate::component::ImportMap<'a>,
+    namespace_registry: &mut crate::component::NamespaceRegistry<'a>,
+) -> Option<FullNgModuleDefinition<'a>> {
+    let r3_metadata =
+        metadata.to_r3_metadata_with_namespaces(allocator, import_map, namespace_registry)?;
+
+    generate_full_ng_module_definition_inner(allocator, metadata, r3_metadata)
+}
+
+fn generate_full_ng_module_definition_inner<'a>(
+    allocator: &'a Allocator,
+    metadata: &NgModuleMetadata<'a>,
+    r3_metadata: super::metadata::R3NgModuleMetadata<'a>,
+) -> Option<FullNgModuleDefinition<'a>> {
+
     // IMPORTANT: Generate ɵfac BEFORE ɵmod and ɵinj to match Angular's namespace index assignment order.
     // Angular processes results in order [fac, mod, inj, ...] during the transform phase
     // (see packages/compiler-cli/src/ngtsc/annotations/ng_module/src/handler.ts:1056-1076),

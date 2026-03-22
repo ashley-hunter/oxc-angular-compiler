@@ -44,7 +44,7 @@ use crate::injectable::{
     generate_injectable_definition_from_decorator,
 };
 use crate::ng_module::{
-    extract_ng_module_metadata, find_ng_module_decorator_span, generate_full_ng_module_definition,
+    extract_ng_module_metadata, find_ng_module_decorator_span,
 };
 use crate::output::ast::{
     DeclareFunctionStmt, FunctionExpr, OutputExpression, OutputStatement, ReadPropExpr,
@@ -1983,9 +1983,16 @@ pub fn transform_angular_file(
                         );
                     }
 
-                    // Compile NgModule and generate all definitions as external property assignments
+                    // Compile NgModule and generate all definitions as external property assignments.
+                    // Use namespace-aware variant to resolve imported references
+                    // (e.g., CommonModule → i1.CommonModule) since named imports may be elided.
                     if let Some(definition) =
-                        generate_full_ng_module_definition(allocator, &ng_module_metadata)
+                        crate::ng_module::generate_full_ng_module_definition_with_namespaces(
+                            allocator,
+                            &ng_module_metadata,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        )
                     {
                         let emitter = JsEmitter::new();
                         let class_name = ng_module_metadata.class_name.to_string();
@@ -5872,5 +5879,97 @@ export class UnityTooltipTrigger {}
                 result.code
             );
         }
+    }
+
+    #[test]
+    fn test_non_standalone_component_with_pipe_uses_get_deps_factory() {
+        // Non-standalone components should use ɵɵgetComponentDepsFactory for dependency resolution.
+        // This enables the Angular runtime to resolve pipes/directives from the NgModule scope.
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-user-list',
+    standalone: false,
+    template: '<div>{{ data$ | async }}</div>'
+})
+export class UserListComponent {}
+"#;
+
+        let result = transform_angular_file(
+            &allocator,
+            "user-list.component.ts",
+            source,
+            &TransformOptions::default(),
+            None,
+        );
+
+        // Non-standalone component should use ɵɵgetComponentDepsFactory
+        assert!(
+            result.code.contains("getComponentDepsFactory"),
+            "Non-standalone component should use ɵɵgetComponentDepsFactory, got:\n{}",
+            result.code
+        );
+        // Template should generate pipe instruction
+        assert!(
+            result.code.contains("ɵɵpipe"),
+            "Template should contain ɵɵpipe call, got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_ng_module_references_use_namespace_imports() {
+        // NgModule declarations/imports/exports should use namespace-prefixed references
+        // for imported identifiers, since their named imports may be elided.
+        let allocator = Allocator::default();
+        let source = r#"
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { UserListComponent } from './user-list.component';
+
+@NgModule({
+    declarations: [UserListComponent],
+    imports: [CommonModule],
+    exports: [UserListComponent]
+})
+export class UsersModule {}
+"#;
+
+        let result = transform_angular_file(
+            &allocator,
+            "users.module.ts",
+            source,
+            &TransformOptions::default(),
+            None,
+        );
+
+        // Should compile the NgModule
+        assert!(
+            result.code.contains("ɵɵdefineNgModule"),
+            "Should contain defineNgModule, got:\n{}",
+            result.code
+        );
+        // CommonModule should be namespace-prefixed (e.g., i1.CommonModule)
+        // not bare "CommonModule" which would fail if the named import is elided
+        let define_section = result
+            .code
+            .split("ɵɵdefineNgModule")
+            .nth(1)
+            .expect("Should have defineNgModule");
+        assert!(
+            define_section.contains("i1.CommonModule") || define_section.contains("i2.CommonModule"),
+            "CommonModule should be namespace-prefixed in ɵɵdefineNgModule, got:\n{}",
+            result.code
+        );
+        // UserListComponent import should also be namespace-prefixed
+        assert!(
+            result.code.contains("i1.UserListComponent")
+                || result.code.contains("i2.UserListComponent")
+                || result.code.contains("i3.UserListComponent"),
+            "UserListComponent should be namespace-prefixed, got:\n{}",
+            result.code
+        );
     }
 }

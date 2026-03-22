@@ -20,7 +20,8 @@ pub use compiler::{NgModuleCompileResult, compile_ng_module, compile_ng_module_f
 pub use decorator::{NgModuleMetadata, extract_ng_module_metadata, find_ng_module_decorator_span};
 pub use definition::{
     FullNgModuleDefinition, NgModuleDefinition, emit_full_ng_module_definition,
-    emit_ng_module_definition, generate_full_ng_module_definition, generate_ng_module_definition,
+    emit_ng_module_definition, generate_full_ng_module_definition,
+    generate_full_ng_module_definition_with_namespaces, generate_ng_module_definition,
     generate_ng_module_definition_from_decorator,
 };
 pub use metadata::{

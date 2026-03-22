@@ -10,8 +10,9 @@ use oxc_ast::ast::{
 };
 use oxc_span::{Atom, Span};
 
+use crate::component::{ImportMap, NamespaceRegistry};
 use crate::factory::R3DependencyMetadata;
-use crate::output::ast::{OutputExpression, ReadVarExpr};
+use crate::output::ast::{OutputExpression, ReadPropExpr, ReadVarExpr};
 use crate::output::oxc_converter::convert_oxc_expression;
 
 /// Extracted NgModule metadata from a `@NgModule` decorator.
@@ -81,9 +82,33 @@ impl<'a> NgModuleMetadata<'a> {
     }
 
     /// Convert to R3NgModuleMetadata for compilation.
+    ///
+    /// When `import_map` and `namespace_registry` are provided, imported references
+    /// (declarations, imports, exports, bootstrap) will be namespace-prefixed
+    /// (e.g., `i1.CommonModule` instead of bare `CommonModule`).
+    /// This is necessary because named imports may be elided during compilation.
+    pub fn to_r3_metadata_with_namespaces(
+        &self,
+        allocator: &'a Allocator,
+        import_map: &ImportMap<'a>,
+        namespace_registry: &mut NamespaceRegistry<'a>,
+    ) -> Option<super::metadata::R3NgModuleMetadata<'a>> {
+        self.to_r3_metadata_inner(allocator, Some(import_map), Some(namespace_registry))
+    }
+
+    /// Convert to R3NgModuleMetadata for compilation (without namespace resolution).
     pub fn to_r3_metadata(
         &self,
         allocator: &'a Allocator,
+    ) -> Option<super::metadata::R3NgModuleMetadata<'a>> {
+        self.to_r3_metadata_inner(allocator, None, None)
+    }
+
+    fn to_r3_metadata_inner(
+        &self,
+        allocator: &'a Allocator,
+        import_map: Option<&ImportMap<'a>>,
+        mut namespace_registry: Option<&mut NamespaceRegistry<'a>>,
     ) -> Option<super::metadata::R3NgModuleMetadata<'a>> {
         use super::metadata::{R3NgModuleMetadataBuilder, R3Reference, R3SelectorScopeMode};
 
@@ -99,37 +124,29 @@ impl<'a> NgModuleMetadata<'a> {
 
         // Add declarations
         for decl in &self.declarations {
-            let decl_expr = OutputExpression::ReadVar(Box::new_in(
-                ReadVarExpr { name: decl.clone(), source_span: None },
-                allocator,
-            ));
+            let decl_expr =
+                resolve_reference_expr(allocator, decl, import_map, &mut namespace_registry);
             builder = builder.add_declaration(R3Reference::value_only(decl_expr));
         }
 
         // Add imports
         for import in &self.imports {
-            let import_expr = OutputExpression::ReadVar(Box::new_in(
-                ReadVarExpr { name: import.clone(), source_span: None },
-                allocator,
-            ));
+            let import_expr =
+                resolve_reference_expr(allocator, import, import_map, &mut namespace_registry);
             builder = builder.add_import(R3Reference::value_only(import_expr));
         }
 
         // Add exports
         for export in &self.exports {
-            let export_expr = OutputExpression::ReadVar(Box::new_in(
-                ReadVarExpr { name: export.clone(), source_span: None },
-                allocator,
-            ));
+            let export_expr =
+                resolve_reference_expr(allocator, export, import_map, &mut namespace_registry);
             builder = builder.add_export(R3Reference::value_only(export_expr));
         }
 
         // Add bootstrap components
         for bootstrap in &self.bootstrap {
-            let bootstrap_expr = OutputExpression::ReadVar(Box::new_in(
-                ReadVarExpr { name: bootstrap.clone(), source_span: None },
-                allocator,
-            ));
+            let bootstrap_expr =
+                resolve_reference_expr(allocator, bootstrap, import_map, &mut namespace_registry);
             builder = builder.add_bootstrap(R3Reference::value_only(bootstrap_expr));
         }
 
@@ -536,6 +553,49 @@ fn extract_param_token<'a>(
 
     // For primitive types or other patterns, return None (invalid dependency)
     None
+}
+
+/// Resolve a reference identifier to a namespace-prefixed expression if it's an imported symbol.
+///
+/// If the identifier is found in the import map, generates `i1.Name` (namespace import).
+/// Otherwise, generates a bare `Name` (local reference).
+///
+/// This ensures NgModule declarations/imports/exports references work correctly
+/// even when named imports are elided by the compiler.
+fn resolve_reference_expr<'a>(
+    allocator: &'a Allocator,
+    name: &Atom<'a>,
+    import_map: Option<&ImportMap<'a>>,
+    namespace_registry: &mut Option<&mut NamespaceRegistry<'a>>,
+) -> OutputExpression<'a> {
+    if let (Some(import_map), Some(namespace_registry)) =
+        (import_map, namespace_registry)
+    {
+        if let Some(import_info) = import_map.get(name) {
+            // Imported symbol - use namespace prefix (e.g., i1.CommonModule)
+            let namespace = namespace_registry.get_or_assign(&import_info.source_module);
+            return OutputExpression::ReadProp(Box::new_in(
+                ReadPropExpr {
+                    receiver: Box::new_in(
+                        OutputExpression::ReadVar(Box::new_in(
+                            ReadVarExpr { name: namespace, source_span: None },
+                            allocator,
+                        )),
+                        allocator,
+                    ),
+                    name: name.clone(),
+                    optional: false,
+                    source_span: None,
+                },
+                allocator,
+            ));
+        }
+    }
+    // Local reference - use bare name
+    OutputExpression::ReadVar(Box::new_in(
+        ReadVarExpr { name: name.clone(), source_span: None },
+        allocator,
+    ))
 }
 
 #[cfg(test)]
