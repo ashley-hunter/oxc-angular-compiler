@@ -676,8 +676,8 @@ enum AngularDecoratorKind {
 struct JitClassInfo {
     /// The class name.
     class_name: String,
-    /// Span of the decorator (including @).
-    decorator_span: Span,
+    /// Spans of ALL class-level decorators (including @) to be removed.
+    all_class_decorator_spans: std::vec::Vec<Span>,
     /// Start of the statement (includes export keyword if present).
     stmt_start: u32,
     /// Start of the class keyword.
@@ -690,10 +690,12 @@ struct JitClassInfo {
     is_default_export: bool,
     /// Constructor parameter info for ctorParameters.
     ctor_params: std::vec::Vec<JitCtorParam>,
-    /// Member decorator info for propDecorators.
+    /// Member decorator info for propDecorators (Angular decorators like @Input, @Output).
     member_decorators: std::vec::Vec<JitMemberDecorator>,
-    /// The modified decorator expression text for __decorate call.
-    decorator_text: String,
+    /// All class-level decorator expression texts for __decorate call, in source order.
+    all_class_decorator_texts: std::vec::Vec<String>,
+    /// Non-Angular member decorators that need __decorate() calls.
+    non_angular_member_decorators: std::vec::Vec<JitNonAngularMemberDecorator>,
 }
 
 /// Constructor parameter info for JIT ctorParameters generation.
@@ -718,6 +720,16 @@ struct JitMemberDecorator {
     member_name: String,
     /// The Angular decorators on this member.
     decorators: std::vec::Vec<JitParamDecorator>,
+}
+
+/// A non-Angular member decorator that needs to be lowered via __decorate().
+struct JitNonAngularMemberDecorator {
+    /// The member name.
+    member_name: String,
+    /// Whether the member is static.
+    is_static: bool,
+    /// The decorator expression texts (e.g., "Selector()", "Action(AddTodo)").
+    decorator_texts: std::vec::Vec<String>,
 }
 
 /// Find any Angular decorator on a class and return its kind and the decorator reference.
@@ -898,6 +910,101 @@ fn extract_jit_member_decorators(
 
         if !angular_decs.is_empty() {
             result.push(JitMemberDecorator { member_name, decorators: angular_decs });
+        }
+    }
+
+    result
+}
+
+/// Extract non-Angular member decorators that need to be lowered via __decorate() calls.
+///
+/// These are decorators on methods/properties that are NOT Angular-specific
+/// (e.g., NGXS @Action, @Selector). They need to be emitted as:
+/// - `__decorate([Decorator()], Class.prototype, "method", null)` for instance members
+/// - `__decorate([Decorator()], Class, "method", null)` for static members
+fn extract_non_angular_member_decorators(
+    source: &str,
+    class: &oxc_ast::ast::Class<'_>,
+) -> std::vec::Vec<JitNonAngularMemberDecorator> {
+    use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey};
+
+    const ANGULAR_MEMBER_DECORATORS: &[&str] = &[
+        "Input",
+        "Output",
+        "HostBinding",
+        "HostListener",
+        "ViewChild",
+        "ViewChildren",
+        "ContentChild",
+        "ContentChildren",
+    ];
+
+    let mut result: std::vec::Vec<JitNonAngularMemberDecorator> = std::vec::Vec::new();
+
+    for element in &class.body.body {
+        let (member_name, is_static, decorators) = match element {
+            ClassElement::PropertyDefinition(prop) => {
+                let name = match &prop.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                    PropertyKey::StringLiteral(s) => s.value.to_string(),
+                    _ => continue,
+                };
+                (name, prop.r#static, &prop.decorators)
+            }
+            ClassElement::MethodDefinition(method) => {
+                if method.kind == MethodDefinitionKind::Constructor {
+                    continue;
+                }
+                let name = match &method.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                    PropertyKey::StringLiteral(s) => s.value.to_string(),
+                    _ => continue,
+                };
+                (name, method.r#static, &method.decorators)
+            }
+            ClassElement::AccessorProperty(accessor) => {
+                let name = match &accessor.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                    PropertyKey::StringLiteral(s) => s.value.to_string(),
+                    _ => continue,
+                };
+                (name, accessor.r#static, &accessor.decorators)
+            }
+            _ => continue,
+        };
+
+        let mut non_angular_texts: std::vec::Vec<String> = std::vec::Vec::new();
+
+        for decorator in decorators {
+            let dec_name = match &decorator.expression {
+                Expression::CallExpression(call) => match &call.callee {
+                    Expression::Identifier(id) => Some(id.name.to_string()),
+                    Expression::StaticMemberExpression(m) => Some(m.property.name.to_string()),
+                    _ => None,
+                },
+                Expression::Identifier(id) => Some(id.name.to_string()),
+                _ => None,
+            };
+
+            let is_angular = dec_name
+                .as_ref()
+                .is_some_and(|n| ANGULAR_MEMBER_DECORATORS.contains(&n.as_str()));
+
+            if !is_angular {
+                // Extract the decorator expression text from source (without the @)
+                let expr_start = decorator.expression.span().start;
+                let expr_end = decorator.expression.span().end;
+                let text = source[expr_start as usize..expr_end as usize].to_string();
+                non_angular_texts.push(text);
+            }
+        }
+
+        if !non_angular_texts.is_empty() {
+            result.push(JitNonAngularMemberDecorator {
+                member_name,
+                is_static,
+                decorator_texts: non_angular_texts,
+            });
         }
     }
 
@@ -1190,28 +1297,48 @@ fn transform_angular_file_jit(
             continue;
         };
 
-        let Some((decorator_kind, decorator)) = find_angular_decorator(class) else {
+        let Some((decorator_kind, angular_decorator)) = find_angular_decorator(class) else {
             continue;
         };
 
-        // Build modified decorator text (replaces templateUrl/styleUrl with resource imports)
-        let decorator_text = build_jit_decorator_text(
-            source,
-            decorator,
-            decorator_kind,
-            &mut resource_counter,
-            &mut resource_imports,
-        );
+        // Collect ALL class-level decorator spans and texts (in source order)
+        let mut all_class_decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
+        let mut all_class_decorator_texts: std::vec::Vec<String> = std::vec::Vec::new();
+
+        for dec in &class.decorators {
+            all_class_decorator_spans.push(dec.span);
+
+            // Check if this is the Angular decorator that needs special text transformation
+            if dec.span == angular_decorator.span {
+                let text = build_jit_decorator_text(
+                    source,
+                    dec,
+                    decorator_kind,
+                    &mut resource_counter,
+                    &mut resource_imports,
+                );
+                all_class_decorator_texts.push(text);
+            } else {
+                // Non-Angular decorator: extract expression text from source (without @)
+                let expr_start = dec.expression.span().start;
+                let expr_end = dec.expression.span().end;
+                all_class_decorator_texts
+                    .push(source[expr_start as usize..expr_end as usize].to_string());
+            }
+        }
 
         // Extract constructor parameters for ctorParameters
         let ctor_params = extract_jit_ctor_params(source, class);
 
-        // Extract member decorators for propDecorators
+        // Extract Angular member decorators for propDecorators
         let member_decorators = extract_jit_member_decorators(source, class);
+
+        // Extract non-Angular member decorators for __decorate() calls
+        let non_angular_member_decorators = extract_non_angular_member_decorators(source, class);
 
         jit_classes.push(JitClassInfo {
             class_name,
-            decorator_span: decorator.span,
+            all_class_decorator_spans,
             stmt_start,
             class_start: class.span.start,
             class_body_end: class.body.span.end,
@@ -1219,7 +1346,8 @@ fn transform_angular_file_jit(
             is_default_export,
             ctor_params,
             member_decorators,
-            decorator_text,
+            all_class_decorator_texts,
+            non_angular_member_decorators,
         });
 
         result.component_count +=
@@ -1300,9 +1428,9 @@ fn transform_angular_file_jit(
             continue;
         };
 
-        // 4a. Remove the Angular decorator (including @ and trailing whitespace)
-        {
-            let mut end = jit_info.decorator_span.end as usize;
+        // 4a. Remove ALL class-level decorators (including @ and trailing whitespace)
+        for decorator_span in &jit_info.all_class_decorator_spans {
+            let mut end = decorator_span.end as usize;
             let bytes = source.as_bytes();
             while end < bytes.len() {
                 let c = bytes[end];
@@ -1312,14 +1440,14 @@ fn transform_angular_file_jit(
                     break;
                 }
             }
-            edits.push(Edit::delete(jit_info.decorator_span.start, end as u32));
+            edits.push(Edit::delete(decorator_span.start, end as u32));
         }
 
-        // 4b. Remove member decorators (@Input, @Output, etc.) and constructor param decorators
+        // 4b. Remove ALL member decorators and constructor param decorators
         {
             let mut decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
             super::decorator::collect_constructor_decorator_spans(class, &mut decorator_spans);
-            super::decorator::collect_member_decorator_spans(class, &mut decorator_spans);
+            super::decorator::collect_all_member_decorator_spans(class, &mut decorator_spans);
             for span in &decorator_spans {
                 let mut end = span.end as usize;
                 let bytes = source.as_bytes();
@@ -1364,11 +1492,30 @@ fn transform_angular_file_jit(
             }
         }
 
-        // 4e. After class body, add __decorate call and export
-        let mut after_class = format!(
-            ";\n{} = __decorate([\n    {}\n], {});\n",
-            jit_info.class_name, jit_info.decorator_text, jit_info.class_name
-        );
+        // 4e. After class body, add member __decorate calls, then class __decorate call, then export
+        let mut after_class = String::from(";\n");
+
+        // Emit __decorate() for non-Angular member decorators (before class __decorate)
+        for member_dec in &jit_info.non_angular_member_decorators {
+            let target = if member_dec.is_static {
+                jit_info.class_name.clone()
+            } else {
+                format!("{}.prototype", jit_info.class_name)
+            };
+            after_class.push_str(&format!(
+                "__decorate([{}], {}, \"{}\", null);\n",
+                member_dec.decorator_texts.join(", "),
+                target,
+                member_dec.member_name
+            ));
+        }
+
+        // Emit class-level __decorate() with ALL class decorators
+        let all_decorator_text = jit_info.all_class_decorator_texts.join(",\n    ");
+        after_class.push_str(&format!(
+            "{} = __decorate([\n    {}\n], {});\n",
+            jit_info.class_name, all_decorator_text, jit_info.class_name
+        ));
 
         if jit_info.is_exported {
             after_class.push_str(&format!("export {{ {} }};\n", jit_info.class_name));

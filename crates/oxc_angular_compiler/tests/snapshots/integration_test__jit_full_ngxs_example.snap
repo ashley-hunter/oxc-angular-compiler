@@ -1,0 +1,47 @@
+---
+source: crates/oxc_angular_compiler/tests/integration_test.rs
+expression: result.code
+---
+
+import { Injectable } from '@angular/core';
+import { State, Action, Selector, StateContext } from '@ngxs/store';
+import { __decorate } from "tslib";
+
+interface TodoStateModel {
+    items: TodoItem[];
+    filter: string;
+}
+
+interface TodoItem {
+    text: string;
+    done: boolean;
+}
+
+class AddTodo {
+    static readonly type = '[Todo] Add';
+    constructor(public text: string) {}
+}
+
+class ToggleTodo {
+    static readonly type = '[Todo] Toggle';
+    constructor(public index: number) {}
+}
+
+let TodoState = class TodoState {
+    static todos(state: TodoStateModel): TodoItem[] { return state.items; }
+
+    static filter(state: TodoStateModel): string { return state.filter; }
+
+    add(ctx: StateContext<TodoStateModel>, action: AddTodo) { /* ... */ }
+
+    toggle(ctx: StateContext<TodoStateModel>, action: ToggleTodo) { /* ... */ }
+};
+__decorate([Selector()], TodoState, "todos", null);
+__decorate([Selector()], TodoState, "filter", null);
+__decorate([Action(AddTodo)], TodoState.prototype, "add", null);
+__decorate([Action(ToggleTodo)], TodoState.prototype, "toggle", null);
+TodoState = __decorate([
+    State<TodoStateModel>({ name: 'todo', defaults: { items: [], filter: 'all' } }),
+    Injectable()
+], TodoState);
+export { TodoState };

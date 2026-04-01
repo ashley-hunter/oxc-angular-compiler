@@ -6378,6 +6378,183 @@ export class TestComponent {
     insta::assert_snapshot!("jit_union_type_ctor_params", result.code);
 }
 
+#[test]
+fn test_jit_non_angular_class_decorators_lowered() {
+    // When a class has both Angular and non-Angular class-level decorators,
+    // ALL decorators must be lowered into the __decorate() call.
+    // Non-Angular decorators left as raw @Decorator syntax on a class expression
+    // cause TS1206 (decorators are not valid on class expressions).
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+import { State } from '@ngxs/store';
+
+interface TodoStateModel {
+    items: string[];
+}
+
+@State<TodoStateModel>({ name: 'todo', defaults: { items: [] } })
+@Injectable()
+export class TodoState {}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw @State decorator should remain in the output
+    assert!(
+        !result.code.contains("@State"),
+        "Non-Angular class decorators should be lowered, not left as raw syntax. Got:\n{}",
+        result.code
+    );
+
+    // Both decorators should appear in the __decorate call
+    assert!(
+        result.code.contains("State<TodoStateModel>("),
+        "Non-Angular class decorator State should appear in __decorate call. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("Injectable()"),
+        "Angular class decorator Injectable should appear in __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // Decorator order should be preserved (State before Injectable)
+    let state_pos = result.code.find("State<TodoStateModel>(").unwrap();
+    let injectable_pos = result.code.find("Injectable()").unwrap();
+    assert!(
+        state_pos < injectable_pos,
+        "Decorator order should be preserved (State before Injectable). Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_angular_class_decorators", result.code);
+}
+
+#[test]
+fn test_jit_non_angular_method_decorators_lowered() {
+    // Non-Angular method decorators should be lowered to __decorate() calls
+    // on the class prototype (for instance methods) or class itself (for static methods).
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector } from '@ngxs/store';
+
+@State({ name: 'todo' })
+@Injectable()
+export class TodoState {
+    @Selector()
+    static todos(state: any): any[] { return state.items; }
+
+    @Action(AddTodo)
+    add(ctx: any, action: any) { ctx.setState(action); }
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw @Selector or @Action decorator should remain
+    assert!(
+        !result.code.contains("@Selector"),
+        "Non-Angular method decorators should be lowered. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("@Action"),
+        "Non-Angular method decorators should be lowered. Got:\n{}",
+        result.code
+    );
+
+    // Static method → __decorate([Selector()], TodoState, "todos", null)
+    assert!(
+        result.code.contains("__decorate([Selector()], TodoState, \"todos\", null)"),
+        "Static method decorator should use class directly (no .prototype). Got:\n{}",
+        result.code
+    );
+
+    // Instance method → __decorate([Action(AddTodo)], TodoState.prototype, "add", null)
+    assert!(
+        result.code.contains("__decorate([Action(AddTodo)], TodoState.prototype, \"add\", null)"),
+        "Instance method decorator should use .prototype. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_angular_method_decorators", result.code);
+}
+
+#[test]
+fn test_jit_full_ngxs_example() {
+    // Full example with NGXS-style decorators: @State, @Selector, @Action combined with @Injectable
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector, StateContext } from '@ngxs/store';
+
+interface TodoStateModel {
+    items: TodoItem[];
+    filter: string;
+}
+
+interface TodoItem {
+    text: string;
+    done: boolean;
+}
+
+class AddTodo {
+    static readonly type = '[Todo] Add';
+    constructor(public text: string) {}
+}
+
+class ToggleTodo {
+    static readonly type = '[Todo] Toggle';
+    constructor(public index: number) {}
+}
+
+@State<TodoStateModel>({ name: 'todo', defaults: { items: [], filter: 'all' } })
+@Injectable()
+export class TodoState {
+    @Selector()
+    static todos(state: TodoStateModel): TodoItem[] { return state.items; }
+
+    @Selector()
+    static filter(state: TodoStateModel): string { return state.filter; }
+
+    @Action(AddTodo)
+    add(ctx: StateContext<TodoStateModel>, action: AddTodo) { /* ... */ }
+
+    @Action(ToggleTodo)
+    toggle(ctx: StateContext<TodoStateModel>, action: ToggleTodo) { /* ... */ }
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain anywhere
+    assert!(
+        !result.code.contains("@State") && !result.code.contains("@Injectable")
+            && !result.code.contains("@Selector") && !result.code.contains("@Action"),
+        "No raw decorator syntax should remain in output. Got:\n{}",
+        result.code
+    );
+
+    // Member __decorate calls should come before class __decorate
+    let selector_decorate = result.code.find("__decorate([Selector()], TodoState, \"todos\"").unwrap();
+    let class_decorate = result.code.find("TodoState = __decorate(").unwrap();
+    assert!(
+        selector_decorate < class_decorate,
+        "Member decorators should be emitted before class decorator. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_full_ngxs_example", result.code);
+}
+
 // =========================================================================
 // Source map tests
 // =========================================================================
