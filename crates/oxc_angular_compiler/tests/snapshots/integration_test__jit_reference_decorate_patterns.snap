@@ -1,0 +1,30 @@
+---
+source: crates/oxc_angular_compiler/tests/integration_test.rs
+expression: result.code
+---
+
+import { Injectable } from '@angular/core';
+import { __decorate } from "tslib";
+
+function CustomPropDecorator(): any { return () => {}; }
+function CustomMethodDecorator(): any { return () => {}; }
+
+let TestDecoratePatternsService = class TestDecoratePatternsService {
+    myProp: string = 'hello';
+
+    myMethod(): void {}
+
+    static myStaticMethod(): void {}
+
+    get myGetter(): string { return ''; }
+
+    set mySetter(val: string) {}
+};
+__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, "myProp", void 0);
+__decorate([CustomMethodDecorator()], TestDecoratePatternsService.prototype, "myMethod", null);
+__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, "myGetter", null);
+__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, "mySetter", null);
+__decorate([CustomMethodDecorator()], TestDecoratePatternsService, "myStaticMethod", null);
+TestDecoratePatternsService = __decorate([
+    Injectable()
+], TestDecoratePatternsService);
