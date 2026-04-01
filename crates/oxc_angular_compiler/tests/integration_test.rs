@@ -6598,6 +6598,447 @@ export class MyService {
     insta::assert_snapshot!("jit_property_decorator_void_0", result.code);
 }
 
+#[test]
+fn test_jit_mixed_angular_and_non_angular_decorators_on_same_member() {
+    // When a member has both Angular and non-Angular decorators, the Angular
+    // decorator goes into propDecorators while the non-Angular one is lowered
+    // to a __decorate() call. Both must be stripped from the class body.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive, Input, Output, EventEmitter } from '@angular/core';
+
+function Required() { return function(t: any, k: string) {}; }
+function Throttle(ms: number) { return function(t: any, k: string, d: any) {}; }
+
+@Directive({ selector: '[appField]' })
+export class FieldDirective {
+    @Required()
+    @Input()
+    value: string = '';
+
+    @Throttle(300)
+    @Output()
+    valueChange = new EventEmitter<string>();
+
+    @Throttle(100)
+    onChange() {}
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "field.directive.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain
+    assert!(
+        !result.code.contains("@Required") && !result.code.contains("@Input")
+            && !result.code.contains("@Throttle") && !result.code.contains("@Output"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Angular decorators should appear in propDecorators
+    assert!(
+        result.code.contains("propDecorators"),
+        "Angular member decorators should be in propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: Input"),
+        "propDecorators should contain Input. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: Output"),
+        "propDecorators should contain Output. Got:\n{}",
+        result.code
+    );
+
+    // Non-Angular decorators should be lowered via __decorate()
+    assert!(
+        result.code.contains("__decorate([Required()], FieldDirective.prototype, \"value\", void 0)"),
+        "Non-Angular property decorator should use __decorate with void 0. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("__decorate([Throttle(300)], FieldDirective.prototype, \"valueChange\", void 0)"),
+        "Non-Angular property decorator should use __decorate with void 0. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("__decorate([Throttle(100)], FieldDirective.prototype, \"onChange\", null)"),
+        "Non-Angular method decorator should use __decorate with null. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_mixed_angular_non_angular_same_member", result.code);
+}
+
+#[test]
+fn test_jit_multiple_non_angular_decorators_on_same_member() {
+    // Multiple non-Angular decorators on the same member should all appear
+    // in a single __decorate() call for that member.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+
+function Log() { return function(t: any, k: string, d: any) {}; }
+function Memoize() { return function(t: any, k: string, d: any) {}; }
+function Validate() { return function(t: any, k: string) {}; }
+
+@Injectable()
+export class MyService {
+    @Log()
+    @Memoize()
+    compute() { return 42; }
+
+    @Validate()
+    @Log()
+    name: string = '';
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Multiple decorators on method should be in single __decorate call, in source order
+    assert!(
+        result.code.contains("__decorate([Log(), Memoize()], MyService.prototype, \"compute\", null)"),
+        "Multiple method decorators should be in one __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // Multiple decorators on property should also be in single __decorate call
+    assert!(
+        result.code.contains("__decorate([Validate(), Log()], MyService.prototype, \"name\", void 0)"),
+        "Multiple property decorators should be in one __decorate call. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_multiple_decorators_same_member", result.code);
+}
+
+#[test]
+fn test_jit_multiple_decorated_classes_in_same_file() {
+    // Multiple Angular-decorated classes in the same file should each get
+    // their own class expression conversion and __decorate calls.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, Injectable } from '@angular/core';
+
+function Logger() { return function(t: any) { return t; }; }
+
+@Component({ selector: 'app-foo', template: '<p>foo</p>' })
+export class FooComponent {}
+
+@Logger()
+@Injectable()
+export class FooService {
+    @Logger()
+    doWork() {}
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "foo.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Both classes should be converted to class expressions
+    assert!(
+        result.code.contains("let FooComponent = class FooComponent"),
+        "FooComponent should be a class expression. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("let FooService = class FooService"),
+        "FooService should be a class expression. Got:\n{}",
+        result.code
+    );
+
+    // Both should have __decorate calls
+    assert!(
+        result.code.contains("FooComponent = __decorate("),
+        "FooComponent should have a __decorate call. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("FooService = __decorate("),
+        "FooService should have a __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Component") && !result.code.contains("@Injectable")
+            && !result.code.contains("@Logger"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // FooService should include Logger in its class __decorate
+    let service_decorate_pos = result.code.find("FooService = __decorate(").unwrap();
+    let service_decorate_section = &result.code[service_decorate_pos..];
+    assert!(
+        service_decorate_section.contains("Logger()"),
+        "FooService __decorate should include Logger. Got:\n{}",
+        result.code
+    );
+
+    // FooService member decorator should also be lowered
+    assert!(
+        result.code.contains("__decorate([Logger()], FooService.prototype, \"doWork\", null)"),
+        "FooService method decorator should be lowered. Got:\n{}",
+        result.code
+    );
+
+    // Both should be re-exported
+    assert!(
+        result.code.contains("export { FooComponent }"),
+        "FooComponent should be re-exported. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("export { FooService }"),
+        "FooService should be re-exported. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_multiple_classes_same_file", result.code);
+}
+
+#[test]
+fn test_jit_non_exported_class_with_decorators() {
+    // A non-exported Angular class with non-Angular decorators should still
+    // be lowered but without an export statement.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+
+function Singleton() { return function(t: any) { return t; }; }
+
+@Singleton()
+@Injectable()
+class InternalService {
+    @Singleton()
+    getInstance() {}
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "internal.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Should be converted to class expression
+    assert!(
+        result.code.contains("let InternalService = class InternalService"),
+        "Non-exported class should still be converted. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Singleton") && !result.code.contains("@Injectable"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Should NOT have an export statement
+    assert!(
+        !result.code.contains("export {") && !result.code.contains("export default"),
+        "Non-exported class should not get an export statement. Got:\n{}",
+        result.code
+    );
+
+    // Both class decorators should be in __decorate
+    assert!(
+        result.code.contains("InternalService = __decorate("),
+        "Should have class __decorate. Got:\n{}",
+        result.code
+    );
+
+    // Member decorator should be lowered
+    assert!(
+        result.code.contains("__decorate([Singleton()], InternalService.prototype, \"getInstance\", null)"),
+        "Member decorator should be lowered. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_exported_class", result.code);
+}
+
+#[test]
+fn test_jit_default_exported_class_with_decorators() {
+    // A default-exported Angular class with non-Angular decorators should
+    // be lowered with `export default ClassName` at the end.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+
+function Logger() { return function(t: any) { return t; }; }
+
+@Logger()
+@Injectable()
+export default class AppService {
+    @Logger()
+    process() {}
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "app.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Should be class expression
+    assert!(
+        result.code.contains("let AppService = class AppService"),
+        "Default-exported class should be converted. Got:\n{}",
+        result.code
+    );
+
+    // Should have `export default AppService` (not `export { AppService }`)
+    assert!(
+        result.code.contains("export default AppService"),
+        "Should use export default. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("export { AppService }"),
+        "Should NOT use named export for default export. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Logger") && !result.code.contains("@Injectable"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_default_export_class", result.code);
+}
+
+#[test]
+fn test_jit_getter_setter_decorators() {
+    // Decorators on getter/setter methods should be lowered like regular methods
+    // (using null, not void 0, since they are accessor methods not property fields).
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive, Input } from '@angular/core';
+
+function Validate() { return function(t: any, k: string, d: any) {}; }
+function Transform() { return function(t: any, k: string, d: any) {}; }
+
+@Directive({ selector: '[appField]' })
+export class FieldDirective {
+    private _value = '';
+
+    @Validate()
+    @Input()
+    get value() { return this._value; }
+    set value(v: string) { this._value = v; }
+
+    @Transform()
+    get computed() { return this._value.toUpperCase(); }
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "field.directive.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Validate") && !result.code.contains("@Input")
+            && !result.code.contains("@Transform"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Getter decorator should use null (method/accessor, not property)
+    assert!(
+        result.code.contains("__decorate([Validate()], FieldDirective.prototype, \"value\", null)"),
+        "Getter decorator should use null (accessor). Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("__decorate([Transform()], FieldDirective.prototype, \"computed\", null)"),
+        "Getter decorator should use null (accessor). Got:\n{}",
+        result.code
+    );
+
+    // Angular decorator should be in propDecorators
+    assert!(
+        result.code.contains("type: Input"),
+        "Angular getter decorator should be in propDecorators. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_getter_setter_decorators", result.code);
+}
+
+#[test]
+fn test_jit_decorator_with_complex_arguments() {
+    // Decorators with complex arguments (objects, arrays, arrow functions,
+    // template literals) should have their argument text preserved verbatim.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+
+function Config(opts: any) { return function(t: any) { return t; }; }
+function Transform(fn: any) { return function(t: any, k: string, d: any) {}; }
+
+@Config({
+    name: 'test',
+    deps: [ServiceA, ServiceB],
+    factory: () => new TestService(),
+})
+@Injectable()
+export class TestService {
+    @Transform((val: string) => val.trim())
+    process() {}
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "test.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain
+    assert!(
+        !result.code.contains("@Config") && !result.code.contains("@Injectable")
+            && !result.code.contains("@Transform"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Complex arguments should be preserved in the __decorate call
+    assert!(
+        result.code.contains("Config("),
+        "Config decorator with complex args should be in __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("factory: () => new TestService()"),
+        "Arrow function argument should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("deps: [ServiceA, ServiceB]"),
+        "Array argument should be preserved. Got:\n{}",
+        result.code
+    );
+
+    // Method decorator with arrow function arg
+    assert!(
+        result.code.contains("Transform((val: string) => val.trim())"),
+        "Arrow function in method decorator should be preserved. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_complex_decorator_arguments", result.code);
+}
+
 // =========================================================================
 // Source map tests
 // =========================================================================

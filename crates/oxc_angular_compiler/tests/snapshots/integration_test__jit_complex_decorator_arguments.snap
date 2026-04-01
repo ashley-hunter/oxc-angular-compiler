@@ -1,0 +1,24 @@
+---
+source: crates/oxc_angular_compiler/tests/integration_test.rs
+expression: result.code
+---
+
+import { Injectable } from '@angular/core';
+import { __decorate } from "tslib";
+
+function Config(opts: any) { return function(t: any) { return t; }; }
+function Transform(fn: any) { return function(t: any, k: string, d: any) {}; }
+
+let TestService = class TestService {
+    process() {}
+};
+__decorate([Transform((val: string) => val.trim())], TestService.prototype, "process", null);
+TestService = __decorate([
+    Config({
+    name: 'test',
+    deps: [ServiceA, ServiceB],
+    factory: () => new TestService(),
+}),
+    Injectable()
+], TestService);
+export { TestService };
