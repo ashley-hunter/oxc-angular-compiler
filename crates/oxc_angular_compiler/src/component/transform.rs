@@ -1495,8 +1495,15 @@ fn transform_angular_file_jit(
         // 4e. After class body, add member __decorate calls, then class __decorate call, then export
         let mut after_class = String::from(";\n");
 
-        // Emit __decorate() for non-Angular member decorators (before class __decorate)
-        for member_dec in &jit_info.non_angular_member_decorators {
+        // Emit __decorate() for non-Angular member decorators (before class __decorate).
+        // Match TypeScript's ordering: instance (prototype) members first, then static members.
+        // Within each group, preserve source declaration order.
+        for member_dec in jit_info
+            .non_angular_member_decorators
+            .iter()
+            .filter(|m| !m.is_static)
+            .chain(jit_info.non_angular_member_decorators.iter().filter(|m| m.is_static))
+        {
             let target = if member_dec.is_static {
                 jit_info.class_name.clone()
             } else {

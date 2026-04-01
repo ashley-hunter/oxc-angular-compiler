@@ -1,6 +1,5 @@
 ---
 source: crates/oxc_angular_compiler/tests/integration_test.rs
-assertion_line: 6486
 expression: result.code
 ---
 
@@ -13,8 +12,8 @@ let TodoState = class TodoState {
 
     add(ctx: any, action: any) { ctx.setState(action); }
 };
-__decorate([Selector()], TodoState, "todos", null);
 __decorate([Action(AddTodo)], TodoState.prototype, "add", null);
+__decorate([Selector()], TodoState, "todos", null);
 TodoState = __decorate([
     State({ name: 'todo' }),
     Injectable()

@@ -36,10 +36,10 @@ let TodoState = class TodoState {
 
     toggle(ctx: StateContext<TodoStateModel>, action: ToggleTodo) { /* ... */ }
 };
-__decorate([Selector()], TodoState, "todos", null);
-__decorate([Selector()], TodoState, "filter", null);
 __decorate([Action(AddTodo)], TodoState.prototype, "add", null);
 __decorate([Action(ToggleTodo)], TodoState.prototype, "toggle", null);
+__decorate([Selector()], TodoState, "todos", null);
+__decorate([Selector()], TodoState, "filter", null);
 TodoState = __decorate([
     State<TodoStateModel>({ name: 'todo', defaults: { items: [], filter: 'all' } }),
     Injectable()
