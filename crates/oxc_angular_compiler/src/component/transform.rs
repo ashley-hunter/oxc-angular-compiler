@@ -828,140 +828,62 @@ fn extract_jit_ctor_params(
     params
 }
 
-/// Extract Angular member decorators for JIT propDecorators generation.
+/// Angular field decorators that go into `static propDecorators`.
+/// Matches Angular's official `FIELD_DECORATORS` constant from `@angular/compiler-cli`.
+const ANGULAR_FIELD_DECORATORS: &[&str] = &[
+    "Input",
+    "Output",
+    "HostBinding",
+    "HostListener",
+    "ViewChild",
+    "ViewChildren",
+    "ContentChild",
+    "ContentChildren",
+];
+
+/// All Angular decorator names from `@angular/core`.
+/// Any decorator with one of these names is treated as Angular and excluded from
+/// non-Angular `__decorate()` lowering. Angular identifies decorators by import source;
+/// we use names since they're unique to `@angular/core`.
+const ANGULAR_DECORATOR_NAMES: &[&str] = &[
+    // Field decorators (→ propDecorators)
+    "Input",
+    "Output",
+    "HostBinding",
+    "HostListener",
+    "ViewChild",
+    "ViewChildren",
+    "ContentChild",
+    "ContentChildren",
+    // Parameter decorators (→ ctorParameters)
+    "Inject",
+    "Optional",
+    "Self",
+    "SkipSelf",
+    "Host",
+    "Attribute",
+    // Class decorators (→ class __decorate)
+    "Component",
+    "Directive",
+    "Pipe",
+    "Injectable",
+    "NgModule",
+];
+
+/// Extract all member decorators for JIT transformation in a single pass.
 ///
-/// Collects all Angular-relevant decorators from class properties/methods
-/// (excluding constructor) so they can be emitted as a `static propDecorators` property.
-fn extract_jit_member_decorators(
+/// Returns two collections:
+/// - Angular field decorators → emitted as `static propDecorators = { ... }`
+/// - Non-Angular decorators → emitted as `__decorate([...], target, "name", desc)` calls
+fn extract_all_jit_member_decorators(
     source: &str,
     class: &oxc_ast::ast::Class<'_>,
-) -> std::vec::Vec<JitMemberDecorator> {
+) -> (std::vec::Vec<JitMemberDecorator>, std::vec::Vec<JitNonAngularMemberDecorator>) {
     use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey};
 
-    const ANGULAR_MEMBER_DECORATORS: &[&str] = &[
-        "Input",
-        "Output",
-        "HostBinding",
-        "HostListener",
-        "ViewChild",
-        "ViewChildren",
-        "ContentChild",
-        "ContentChildren",
-    ];
-
-    let mut result: std::vec::Vec<JitMemberDecorator> = std::vec::Vec::new();
-
-    for element in &class.body.body {
-        let (member_name, decorators) = match element {
-            ClassElement::PropertyDefinition(prop) => {
-                let name = match &prop.key {
-                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                    PropertyKey::StringLiteral(s) => s.value.to_string(),
-                    _ => continue,
-                };
-                (name, &prop.decorators)
-            }
-            ClassElement::MethodDefinition(method) => {
-                if method.kind == MethodDefinitionKind::Constructor {
-                    continue;
-                }
-                let name = match &method.key {
-                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                    PropertyKey::StringLiteral(s) => s.value.to_string(),
-                    _ => continue,
-                };
-                (name, &method.decorators)
-            }
-            ClassElement::AccessorProperty(accessor) => {
-                let name = match &accessor.key {
-                    PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                    PropertyKey::StringLiteral(s) => s.value.to_string(),
-                    _ => continue,
-                };
-                (name, &accessor.decorators)
-            }
-            _ => continue,
-        };
-
-        let mut angular_decs: std::vec::Vec<JitParamDecorator> = std::vec::Vec::new();
-
-        for decorator in decorators {
-            let (dec_name, call_args) = match &decorator.expression {
-                Expression::CallExpression(call) => {
-                    let name = match &call.callee {
-                        Expression::Identifier(id) => id.name.to_string(),
-                        Expression::StaticMemberExpression(m) => m.property.name.to_string(),
-                        _ => continue,
-                    };
-                    let args = if call.arguments.is_empty() {
-                        None
-                    } else {
-                        let start = call.arguments.first().unwrap().span().start;
-                        let end = call.arguments.last().unwrap().span().end;
-                        Some(source[start as usize..end as usize].to_string())
-                    };
-                    (name, args)
-                }
-                Expression::Identifier(id) => (id.name.to_string(), None),
-                _ => continue,
-            };
-
-            if ANGULAR_MEMBER_DECORATORS.contains(&dec_name.as_str()) {
-                angular_decs.push(JitParamDecorator { name: dec_name, args: call_args });
-            }
-        }
-
-        if !angular_decs.is_empty() {
-            result.push(JitMemberDecorator { member_name, decorators: angular_decs });
-        }
-    }
-
-    result
-}
-
-/// Extract non-Angular member decorators that need to be lowered via __decorate() calls.
-///
-/// These are decorators on methods/properties that are NOT Angular-specific
-/// (e.g., NGXS @Action, @Selector). They need to be emitted as:
-/// - `__decorate([Decorator()], Class.prototype, "method", null)` for instance members
-/// - `__decorate([Decorator()], Class, "method", null)` for static members
-fn extract_non_angular_member_decorators(
-    source: &str,
-    class: &oxc_ast::ast::Class<'_>,
-) -> std::vec::Vec<JitNonAngularMemberDecorator> {
-    use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey};
-
-    // All Angular decorators that should NOT be lowered via __decorate().
-    // This includes field decorators (handled via propDecorators), parameter decorators
-    // (handled via ctorParameters), and class decorators (handled via class __decorate).
-    // Angular identifies these by import source (@angular/core); we use names since
-    // they're unique enough and matches the official FIELD_DECORATORS list.
-    const ANGULAR_DECORATORS: &[&str] = &[
-        // Field decorators (go into propDecorators)
-        "Input",
-        "Output",
-        "HostBinding",
-        "HostListener",
-        "ViewChild",
-        "ViewChildren",
-        "ContentChild",
-        "ContentChildren",
-        // Parameter decorators (go into ctorParameters, but could appear on members)
-        "Inject",
-        "Optional",
-        "Self",
-        "SkipSelf",
-        "Host",
-        "Attribute",
-        // Class decorators (shouldn't appear on members, but exclude defensively)
-        "Component",
-        "Directive",
-        "Pipe",
-        "Injectable",
-        "NgModule",
-    ];
-
-    let mut result: std::vec::Vec<JitNonAngularMemberDecorator> = std::vec::Vec::new();
+    let mut angular_members: std::vec::Vec<JitMemberDecorator> = std::vec::Vec::new();
+    let mut non_angular_members: std::vec::Vec<JitNonAngularMemberDecorator> =
+        std::vec::Vec::new();
 
     for element in &class.body.body {
         let (member_name, is_static, is_property, decorators) = match element {
@@ -995,34 +917,52 @@ fn extract_non_angular_member_decorators(
             _ => continue,
         };
 
+        let mut angular_decs: std::vec::Vec<JitParamDecorator> = std::vec::Vec::new();
         let mut non_angular_texts: std::vec::Vec<String> = std::vec::Vec::new();
 
         for decorator in decorators {
-            let dec_name = match &decorator.expression {
-                Expression::CallExpression(call) => match &call.callee {
-                    Expression::Identifier(id) => Some(id.name.to_string()),
-                    Expression::StaticMemberExpression(m) => Some(m.property.name.to_string()),
-                    _ => None,
-                },
-                Expression::Identifier(id) => Some(id.name.to_string()),
-                _ => None,
+            let (dec_name, call_args) = match &decorator.expression {
+                Expression::CallExpression(call) => {
+                    let name = match &call.callee {
+                        Expression::Identifier(id) => id.name.to_string(),
+                        Expression::StaticMemberExpression(m) => m.property.name.to_string(),
+                        _ => continue,
+                    };
+                    let args = if call.arguments.is_empty() {
+                        None
+                    } else {
+                        let start = call.arguments.first().unwrap().span().start;
+                        let end = call.arguments.last().unwrap().span().end;
+                        Some(source[start as usize..end as usize].to_string())
+                    };
+                    (name, args)
+                }
+                Expression::Identifier(id) => (id.name.to_string(), None),
+                _ => continue,
             };
 
-            let is_angular = dec_name
-                .as_ref()
-                .is_some_and(|n| ANGULAR_DECORATORS.contains(&n.as_str()));
-
-            if !is_angular {
-                // Extract the decorator expression text from source (without the @)
+            if ANGULAR_FIELD_DECORATORS.contains(&dec_name.as_str()) {
+                // Angular field decorator → goes into propDecorators
+                angular_decs.push(JitParamDecorator { name: dec_name, args: call_args });
+            } else if !ANGULAR_DECORATOR_NAMES.contains(&dec_name.as_str()) {
+                // Non-Angular decorator → goes into __decorate() call
                 let expr_start = decorator.expression.span().start;
                 let expr_end = decorator.expression.span().end;
-                let text = source[expr_start as usize..expr_end as usize].to_string();
-                non_angular_texts.push(text);
+                non_angular_texts.push(source[expr_start as usize..expr_end as usize].to_string());
             }
+            // Angular non-field decorators (e.g. @Inject on a member) are silently dropped
+            // since they have no meaningful effect on members.
+        }
+
+        if !angular_decs.is_empty() {
+            angular_members.push(JitMemberDecorator {
+                member_name: member_name.clone(),
+                decorators: angular_decs,
+            });
         }
 
         if !non_angular_texts.is_empty() {
-            result.push(JitNonAngularMemberDecorator {
+            non_angular_members.push(JitNonAngularMemberDecorator {
                 member_name,
                 is_static,
                 is_property,
@@ -1031,7 +971,7 @@ fn extract_non_angular_member_decorators(
         }
     }
 
-    result
+    (angular_members, non_angular_members)
 }
 
 /// Build the propDecorators static property text for JIT member decorator metadata.
@@ -1353,11 +1293,9 @@ fn transform_angular_file_jit(
         // Extract constructor parameters for ctorParameters
         let ctor_params = extract_jit_ctor_params(source, class);
 
-        // Extract Angular member decorators for propDecorators
-        let member_decorators = extract_jit_member_decorators(source, class);
-
-        // Extract non-Angular member decorators for __decorate() calls
-        let non_angular_member_decorators = extract_non_angular_member_decorators(source, class);
+        // Extract Angular and non-Angular member decorators
+        let (member_decorators, non_angular_member_decorators) =
+            extract_all_jit_member_decorators(source, class);
 
         jit_classes.push(JitClassInfo {
             class_name,
