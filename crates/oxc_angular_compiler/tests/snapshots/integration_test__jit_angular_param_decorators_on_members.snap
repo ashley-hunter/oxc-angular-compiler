@@ -1,0 +1,22 @@
+---
+source: crates/oxc_angular_compiler/tests/integration_test.rs
+expression: result.code
+---
+
+import { Injectable, Inject, Optional } from '@angular/core';
+import { __decorate } from "tslib";
+
+function Custom() { return function(t: any, k: string) {}; }
+
+let MyService = class MyService {
+    token: any;
+
+    optionalDep: any;
+
+    customProp: string = '';
+};
+__decorate([Custom()], MyService.prototype, "customProp", void 0);
+MyService = __decorate([
+    Injectable()
+], MyService);
+export { MyService };
