@@ -7039,6 +7039,58 @@ export class TestService {
     insta::assert_snapshot!("jit_complex_decorator_arguments", result.code);
 }
 
+#[test]
+fn test_jit_angular_param_decorators_not_in_member_decorate() {
+    // Angular parameter decorators (@Inject, @Optional, @Self, @SkipSelf, @Host, @Attribute)
+    // should NOT be emitted in __decorate() calls if they appear on a member.
+    // While these are designed for constructor params, if someone puts them on a member,
+    // they should be treated as Angular decorators (not lowered via __decorate).
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable, Inject, Optional } from '@angular/core';
+
+function Custom() { return function(t: any, k: string) {}; }
+
+@Injectable()
+export class MyService {
+    @Inject('TOKEN')
+    token: any;
+
+    @Optional()
+    optionalDep: any;
+
+    @Custom()
+    customProp: string = '';
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // @Custom should be lowered via __decorate (it's non-Angular)
+    assert!(
+        result.code.contains("__decorate([Custom()], MyService.prototype, \"customProp\", void 0)"),
+        "Non-Angular decorator should be in __decorate. Got:\n{}",
+        result.code
+    );
+
+    // @Inject and @Optional should NOT appear in __decorate calls for members
+    // They are Angular decorators and should not be treated as non-Angular
+    let member_decorate_calls: Vec<&str> = result.code.lines()
+        .filter(|l| l.contains("__decorate(") && l.contains(".prototype"))
+        .collect();
+    for call in &member_decorate_calls {
+        assert!(
+            !call.contains("Inject(") && !call.contains("Optional()"),
+            "Angular param decorators should not appear in member __decorate calls. Got:\n{}",
+            call
+        );
+    }
+
+    insta::assert_snapshot!("jit_angular_param_decorators_on_members", result.code);
+}
+
 // =========================================================================
 // Reference output comparison tests
 // =========================================================================

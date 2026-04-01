@@ -931,7 +931,13 @@ fn extract_non_angular_member_decorators(
 ) -> std::vec::Vec<JitNonAngularMemberDecorator> {
     use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey};
 
-    const ANGULAR_MEMBER_DECORATORS: &[&str] = &[
+    // All Angular decorators that should NOT be lowered via __decorate().
+    // This includes field decorators (handled via propDecorators), parameter decorators
+    // (handled via ctorParameters), and class decorators (handled via class __decorate).
+    // Angular identifies these by import source (@angular/core); we use names since
+    // they're unique enough and matches the official FIELD_DECORATORS list.
+    const ANGULAR_DECORATORS: &[&str] = &[
+        // Field decorators (go into propDecorators)
         "Input",
         "Output",
         "HostBinding",
@@ -940,6 +946,19 @@ fn extract_non_angular_member_decorators(
         "ViewChildren",
         "ContentChild",
         "ContentChildren",
+        // Parameter decorators (go into ctorParameters, but could appear on members)
+        "Inject",
+        "Optional",
+        "Self",
+        "SkipSelf",
+        "Host",
+        "Attribute",
+        // Class decorators (shouldn't appear on members, but exclude defensively)
+        "Component",
+        "Directive",
+        "Pipe",
+        "Injectable",
+        "NgModule",
     ];
 
     let mut result: std::vec::Vec<JitNonAngularMemberDecorator> = std::vec::Vec::new();
@@ -991,7 +1010,7 @@ fn extract_non_angular_member_decorators(
 
             let is_angular = dec_name
                 .as_ref()
-                .is_some_and(|n| ANGULAR_MEMBER_DECORATORS.contains(&n.as_str()));
+                .is_some_and(|n| ANGULAR_DECORATORS.contains(&n.as_str()));
 
             if !is_angular {
                 // Extract the decorator expression text from source (without the @)
