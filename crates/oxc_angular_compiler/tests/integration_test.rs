@@ -6555,6 +6555,49 @@ export class TodoState {
     insta::assert_snapshot!("jit_full_ngxs_example", result.code);
 }
 
+#[test]
+fn test_jit_non_angular_property_decorator_uses_void_0() {
+    // TypeScript uses `void 0` (not `null`) as the 4th argument for property decorators
+    // because properties don't have an existing descriptor on the prototype.
+    // Methods use `null` which tells __decorate to call Object.getOwnPropertyDescriptor.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Injectable } from '@angular/core';
+
+function Validate() { return function(t: any, k: string) {}; }
+function Log(target: any, key: string, desc: PropertyDescriptor) {}
+
+@Injectable()
+export class MyService {
+    @Validate()
+    name: string = '';
+
+    @Log
+    greet() { return 'hello'; }
+}
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, &options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Property decorator should use `void 0`
+    assert!(
+        result.code.contains("__decorate([Validate()], MyService.prototype, \"name\", void 0)"),
+        "Property decorator should use `void 0` as 4th arg. Got:\n{}",
+        result.code
+    );
+
+    // Method decorator should use `null`
+    assert!(
+        result.code.contains("__decorate([Log], MyService.prototype, \"greet\", null)"),
+        "Method decorator should use `null` as 4th arg. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_property_decorator_void_0", result.code);
+}
+
 // =========================================================================
 // Source map tests
 // =========================================================================

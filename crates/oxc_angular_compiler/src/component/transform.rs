@@ -728,6 +728,9 @@ struct JitNonAngularMemberDecorator {
     member_name: String,
     /// Whether the member is static.
     is_static: bool,
+    /// Whether this is a property (field) vs a method/accessor.
+    /// TypeScript uses `void 0` for properties and `null` for methods/accessors.
+    is_property: bool,
     /// The decorator expression texts (e.g., "Selector()", "Action(AddTodo)").
     decorator_texts: std::vec::Vec<String>,
 }
@@ -942,14 +945,14 @@ fn extract_non_angular_member_decorators(
     let mut result: std::vec::Vec<JitNonAngularMemberDecorator> = std::vec::Vec::new();
 
     for element in &class.body.body {
-        let (member_name, is_static, decorators) = match element {
+        let (member_name, is_static, is_property, decorators) = match element {
             ClassElement::PropertyDefinition(prop) => {
                 let name = match &prop.key {
                     PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, prop.r#static, &prop.decorators)
+                (name, prop.r#static, true, &prop.decorators)
             }
             ClassElement::MethodDefinition(method) => {
                 if method.kind == MethodDefinitionKind::Constructor {
@@ -960,7 +963,7 @@ fn extract_non_angular_member_decorators(
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, method.r#static, &method.decorators)
+                (name, method.r#static, false, &method.decorators)
             }
             ClassElement::AccessorProperty(accessor) => {
                 let name = match &accessor.key {
@@ -968,7 +971,7 @@ fn extract_non_angular_member_decorators(
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, accessor.r#static, &accessor.decorators)
+                (name, accessor.r#static, false, &accessor.decorators)
             }
             _ => continue,
         };
@@ -1003,6 +1006,7 @@ fn extract_non_angular_member_decorators(
             result.push(JitNonAngularMemberDecorator {
                 member_name,
                 is_static,
+                is_property,
                 decorator_texts: non_angular_texts,
             });
         }
@@ -1509,11 +1513,15 @@ fn transform_angular_file_jit(
             } else {
                 format!("{}.prototype", jit_info.class_name)
             };
+            // TypeScript uses `null` for methods/accessors (reads existing descriptor)
+            // and `void 0` for properties (no existing descriptor).
+            let desc = if member_dec.is_property { "void 0" } else { "null" };
             after_class.push_str(&format!(
-                "__decorate([{}], {}, \"{}\", null);\n",
+                "__decorate([{}], {}, \"{}\", {});\n",
                 member_dec.decorator_texts.join(", "),
                 target,
-                member_dec.member_name
+                member_dec.member_name,
+                desc
             ));
         }
 
