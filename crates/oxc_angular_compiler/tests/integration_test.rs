@@ -7260,6 +7260,74 @@ export class AppComponent {
 }
 
 #[test]
+fn test_jit_all_inline_type_import_elided() {
+    // An import whose specifiers all carry inline `type` modifiers must be
+    // elided entirely, not left behind as a bare side-effect import.
+    let allocator = Allocator::default();
+    let source = r#"
+import './side-effect';
+import { Pipe, type PipeTransform } from '@angular/core';
+import { type Get } from 'type-fest';
+import type { Whole } from './whole';
+import Def, { type Partial } from './default-mixed';
+
+@Pipe({ name: 'demo' })
+export class DemoPipe implements PipeTransform {
+    transform(v: string) { return Def(v as unknown as Whole as Partial as string); }
+}
+
+export let sample: Get<{ a: 1 }, 'a'> | undefined;
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "demo.pipe.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        !result.code.contains("type-fest"),
+        "All-inline-type import should be elided, not kept as a side-effect import. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("./whole"),
+        "`import type {{ ... }}` statement should be elided. Got:\n{}",
+        result.code
+    );
+
+    // Mixed import keeps its value binding, drops the type-only one
+    assert!(
+        result.code.contains("import { Pipe } from"),
+        "Value binding of mixed import should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("PipeTransform"),
+        "Type-only binding of mixed import should be dropped. Got:\n{}",
+        result.code
+    );
+
+    // Default import alongside an inline-type specifier keeps the default
+    // binding and drops the type-only sibling
+    assert!(
+        result.code.contains("import Def from"),
+        "Default import with inline-type sibling should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("Partial"),
+        "Inline-type sibling of a default import should be dropped. Got:\n{}",
+        result.code
+    );
+
+    // Deliberate side-effect imports (no specifier list) must survive
+    assert!(
+        result.code.contains("import \"./side-effect\""),
+        "Bare side-effect import should be preserved. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
 fn test_jit_component_class_restructuring() {
     // JIT should restructure: export class X {} → let X = class X {}; X = __decorate([...], X); export { X };
     let allocator = Allocator::default();
