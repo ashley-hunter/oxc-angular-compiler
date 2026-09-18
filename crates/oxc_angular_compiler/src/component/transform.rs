@@ -1981,6 +1981,30 @@ fn strip_typescript(allocator: &Allocator, path: &str, code: &str) -> String {
     // In oxc 0.129.0, parameter properties generate field declarations which we need to remove.
     let param_property_names = collect_parameter_property_names(&program);
 
+    // An import whose specifiers all carry inline `type` modifiers has no runtime
+    // bindings. Promote it to `import type` so `only_remove_type_imports` elides
+    // the whole statement instead of leaving a bare side-effect import behind.
+    // This intentionally diverges from tsc's verbatimModuleSyntax (which keeps
+    // `import {}` for side effects) to match Angular CLI's esbuild pipeline;
+    // side effects need an explicit `import 'mod'`, which is left untouched.
+    for stmt in &mut program.body {
+        if let Statement::ImportDeclaration(import_decl) = stmt
+            && import_decl.import_kind == ImportOrExportKind::Value
+            && import_decl.specifiers.as_ref().is_some_and(|specs| {
+                !specs.is_empty()
+                    && specs.iter().all(|spec| {
+                        matches!(
+                            spec,
+                            ImportDeclarationSpecifier::ImportSpecifier(s)
+                                if s.import_kind.is_type()
+                        )
+                    })
+            })
+        {
+            import_decl.import_kind = ImportOrExportKind::Type;
+        }
+    }
+
     let semantic_ret =
         oxc_semantic::SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
 
