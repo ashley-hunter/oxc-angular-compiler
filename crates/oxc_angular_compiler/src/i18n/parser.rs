@@ -37,6 +37,9 @@ pub struct I18nVisitorContext {
     pub placeholder_to_message: FxHashMap<String, Message>,
     /// Source file for span conversion.
     pub source_file: Arc<ParseSourceFile>,
+    /// Full name (`:svg:svg`) of the element whose children are being visited, from which
+    /// child elements inherit their namespace.
+    pub parent_element: Option<String>,
 }
 
 impl I18nVisitorContext {
@@ -48,6 +51,7 @@ impl I18nVisitorContext {
             placeholders: FxHashMap::default(),
             placeholder_to_message: FxHashMap::default(),
             source_file,
+            parent_element: None,
         }
     }
 }
@@ -85,7 +89,32 @@ impl I18nMessageFactory {
         visit_node_fn: Option<VisitNodeFn>,
         source_file: Arc<ParseSourceFile>,
     ) -> Message {
+        self.create_message_in(
+            nodes,
+            None,
+            meaning,
+            description,
+            custom_id,
+            visit_node_fn,
+            source_file,
+        )
+    }
+
+    /// Converts the children of an element with the given full name (such as `:svg:text`) to
+    /// an i18n Message, so elements inherit its namespace as in Angular's HTML parser.
+    #[expect(clippy::too_many_arguments)]
+    pub fn create_message_in(
+        &self,
+        nodes: &[HtmlNode<'_>],
+        parent_element: Option<&str>,
+        meaning: Option<&str>,
+        description: Option<&str>,
+        custom_id: Option<&str>,
+        visit_node_fn: Option<VisitNodeFn>,
+        source_file: Arc<ParseSourceFile>,
+    ) -> Message {
         let mut context = I18nVisitorContext::new(source_file);
+        context.parent_element = parent_element.map(str::to_string);
         let visit_fn = visit_node_fn.unwrap_or(noop_visit_node);
 
         // Check if this is a single ICU expression
@@ -132,9 +161,11 @@ impl I18nMessageFactory {
     pub fn create_icu_message(
         &self,
         expansion: &HtmlExpansion<'_>,
+        parent_element: Option<&str>,
         source_file: Arc<ParseSourceFile>,
     ) -> Message {
         let mut context = I18nVisitorContext::new(source_file);
+        context.parent_element = parent_element.map(str::to_string);
         context.is_icu = true;
         let nodes =
             self.visit_expansion(expansion, &mut context, noop_visit_node).into_iter().collect();
@@ -585,7 +616,9 @@ impl I18nMessageFactory {
         context: &mut I18nVisitorContext,
         visit_fn: VisitNodeFn,
     ) -> Option<Node> {
-        let tag_name = element.name.as_str();
+        // Angular names placeholders from the element's full name (`:svg:circle`).
+        let full_name = element_full_name(element.name.as_str(), context.parent_element.as_deref());
+        let tag_name = full_name.as_str();
         let is_void = is_void_element(tag_name);
 
         // Convert element attributes to an IndexMap for placeholder registry (ordered for consistent serialization)
@@ -602,7 +635,9 @@ impl I18nMessageFactory {
         }
 
         // Visit children first: Angular names nested tags before their parent.
+        let parent = context.parent_element.replace(full_name.clone());
         let children = self.visit_all(&element.children, context, visit_fn);
+        context.parent_element = parent;
 
         // Generate placeholder names for the tag
         let start_name =
@@ -832,6 +867,26 @@ pub fn create_i18n_message_factory(
     preserve_expression_whitespace: bool,
 ) -> I18nMessageFactory {
     I18nMessageFactory::new(retain_empty_tokens, preserve_expression_whitespace)
+}
+
+/// An element's full name with its namespace prefix: explicit (`:xhtml:div`), implicit for the
+/// tag (`:svg:svg`) or inherited from its parent (`:svg:circle`), as Angular's HTML parser
+/// computes it in `_getElementFullName`.
+pub(crate) fn element_full_name(name: &str, parent: Option<&str>) -> String {
+    use crate::parser::html::{
+        get_html_tag_definition, get_ns_prefix, merge_ns_and_name, split_ns_name,
+    };
+    if name.starts_with(':') {
+        return name.to_string();
+    }
+    let mut prefix = get_html_tag_definition(name).implicit_namespace_prefix;
+    if prefix.is_none()
+        && let Some(parent) = parent
+        && !get_html_tag_definition(split_ns_name(parent).1).prevent_namespace_inheritance
+    {
+        prefix = get_ns_prefix(parent);
+    }
+    merge_ns_and_name(prefix, name)
 }
 
 /// Extracts a custom placeholder name from an expression if present.

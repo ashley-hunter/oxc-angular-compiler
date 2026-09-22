@@ -181,6 +181,8 @@ pub struct HtmlToR3Transform<'a> {
     /// Tag placeholder start/close names from the enclosing i18n message, keyed by the
     /// element's start offset.
     tag_placeholder_names: FxHashMap<u32, (String, String)>,
+    /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
+    element_full_names: std::vec::Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +221,7 @@ impl<'a> HtmlToR3Transform<'a> {
             icu_placeholder_names: FxHashMap::default(),
             block_placeholder_names: FxHashMap::default(),
             tag_placeholder_names: FxHashMap::default(),
+            element_full_names: std::vec::Vec::new(),
         }
     }
 
@@ -362,6 +365,10 @@ impl<'a> HtmlToR3Transform<'a> {
         // Note: foreignObject is an SVG element but its children use HTML namespace.
         // We need to distinguish between the element's own namespace (for naming) and
         // the namespace for its children (pushed to stack).
+        let full_name = crate::i18n::parser::element_full_name(
+            element.name.as_str(),
+            self.element_full_names.last().map(String::as_str),
+        );
         let parent_namespace = self.current_namespace();
         let child_namespace = self.resolve_namespace(raw_name, parent_namespace);
 
@@ -416,8 +423,9 @@ impl<'a> HtmlToR3Transform<'a> {
                 };
                 let custom_id = attr.value.find("@@").map(|pos| &attr.value.as_str()[pos + 2..]);
 
-                let message = factory.create_message(
+                let message = factory.create_message_in(
                     &element.children,
+                    Some(&full_name),
                     meaning,
                     description,
                     custom_id,
@@ -478,7 +486,9 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Visit children
+        self.element_full_names.push(full_name);
         let children = self.visit_children(&element.children);
+        self.element_full_names.pop();
 
         // Decrement non_bindable depth if we incremented it
         if has_non_bindable {
@@ -1290,8 +1300,11 @@ impl<'a> HtmlToR3Transform<'a> {
         // than a sub-message of it.
         let source_file =
             std::sync::Arc::new(crate::util::ParseSourceFile::new(self.source_text, "<template>"));
-        let icu_message =
-            I18nMessageFactory::new(false, true).create_icu_message(expansion, source_file);
+        let icu_message = I18nMessageFactory::new(false, true).create_icu_message(
+            expansion,
+            self.element_full_names.last().map(String::as_str),
+            source_file,
+        );
         let message_string = icu_message.serialize();
         // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
         // vars, interpolations become bound text, and element markup becomes plain text.
