@@ -4291,6 +4291,182 @@ fn test_i18n_expression_ordering_icu_plural_with_pipe() {
     );
 }
 
+/// Compiles a component with the given template and returns its `consts` function and
+/// template function, with line breaks collapsed and the `__makeTemplateObject` helper
+/// shortened to `__tpl`, so assertions do not depend on the emitter's line wrapping.
+fn compile_i18n_component(template: &str) -> String {
+    let allocator = Allocator::default();
+    let source = format!(
+        "import {{ Component }} from '@angular/core';\n\
+         @Component({{ selector: 'app-repro', template: `{template}` }})\n\
+         export class Repro {{ count = 3; gender = 'male'; name = 'Bob'; }}\n"
+    );
+    let result = transform_angular_file(&allocator, "repro.ts", &source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code = result.code.replace(
+        r#"(this&&this.__makeTemplateObject||function(e,t){return Object.defineProperty?Object.defineProperty(e,"raw",{value:t}):e.raw=t,e})"#,
+        "__tpl",
+    );
+    let start = code.find("consts:").expect("component should have consts");
+    let end = code[start..].find("encapsulation").map_or(code.len(), |e| start + e);
+    let mut out = String::new();
+    for line in code[start..end].lines() {
+        out.push_str(line.trim_start());
+    }
+    out
+}
+
+/// Asserts that `haystack` contains `needle`, printing the compiled output on failure.
+#[track_caller]
+fn assert_contains(haystack: &str, needle: &str) {
+    assert!(haystack.contains(needle), "Expected to find:\n{needle}\nin:\n{haystack}");
+}
+
+/// An `i18n-<attr>` message takes the attribute's own value as its text.
+/// Expected output taken from Angular 22.1.5 `ngc`:
+///   goog.getMsg("Close") / $localize `:@@close:Close`
+#[test]
+fn test_i18n_attribute_message_uses_attribute_value() {
+    let js = compile_i18n_component(r#"<div i18n-title="@@close" title="Close"></div>"#);
+    assert_contains(&js, r#"goog.getMsg("Close")"#);
+    assert_contains(&js, r#"__tpl([":@@close:Close"], [":@@close:Close"])"#);
+    assert_contains(&js, r#"return [["title",i18n_0]]"#);
+}
+
+/// An interpolated `i18n-<attr>` keeps its text and gets an INTERPOLATION placeholder.
+/// Angular 22.1.5: goog.getMsg("Hi {$interpolation}!", { "interpolation": "�0�" }, ...)
+///                 $localize `:@@hi:Hi ${"�0�"}:INTERPOLATION:!`
+#[test]
+fn test_i18n_interpolated_attribute_message_uses_attribute_value() {
+    let js = compile_i18n_component(r#"<div i18n-title="@@hi" title="Hi {{name}}!"></div>"#);
+    assert_contains(
+        &js,
+        "goog.getMsg(\"Hi {$interpolation}!\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"}",
+    );
+    assert_contains(
+        &js,
+        "__tpl([\":@@hi:Hi \", \":INTERPOLATION:!\"], [\":@@hi:Hi \", \":INTERPOLATION:!\"]), \"\u{FFFD}0\u{FFFD}\")",
+    );
+}
+
+/// `i18n-<attr>` alongside an `i18n` element body: both messages keep their text.
+/// Angular 22.1.5: i18n_0 = "Close" (@@ttl), i18n_1 = "Body text" (@@body),
+///                 return [i18n_1, ["title", i18n_0]]
+#[test]
+fn test_i18n_attribute_and_element_body_on_same_element() {
+    let js = compile_i18n_component(
+        r#"<div i18n="@@body" i18n-title="@@ttl" title="Close">Body text</div>"#,
+    );
+    assert_contains(&js, r#"goog.getMsg("Close")"#);
+    assert_contains(&js, r#"__tpl([":@@ttl:Close"], [":@@ttl:Close"])"#);
+    assert_contains(&js, r#"goog.getMsg("Body text")"#);
+    assert_contains(&js, r#"__tpl([":@@body:Body text"], [":@@body:Body text"])"#);
+    assert_contains(&js, r#"return [i18n_1,["title",i18n_0]]"#);
+}
+
+/// An element whose only child is an ICU: the ICU *is* the message. Angular 22.1.5 emits no
+/// sub-message, keeps `{INTERPOLATION}` as literal ICU text, and post-processes the message
+/// to map the ICU's placeholders to runtime slots.
+#[test]
+fn test_i18n_sole_icu_is_the_message() {
+    let js = compile_i18n_component(
+        r#"<span i18n="@@items">{count, plural, =1 {one item} other {{{count}} items}}</span><div i18n-title="@@close" title="Close"></div>"#,
+    );
+    // Only two messages: the title attribute and the ICU.
+    assert!(!js.contains("i18n_2"), "ICU must not produce a separate sub-message:\n{js}");
+    assert!(!js.contains(r#""icu""#), "ICU must not be referenced as a placeholder:\n{js}");
+    assert_contains(
+        &js,
+        r#"goog.getMsg("{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}")"#,
+    );
+    assert_contains(
+        &js,
+        r#"__tpl([":@@items:{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"], [":@@items:{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"]))"#,
+    );
+    // Post-processing runs after the Closure/$localize branch, for both modes.
+    assert_contains(
+        &js,
+        "}(i18n_1 = i0.ɵɵi18nPostprocess(i18n_1,{\"INTERPOLATION\":\"\u{FFFD}1\u{FFFD}\",\"VAR_PLURAL\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(&js, r#"return [i18n_1,["title",i18n_0]]"#);
+    assert_contains(&js, "i0.ɵɵi18nExp(ctx.count)(ctx.count);");
+}
+
+/// A sole `select` ICU. Angular 22.1.5:
+///   goog.getMsg("{VAR_SELECT, select, male {he} female {she} other {they}}")
+///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "VAR_SELECT": "�0�" });
+#[test]
+fn test_i18n_sole_select_icu_is_the_message() {
+    let js = compile_i18n_component(
+        r#"<span i18n>{gender, select, male {he} female {she} other {they}}</span>"#,
+    );
+    assert!(!js.contains("i18n_1"), "ICU must not produce a separate sub-message:\n{js}");
+    assert_contains(
+        &js,
+        r#"goog.getMsg("{VAR_SELECT, select, male {he} female {she} other {they}}")"#,
+    );
+    assert_contains(&js, r#"__tpl(["{VAR_SELECT, select, male {he} female {she} other {they}}"]"#);
+    assert_contains(
+        &js,
+        "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(&js, "return [i18n_0]");
+}
+
+/// A sole ICU with no interpolation still needs its VAR_PLURAL mapped. Angular 22.1.5:
+///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "VAR_PLURAL": "�0�" });
+#[test]
+fn test_i18n_sole_icu_without_interpolation() {
+    let js = compile_i18n_component(
+        r#"<span i18n>{count, plural, =1 {one item} other {many items}}</span>"#,
+    );
+    assert!(!js.contains("i18n_1"), "ICU must not produce a separate sub-message:\n{js}");
+    assert_contains(
+        &js,
+        r#"goog.getMsg("{VAR_PLURAL, plural, =1 {one item} other {many items}}")"#,
+    );
+    assert_contains(
+        &js,
+        "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_PLURAL\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(&js, "return [i18n_0]");
+}
+
+/// An ICU next to text and an interpolation is a real sub-message, referenced from the root
+/// message through the `icu` placeholder by variable. Angular 22.1.5:
+///   i18n_0 = "{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"
+///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "INTERPOLATION": "�2�", "VAR_PLURAL": "�1�" });
+///   goog.getMsg("Hello {$interpolation}! {$icu}", { "icu": i18n_0, "interpolation": "�0�" }, ...)
+///   $localize `Hello ${"�0�"}:INTERPOLATION:! ${i18n_0}:ICU:`
+#[test]
+fn test_i18n_icu_with_sibling_content_is_sub_message() {
+    let js = compile_i18n_component(
+        r#"<span i18n>Hello {{name}}! {count, plural, =1 {one item} other {{{count}} items}}</span>"#,
+    );
+    assert_contains(
+        &js,
+        r#"goog.getMsg("{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}")"#,
+    );
+    assert_contains(
+        &js,
+        r#"__tpl(["{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"]"#,
+    );
+    assert_contains(
+        &js,
+        "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"INTERPOLATION\":\"\u{FFFD}2\u{FFFD}\",\"VAR_PLURAL\":\"\u{FFFD}1\u{FFFD}\"}));",
+    );
+    assert_contains(
+        &js,
+        "goog.getMsg(\"Hello {$interpolation}! {$icu}\",{\"icu\":i18n_0,\"interpolation\":\"\u{FFFD}0\u{FFFD}\"}",
+    );
+    assert_contains(
+        &js,
+        "__tpl([\"Hello \", \":INTERPOLATION:! \", \":ICU:\"], [\"Hello \", \":INTERPOLATION:! \", \":ICU:\"]), \"\u{FFFD}0\u{FFFD}\", i18n_0)",
+    );
+    assert_contains(&js, "return [i18n_1]");
+    assert_contains(&js, "i0.ɵɵi18nExp(ctx.name)(ctx.count)(ctx.count);");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
