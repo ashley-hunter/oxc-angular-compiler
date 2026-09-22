@@ -690,8 +690,13 @@ fn create_localize_expression<'a>(
     let (text_parts, placeholder_order) = parse_message_string(message_string);
 
     let mut message_parts = ArenaVec::new_in(allocator);
+    let mut raw_message_parts = ArenaVec::new_in(allocator);
     let mut placeholder_names = ArenaVec::new_in(allocator);
     let mut expressions = ArenaVec::new_in(allocator);
+    let mut push_part = |(cooked, raw): (String, String)| {
+        message_parts.push(Ident::from(allocator.alloc_str(&cooked)));
+        raw_message_parts.push(Ident::from(allocator.alloc_str(&raw)));
+    };
 
     // Build a map from placeholder name to value for quick lookup
     let params_map: FxHashMap<String, I18nParamExpr> =
@@ -700,9 +705,7 @@ fn create_localize_expression<'a>(
     // First message part: includes metadata block + first text segment
     // Format: ":meaning|description@@customId:text"
     let first_text = text_parts.first().map(|s| s.as_str()).unwrap_or("");
-    let head_cooked = serialize_i18n_head(first_text, &meaning, &description, &custom_id);
-    let head_str = allocator.alloc_str(&head_cooked);
-    message_parts.push(Ident::from(head_str));
+    push_part(serialize_i18n_head(first_text, &meaning, &description, &custom_id));
 
     // Subsequent parts: ":PLACEHOLDER_NAME:text"
     for (i, placeholder) in placeholder_order.iter().enumerate() {
@@ -720,9 +723,7 @@ fn create_localize_expression<'a>(
 
         // Text part after this placeholder
         let text_part = text_parts.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-        let part_cooked = serialize_i18n_template_part(&formatted_name, text_part);
-        let part_str = allocator.alloc_str(&part_cooked);
-        message_parts.push(Ident::from(part_str));
+        push_part(create_cooked_raw_string(&formatted_name, text_part));
     }
 
     // Store metadata for potential future use (JSDoc generation in emitter)
@@ -745,6 +746,7 @@ fn create_localize_expression<'a>(
             meaning: meaning_atom,
             custom_id: custom_id_atom,
             message_parts,
+            raw_message_parts,
             placeholder_names,
             expressions,
             source_span: None,
@@ -792,51 +794,45 @@ fn parse_message_string(message: &str) -> (Vec<String>, Vec<String>) {
     (text_parts, placeholders)
 }
 
-/// Serialize the i18n head (first message part) with metadata.
-///
-/// Format: ":meaning|description@@customId:text"
-/// - meaning and description are separated by |
-/// - customId is prefixed with @@
-/// - If there's no metadata, just return the text (with starting colon escaped if needed)
+/// Serialize the i18n head (first message part) with its metadata block
+/// (`meaning|description@@customId`), as Angular's `serializeI18nHead`.
 fn serialize_i18n_head(
     text: &str,
     meaning: &Option<String>,
     description: &Option<String>,
     custom_id: &Option<String>,
-) -> String {
-    let mut meta_block = String::new();
-
-    // Build meta block: meaning|description@@customId
-    if let Some(m) = meaning {
-        meta_block.push_str(m);
+) -> (String, String) {
+    let mut meta_block = description.clone().unwrap_or_default();
+    if let Some(meaning) = meaning.as_deref().filter(|m| !m.is_empty()) {
+        meta_block = format!("{meaning}|{meta_block}");
     }
-    if meaning.is_some() || description.is_some() {
-        if meaning.is_some() {
-            meta_block.push('|');
-        }
-        if let Some(d) = description {
-            meta_block.push_str(d);
-        }
+    if let Some(id) = custom_id.as_deref().filter(|id| !id.is_empty()) {
+        meta_block = format!("{meta_block}@@{id}");
     }
-    if let Some(id) = custom_id {
-        meta_block.push_str("@@");
-        meta_block.push_str(id);
-    }
-
-    if meta_block.is_empty() {
-        // No metadata - just return text (escape starting colon if needed)
-        if text.starts_with(':') { format!("\\:{}", &text[1..]) } else { text.to_string() }
-    } else {
-        // With metadata: :meta:text
-        format!(":{}:{}", meta_block, text)
-    }
+    create_cooked_raw_string(&meta_block, text)
 }
 
-/// Serialize an i18n template part (after first part).
-///
-/// Format: ":PLACEHOLDER_NAME:text"
-fn serialize_i18n_template_part(placeholder_name: &str, text: &str) -> String {
-    format!(":{}:{}", placeholder_name, text)
+/// Returns the cooked and raw strings of a `$localize` message part with its metadata block,
+/// as Angular's `createCookedRawString`. Only the raw string carries escapes: `$localize` reads
+/// it to tell an escaped `\:` from the `:` that ends the metadata block.
+fn create_cooked_raw_string(meta_block: &str, message_part: &str) -> (String, String) {
+    let escape_slashes = |s: &str| s.replace('\\', "\\\\");
+    let escape_for_template_literal = |s: &str| s.replace('`', "\\`").replace("${", "$\\{");
+    if meta_block.is_empty() {
+        let raw = escape_slashes(message_part);
+        let raw = match raw.strip_prefix(':') {
+            Some(rest) => format!("\\:{rest}"),
+            None => raw,
+        };
+        (message_part.to_string(), escape_for_template_literal(&raw))
+    } else {
+        let raw = format!(
+            ":{}:{}",
+            escape_slashes(meta_block).replace(':', "\\:"),
+            escape_slashes(message_part)
+        );
+        (format!(":{meta_block}:{message_part}"), escape_for_template_literal(&raw))
+    }
 }
 
 /// Find the parameter value for a placeholder, by its name in the message (Angular:

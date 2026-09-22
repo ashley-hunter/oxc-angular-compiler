@@ -768,6 +768,8 @@ fn clone_expression<'a>(
             for part in loc.message_parts.iter() {
                 message_parts.push(part.clone());
             }
+            let mut raw_message_parts = oxc_allocator::Vec::new_in(allocator);
+            raw_message_parts.extend(loc.raw_message_parts.iter().copied());
             let mut placeholder_names = oxc_allocator::Vec::new_in(allocator);
             for name in loc.placeholder_names.iter() {
                 placeholder_names.push(name.clone());
@@ -782,6 +784,7 @@ fn clone_expression<'a>(
                     meaning: loc.meaning.clone(),
                     custom_id: loc.custom_id.clone(),
                     message_parts,
+                    raw_message_parts,
                     placeholder_names,
                     expressions,
                     source_span: loc.source_span,
