@@ -4758,6 +4758,18 @@ fn test_i18n_namespaced_element_placeholders() {
     assert_contains(&js, "\":START_TAG__XHTML_SPAN:5\"");
 }
 
+/// SVG elements in an i18n message are named with their namespace. Angular 22.1.5:
+///   $localize `Save ${...}:START_TAG__SVG_SVG:${...}:START_TAG__SVG_CIRCLE:...`
+#[test]
+fn test_i18n_svg_element_placeholders() {
+    let js =
+        compile_i18n_component(r#"<div i18n>Save <svg><circle r="1"></circle></svg> now</div>"#);
+    assert_contains(
+        &js,
+        r#"__tpl(["Save ", ":START_TAG__SVG_SVG:", ":START_TAG__SVG_CIRCLE:", ":CLOSE_TAG__SVG_CIRCLE:", ":CLOSE_TAG__SVG_SVG: now"]"#,
+    );
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
