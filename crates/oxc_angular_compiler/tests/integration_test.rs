@@ -4514,6 +4514,86 @@ fn test_i18n_two_icus_in_one_message() {
     assert_contains(&js, "return [i18n_2]");
 }
 
+/// `$localize` placeholder names keep Angular's internal form (`START_BOLD_TEXT`), since they
+/// are part of the message id that `ng extract-i18n` computes. Angular 22.1.5:
+///   $localize `Hello ${"�#2�"}:START_BOLD_TEXT:world${"�/#2�"}:CLOSE_BOLD_TEXT:!`
+#[test]
+fn test_i18n_localize_placeholder_names_keep_underscores() {
+    let js = compile_i18n_component(r#"<span i18n>Hello <b>world</b>!</span>"#);
+    assert_contains(
+        &js,
+        r#"goog.getMsg("Hello {$startBoldText}world{$closeBoldText}!",{"closeBoldText":"#,
+    );
+    assert_contains(
+        &js,
+        "__tpl([\"Hello \", \":START_BOLD_TEXT:world\", \":CLOSE_BOLD_TEXT:!\"], [\"Hello \", \":START_BOLD_TEXT:world\", \":CLOSE_BOLD_TEXT:!\"]), \"\u{FFFD}#2\u{FFFD}\", \"\u{FFFD}/#2\u{FFFD}\")",
+    );
+}
+
+/// `i18n-<attr>` on an empty attribute creates no message; Angular only attaches a message
+/// when the attribute has a value. Angular 22.1.5: consts: [["title", ""]]
+#[test]
+fn test_i18n_attribute_with_empty_value_has_no_message() {
+    let js = compile_i18n_component(r#"<div i18n-title title=""></div>"#);
+    assert!(!js.contains("$localize"), "Empty attribute must not produce a message:\n{js}");
+    assert_contains(&js, r#"consts:[["title",""]]"#);
+}
+
+/// A custom placeholder name from `// i18n(ph="PH")` names the interpolation. Angular 22.1.5:
+///   goog.getMsg("Hello {$ph}", { "ph": "�0�" }, ...)
+///   $localize `Hello ${"�0�"}:PH:`
+#[test]
+fn test_i18n_custom_interpolation_placeholder_name() {
+    let js = compile_i18n_component(r#"<span i18n>Hello {{ name // i18n(ph="PH") }}</span>"#);
+    assert_contains(&js, "goog.getMsg(\"Hello {$ph}\",{\"ph\":\"\u{FFFD}0\u{FFFD}\"})");
+    assert_contains(
+        &js,
+        "__tpl([\"Hello \", \":PH:\"], [\"Hello \", \":PH:\"]), \"\u{FFFD}0\u{FFFD}\")",
+    );
+}
+
+/// Whitespace next to an ICU is part of the message. Angular 22.1.5:
+///   goog.getMsg("{$icu} {$startBoldText}x{$closeBoldText}", ...)
+#[test]
+fn test_i18n_keeps_whitespace_next_to_icu() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{count, plural, =1 {one} other {many}} <b>x</b></div>"#,
+    );
+    assert_contains(&js, r#"goog.getMsg("{$icu} {$startBoldText}x{$closeBoldText}","#);
+    assert_contains(&js, r#"__tpl(["", ":ICU: ", ":START_BOLD_TEXT:x", ":CLOSE_BOLD_TEXT:"]"#);
+}
+
+/// An element with a structural directive inside an i18n block gets one combined value per
+/// tag placeholder, and needs no post-processing. Angular 22.1.5:
+///   { "closeTagSpan": "�/#1:1��/*2:1�", "startTagSpan": "�*2:1��#1:1�" }
+#[test]
+fn test_i18n_structural_directive_element_placeholders() {
+    let js = compile_i18n_component(r#"<div i18n><span *ngIf="count">x</span></div>"#);
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$startTagSpan}x{$closeTagSpan}\",{\"closeTagSpan\":\"\u{FFFD}/#1:1\u{FFFD}\u{FFFD}/*2:1\u{FFFD}\",\"startTagSpan\":\"\u{FFFD}*2:1\u{FFFD}\u{FFFD}#1:1\u{FFFD}\"})",
+    );
+    assert!(!js.contains("i18nPostprocess"), "No post-processing expected:\n{js}");
+}
+
+/// `@if`/`@else` inside an i18n block: each block gets its own start/close placeholder values.
+/// Angular 22.1.5:
+///   { "closeBlockElse": "�/*3:2�", "closeBlockIf": "�/*2:1�", "closeTagSpan": "�/#1:1�",
+///     "startBlockElse": "�*3:2�", "startBlockIf": "�*2:1�", "startTagSpan": "�#1:1�" }
+#[test]
+fn test_i18n_if_else_block_placeholders() {
+    let js = compile_i18n_component(r#"<div i18n>@if (count) {<span>yes</span>} @else {no}</div>"#);
+    assert_contains(
+        &js,
+        "{\"closeBlockElse\":\"\u{FFFD}/*3:2\u{FFFD}\",\"closeBlockIf\":\"\u{FFFD}/*2:1\u{FFFD}\",\"closeTagSpan\":\"\u{FFFD}/#1:1\u{FFFD}\",\"startBlockElse\":\"\u{FFFD}*3:2\u{FFFD}\",\"startBlockIf\":\"\u{FFFD}*2:1\u{FFFD}\",\"startTagSpan\":\"\u{FFFD}#1:1\u{FFFD}\"}",
+    );
+    assert_contains(
+        &js,
+        r#"__tpl(["", ":START_BLOCK_IF:", ":START_TAG_SPAN:yes", ":CLOSE_TAG_SPAN:", ":CLOSE_BLOCK_IF:", ":START_BLOCK_ELSE:no", ":CLOSE_BLOCK_ELSE:"]"#,
+    );
+    assert!(!js.contains("i18nPostprocess"), "No post-processing expected:\n{js}");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
