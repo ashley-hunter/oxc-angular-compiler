@@ -175,6 +175,9 @@ pub struct HtmlToR3Transform<'a> {
     /// Block placeholder start/close names (`START_BLOCK_IF`, `CLOSE_BLOCK_IF`, ...) from the
     /// enclosing i18n message, keyed by the block's start offset.
     block_placeholder_names: FxHashMap<u32, (String, String)>,
+    /// Tag placeholder start/close names from the enclosing i18n message, keyed by the
+    /// element's start offset.
+    tag_placeholder_names: FxHashMap<u32, (String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +214,7 @@ impl<'a> HtmlToR3Transform<'a> {
             icu_interpolation_names: FxHashMap::default(),
             icu_placeholder_names: FxHashMap::default(),
             block_placeholder_names: FxHashMap::default(),
+            tag_placeholder_names: FxHashMap::default(),
         }
     }
 
@@ -420,6 +424,7 @@ impl<'a> HtmlToR3Transform<'a> {
                     &message.nodes,
                     &mut self.icu_placeholder_names,
                     &mut self.block_placeholder_names,
+                    &mut self.tag_placeholder_names,
                 );
                 message.serialize()
             }
@@ -4195,14 +4200,21 @@ impl<'a> HtmlToR3Transform<'a> {
             }
         }
 
-        // Generate placeholder names
-        let start_name = self
-            .i18n_placeholder_registry
-            .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
-        let close_name = if is_void {
-            String::new()
-        } else {
-            self.i18n_placeholder_registry.get_close_tag_placeholder_name(tag_name)
+        // Use the names from the enclosing i18n message, as Angular does.
+        let (start_name, close_name) = match self.tag_placeholder_names.remove(&element.span.start)
+        {
+            Some(names) => names,
+            None => {
+                let start_name = self
+                    .i18n_placeholder_registry
+                    .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
+                let close_name = if is_void {
+                    String::new()
+                } else {
+                    self.i18n_placeholder_registry.get_close_tag_placeholder_name(tag_name)
+                };
+                (start_name, close_name)
+            }
         };
 
         // Create TagPlaceholder
@@ -4869,6 +4881,7 @@ fn collect_placeholder_names(
     nodes: &[crate::i18n::ast::Node],
     icus: &mut FxHashMap<u32, String>,
     blocks: &mut FxHashMap<u32, (String, String)>,
+    tags: &mut FxHashMap<u32, (String, String)>,
 ) {
     use crate::i18n::ast::Node;
     for node in nodes {
@@ -4877,15 +4890,21 @@ fn collect_placeholder_names(
                 icus.insert(ph.source_span.start.offset, ph.name.clone());
             }
             Node::Container(container) => {
-                collect_placeholder_names(&container.children, icus, blocks)
+                collect_placeholder_names(&container.children, icus, blocks, tags);
             }
-            Node::TagPlaceholder(tag) => collect_placeholder_names(&tag.children, icus, blocks),
+            Node::TagPlaceholder(tag) => {
+                tags.insert(
+                    tag.source_span.start.offset,
+                    (tag.start_name.clone(), tag.close_name.clone()),
+                );
+                collect_placeholder_names(&tag.children, icus, blocks, tags);
+            }
             Node::BlockPlaceholder(block) => {
                 blocks.insert(
                     block.source_span.start.offset,
                     (block.start_name.clone(), block.close_name.clone()),
                 );
-                collect_placeholder_names(&block.children, icus, blocks);
+                collect_placeholder_names(&block.children, icus, blocks, tags);
             }
             Node::Text(_) | Node::Icu(_) | Node::Placeholder(_) => {}
         }

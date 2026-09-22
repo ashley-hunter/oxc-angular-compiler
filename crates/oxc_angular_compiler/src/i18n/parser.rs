@@ -601,6 +601,9 @@ impl I18nMessageFactory {
             }
         }
 
+        // Visit children first: Angular names nested tags before their parent.
+        let children = self.visit_all(&element.children, context, visit_fn);
+
         // Generate placeholder names for the tag
         let start_name =
             context.placeholder_registry.get_start_tag_placeholder_name(tag_name, &attrs, is_void);
@@ -609,9 +612,6 @@ impl I18nMessageFactory {
         } else {
             context.placeholder_registry.get_close_tag_placeholder_name(tag_name)
         };
-
-        // Visit children
-        let children = self.visit_all(&element.children, context, visit_fn);
 
         let source_span = ParseSourceSpan::from_offsets(
             &context.source_file,
