@@ -11,7 +11,7 @@
 
 use std::ptr::NonNull;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::r3::SecurityContext;
 use crate::ir::enums::BindingKind;
@@ -59,6 +59,8 @@ fn process_view_attributes<'a>(
 
     // Collect pointers to ops that should be removed (extractable text attributes)
     let mut ops_to_remove: Vec<NonNull<UpdateOp<'a>>> = Vec::new();
+    // Template ops in this view: a binding targeting one has a non-null `templateKind`.
+    let mut template_xrefs: FxHashSet<XrefId> = FxHashSet::default();
 
     // IMPORTANT: Process create operations FIRST (for listeners)
     // This matches Angular's unit.ops() which iterates create ops before update ops.
@@ -73,6 +75,9 @@ fn process_view_attributes<'a>(
         };
 
         for op in view.create.iter() {
+            if let CreateOp::Template(template) = op {
+                template_xrefs.insert(template.xref);
+            }
             match op {
                 CreateOp::Listener(listener) => {
                     if !listener.is_animation_listener {
@@ -197,6 +202,7 @@ fn process_view_attributes<'a>(
                     // kind because the runtime uses domProperty, not i18nAttributes.
                     let binding_kind = if prop_op.i18n_message.is_some()
                         && prop_op.binding_kind != BindingKind::Template
+                        && !template_xrefs.contains(&prop_op.target)
                         && matches!(*prop_op.expression, IrExpression::Interpolation(_))
                     {
                         BindingKind::I18n
