@@ -1366,17 +1366,28 @@ impl<'a> HtmlToR3Transform<'a> {
             self.extract_placeholders_from_nodes(&case.expansion, &mut placeholders, &mut vars);
         }
         for (name, placeholder) in tags {
-            let text = R3Text {
-                value: Ident::from_in(placeholder.text.as_str(), self.allocator),
-                source_span: Span::new(
-                    placeholder.source_span.start.offset,
-                    placeholder.source_span.end.offset,
-                ),
+            // Angular: `_visitTextWithInterpolation(value.text, ...)`, so markup such as
+            // `<span title="{{a}}">` becomes bound text with expression placeholders.
+            let span =
+                Span::new(placeholder.source_span.start.offset, placeholder.source_span.end.offset);
+            let text = self.allocator.alloc_str(&placeholder.text);
+            let value = match self.has_interpolation(text) {
+                true => self.parse_interpolation(text, span).map(|value| {
+                    R3IcuPlaceholder::BoundText(R3BoundText {
+                        value,
+                        source_span: span,
+                        i18n: None,
+                    })
+                }),
+                false => None,
             };
+            let value = value.unwrap_or_else(|| {
+                R3IcuPlaceholder::Text(R3Text { value: Ident::from(&*text), source_span: span })
+            });
             ordered_insert_placeholder(
                 &mut placeholders,
                 Ident::from_in(name.as_str(), self.allocator),
-                R3IcuPlaceholder::Text(text),
+                value,
             );
         }
 
