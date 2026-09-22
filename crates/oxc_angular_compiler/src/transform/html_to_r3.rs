@@ -2932,15 +2932,15 @@ impl<'a> HtmlToR3Transform<'a> {
         for attr in attrs {
             let name = attr.name.as_str();
             if let Some(target_attr) = name.strip_prefix("i18n-") {
-                let instance_id = self.allocate_i18n_message_instance_id();
-                // The attribute's own value is the message text. Angular's I18nMetaVisitor
-                // builds it with `_generateI18nMessage([attr], meta)` when `attr.value` is set.
-                let target =
-                    attrs.iter().find(|a| a.name.as_str() == target_attr && !a.value.is_empty());
-                let (message_string, nodes) = match target {
-                    Some(target) => self.create_attribute_i18n_message(target),
-                    None => (String::new(), Vec::new_in(self.allocator)),
+                // Angular's I18nMetaVisitor only gives a message to a plain attribute with that
+                // name and a value, built from the value: `_generateI18nMessage([attr], meta)`.
+                let Some(target) =
+                    attrs.iter().find(|a| a.name.as_str() == target_attr && !a.value.is_empty())
+                else {
+                    continue;
                 };
+                let instance_id = self.allocate_i18n_message_instance_id();
+                let (message_string, nodes) = self.create_attribute_i18n_message(target);
                 let mut meta = parse_i18n_meta_with_message(
                     self.allocator,
                     attr.value.as_str(),
