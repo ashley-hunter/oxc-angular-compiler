@@ -178,6 +178,22 @@ pnpm compare --fixtures --category defer
 pnpm compare --fixtures --category control-flow --category animations
 ```
 
+### Known Differences
+
+`fixtures/known-differences.ts` lists fixtures whose output differs from Angular's in
+documented ways, with the reasons. They are reported as known differences instead of failures.
+A listed fixture that matches Angular fails, so remove its entry once the difference is fixed.
+
+### Generated i18n Fixtures
+
+The `fixtures/i18n/generated-*.fixture.ts` files are generated from Angular's own i18n tests
+(the `r3_view_compiler_i18n` compliance cases and the i18n acceptance spec). Regenerate them
+after updating Angular:
+
+```bash
+pnpm generate:i18n-fixtures [path/to/angular]  # defaults to the Angular submodule
+```
+
 ## Output Format
 
 ### Console Output
