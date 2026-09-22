@@ -4840,6 +4840,23 @@ fn test_i18n_attribute_on_ng_template_uses_bindings_marker() {
     assert_contains(&js, r#"return [["title",i18n_0],[3,"title"]]"#);
 }
 
+/// Text that looks like a placeholder marker stays literal text. Angular 22.1.5 for
+/// `&#123;$notAPlaceholder&#125; {{ name }}`:
+///   goog.getMsg("{$notAPlaceholder} {$interpolation}", { "interpolation": "\uFFFD0\uFFFD" })
+///   $localize `{$notAPlaceholder} ${"\uFFFD0\uFFFD"}:INTERPOLATION:`
+#[test]
+fn test_i18n_literal_placeholder_like_text() {
+    let js = compile_i18n_component("<div i18n>&#123;$notAPlaceholder&#125; {{ name }}</div>");
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$notAPlaceholder} {$interpolation}\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"})",
+    );
+    assert_contains(
+        &js,
+        "__tpl([\"{$notAPlaceholder} \", \":INTERPOLATION:\"], [\"{$notAPlaceholder} \", \":INTERPOLATION:\"]), \"\u{FFFD}0\u{FFFD}\")",
+    );
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
