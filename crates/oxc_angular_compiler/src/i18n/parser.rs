@@ -221,6 +221,16 @@ impl I18nMessageFactory {
 
     /// Visits a text node and extracts interpolations.
     fn visit_text(&self, text: &HtmlText<'_>, context: &mut I18nVisitorContext) -> Option<Node> {
+        // Angular: `text.tokens.length === 1 ? new Text(text.value) : _visitTextWithInterpolation`.
+        // Building from tokens keeps entity tokens as decoded, e.g. `&ngsp;` as U+E500, which
+        // whitespace processing only replaces in plain text tokens.
+        if text.tokens.len() > 1 {
+            return Some(self.visit_text_with_interpolation_tokens(
+                &text.tokens,
+                text.span,
+                context,
+            ));
+        }
         let value = text.value.as_str();
 
         // Check if text contains interpolations
@@ -469,8 +479,8 @@ impl I18nMessageFactory {
             }
         }
 
-        // Return result based on what we found
-        if has_interpolation && nodes.len() > 1 {
+        // Angular: a Container whenever there is an interpolation, otherwise the single node.
+        if has_interpolation {
             Node::Container(Container::new(nodes, overall_span))
         } else if nodes.len() == 1 {
             nodes
