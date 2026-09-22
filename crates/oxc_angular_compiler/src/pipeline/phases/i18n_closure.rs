@@ -37,6 +37,51 @@ use crate::output::ast::{
     TypeofExpr,
 };
 
+/// The value of an i18n message param.
+///
+/// Most params are string literals, but Angular passes an ICU sub-message by its variable
+/// (`{ "icu": i18n_0 }`), and a placeholder shared by several sub-messages as an array of
+/// their variables for `ɵɵi18nPostprocess`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum I18nParamExpr {
+    /// A string literal, e.g. `"\uFFFD0\uFFFD"`.
+    Literal(String),
+    /// A reference to another message's variable, e.g. `i18n_0`.
+    Var(String),
+    /// An array of message variables, e.g. `[i18n_0, i18n_1]`.
+    Vars(Vec<String>),
+}
+
+impl I18nParamExpr {
+    /// Builds the output expression for this value.
+    pub fn to_expr<'a>(&self, allocator: &'a oxc_allocator::Allocator) -> OutputExpression<'a> {
+        let read_var = |name: &str| {
+            OutputExpression::ReadVar(AllocBox::new_in(
+                ReadVarExpr { name: Ident::from(allocator.alloc_str(name)), source_span: None },
+                allocator,
+            ))
+        };
+        match self {
+            Self::Literal(value) => OutputExpression::Literal(AllocBox::new_in(
+                LiteralExpr {
+                    value: LiteralValue::String(Ident::from(allocator.alloc_str(value))),
+                    source_span: None,
+                },
+                allocator,
+            )),
+            Self::Var(name) => read_var(name),
+            Self::Vars(names) => {
+                let mut entries = AllocVec::new_in(allocator);
+                entries.extend(names.iter().map(|name| read_var(name)));
+                OutputExpression::LiteralArray(AllocBox::new_in(
+                    crate::output::ast::LiteralArrayExpr { entries, source_span: None },
+                    allocator,
+                ))
+            }
+        }
+    }
+}
+
 /// Name of the global variable that is used to determine if we use Closure translations.
 const NG_I18N_CLOSURE_MODE: &str = "ngI18nClosureMode";
 
@@ -171,7 +216,7 @@ pub fn create_goog_get_msg_statements<'a>(
     i18n_var_name: &Ident<'a>,
     closure_var_name: &Ident<'a>,
     message_string: &str,
-    params: &[(String, String)],
+    params: &[(String, I18nParamExpr)],
     meta: Option<&I18nMessageMeta<'a>>,
 ) -> AllocVec<'a, OutputStatement<'a>> {
     let mut statements = AllocVec::new_in(allocator);
@@ -193,16 +238,9 @@ pub fn create_goog_get_msg_statements<'a>(
             // Format placeholder name to camelCase for Closure
             let formatted_name = format_i18n_placeholder_name(name, true);
             let key_str = allocator.alloc_str(&formatted_name);
-            let value_str = allocator.alloc_str(value);
             entries.push(LiteralMapEntry {
                 key: Ident::from(key_str),
-                value: OutputExpression::Literal(AllocBox::new_in(
-                    LiteralExpr {
-                        value: LiteralValue::String(Ident::from(value_str)),
-                        source_span: None,
-                    },
-                    allocator,
-                )),
+                value: value.to_expr(allocator),
                 quoted: true,
             });
         }
@@ -336,7 +374,7 @@ pub fn create_translation_declaration<'a>(
     i18n_var_name: Ident<'a>,
     closure_var_name: Ident<'a>,
     message_for_closure: &str,
-    params: &[(String, String)],
+    params: &[(String, I18nParamExpr)],
     localized_expr: OutputExpression<'a>,
     meta: Option<&I18nMessageMeta<'a>>,
 ) -> AllocVec<'a, OutputStatement<'a>> {

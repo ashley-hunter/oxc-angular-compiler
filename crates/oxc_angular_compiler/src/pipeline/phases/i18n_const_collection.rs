@@ -20,7 +20,7 @@ use crate::output::ast::{
 };
 use crate::pipeline::compilation::{ComponentCompilationJob, ConstValue};
 use crate::pipeline::phases::i18n_closure::{
-    I18nMessageMeta, create_translation_declaration, generate_closure_var_name,
+    I18nMessageMeta, I18nParamExpr, create_translation_declaration, generate_closure_var_name,
     generate_file_based_i18n_suffix, generate_i18n_var_name,
 };
 use crate::r3::Identifiers;
@@ -60,7 +60,11 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
     // I18n Message Xref -> I18n Message Op info
     let mut messages: FxHashMap<XrefId, MessageInfo> = FxHashMap::default();
     // I18n Context Xref -> Params
-    let mut params_by_context: FxHashMap<XrefId, Vec<(String, String)>> = FxHashMap::default();
+    let mut params_by_context: FxHashMap<XrefId, Vec<(String, I18nParamExpr)>> =
+        FxHashMap::default();
+    // I18n Context Xref -> Post-processing params
+    let mut postprocessing_params_by_context: FxHashMap<XrefId, FxHashMap<String, String>> =
+        FxHashMap::default();
 
     // Collect info from all views
     for view in job.all_views() {
@@ -98,8 +102,20 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                 }
                 CreateOp::I18nContext(ctx_op) => {
                     // Collect formatted params from context
-                    let formatted = format_context_params(&ctx_op.params);
+                    let formatted = format_context_params(&ctx_op.params)
+                        .into_iter()
+                        .map(|(name, value)| (name, I18nParamExpr::Literal(value)))
+                        .collect();
                     params_by_context.insert(ctx_op.xref, formatted);
+
+                    // Angular's createI18nMessage formats the context's post-processing params,
+                    // then extractI18nMessages sets each ICU placeholder's literal over them.
+                    let mut postprocessing: FxHashMap<String, String> =
+                        format_context_params(&ctx_op.postprocessing_params).into_iter().collect();
+                    for (name, value) in &ctx_op.icu_placeholder_literals {
+                        postprocessing.insert(name.to_string(), value.to_string());
+                    }
+                    postprocessing_params_by_context.insert(ctx_op.xref, postprocessing);
                 }
                 _ => {}
             }
@@ -173,6 +189,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
             allocator,
             &messages,
             &params_by_context,
+            &postprocessing_params_by_context,
             &msg_info,
             &file_based_i18n_suffix,
             job.i18n_use_external_ids,
@@ -444,7 +461,8 @@ struct I18nExpressionInfo {
 fn collect_message<'a>(
     allocator: &'a oxc_allocator::Allocator,
     messages: &FxHashMap<XrefId, MessageInfo>,
-    params_by_context: &FxHashMap<XrefId, Vec<(String, String)>>,
+    params_by_context: &FxHashMap<XrefId, Vec<(String, I18nParamExpr)>>,
+    postprocessing_params_by_context: &FxHashMap<XrefId, FxHashMap<String, String>>,
     msg_info: &MessageInfo,
     file_suffix: &str,
     use_external_ids: bool,
@@ -460,6 +478,7 @@ fn collect_message<'a>(
                 allocator,
                 messages,
                 params_by_context,
+                postprocessing_params_by_context,
                 sub_msg,
                 file_suffix,
                 use_external_ids,
@@ -480,16 +499,21 @@ fn collect_message<'a>(
         .cloned()
         .unwrap_or_default();
 
-    // Build postprocessing params from sub-message placeholders (for ICU post-processing)
-    let postprocessing_params: Vec<(String, Vec<String>)> = sub_message_placeholders
-        .iter()
-        .filter(|(_, vars)| vars.len() > 1)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut postprocessing_params: Vec<(String, I18nParamExpr)> = msg_info
+        .i18n_context
+        .and_then(|ctx| postprocessing_params_by_context.get(&ctx))
+        .map(|params| {
+            params
+                .iter()
+                .map(|(name, value)| (name.clone(), I18nParamExpr::Literal(value.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Build params with sub-message values
     let mut params = base_params;
-    add_sub_message_params(&mut params, &sub_message_placeholders, msg_info.needs_postprocessing);
+    add_sub_message_params(&mut params, &mut postprocessing_params, &sub_message_placeholders);
+    postprocessing_params.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Sort params for consistency
     params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -534,13 +558,6 @@ fn collect_message<'a>(
         msg_info.custom_id.clone(),
     );
 
-    // Wrap with postprocess if needed
-    let localized_expr = if msg_info.needs_postprocessing || !postprocessing_params.is_empty() {
-        wrap_with_postprocess(allocator, localized_expr, &postprocessing_params)
-    } else {
-        localized_expr
-    };
-
     // Generate dual-mode translation declaration
     let i18n_var_atom = Ident::from(allocator.alloc_str(&i18n_var_name));
     let closure_var_atom = Ident::from(allocator.alloc_str(&closure_var_name));
@@ -557,32 +574,62 @@ fn collect_message<'a>(
 
     all_statements.extend(statements);
 
+    // Angular applies post-processing after both the Closure and $localize branches:
+    // `i18n_X = ɵɵi18nPostprocess(i18n_X, params?)`.
+    if msg_info.needs_postprocessing || !postprocessing_params.is_empty() {
+        let read_var = || {
+            OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+                ReadVarExpr { name: i18n_var_atom, source_span: None },
+                allocator,
+            ))
+        };
+        let postprocess = wrap_with_postprocess(allocator, read_var(), &postprocessing_params);
+        let assignment = OutputExpression::BinaryOperator(oxc_allocator::Box::new_in(
+            crate::output::ast::BinaryOperatorExpr {
+                operator: crate::output::ast::BinaryOperator::Assign,
+                lhs: oxc_allocator::Box::new_in(read_var(), allocator),
+                rhs: oxc_allocator::Box::new_in(postprocess, allocator),
+                source_span: None,
+            },
+            allocator,
+        ));
+        all_statements.push(OutputStatement::Expression(oxc_allocator::Box::new_in(
+            crate::output::ast::ExpressionStatement { expr: assignment, source_span: None },
+            allocator,
+        )));
+    }
+
     (i18n_var_name, all_statements)
 }
 
 /// Add sub-message placeholder values to the params.
+///
+/// Ported from Angular's `addSubMessageParams`: a single sub-message is passed by its
+/// variable; several sub-messages sharing a placeholder are mapped at post-processing time.
 fn add_sub_message_params(
-    params: &mut Vec<(String, String)>,
+    params: &mut Vec<(String, I18nParamExpr)>,
+    postprocessing_params: &mut Vec<(String, I18nParamExpr)>,
     sub_message_placeholders: &FxHashMap<String, Vec<String>>,
-    _needs_postprocessing: bool,
 ) {
     for (placeholder, sub_vars) in sub_message_placeholders {
-        if sub_vars.len() == 1 {
-            // Single sub-message: use its variable directly
-            // The value will be the variable reference (handled at runtime)
-            params.push((placeholder.clone(), format!("{ESCAPE}{}{ESCAPE}", sub_vars[0])));
+        if let [sub_var] = sub_vars.as_slice() {
+            params.push((placeholder.clone(), I18nParamExpr::Var(sub_var.clone())));
         } else {
-            // Multiple sub-messages: create ICU mapping placeholder for post-processing
             params.push((
                 placeholder.clone(),
-                format!("{ESCAPE}{I18N_ICU_MAPPING_PREFIX}{placeholder}{ESCAPE}"),
+                I18nParamExpr::Literal(format!(
+                    "{ESCAPE}{I18N_ICU_MAPPING_PREFIX}{placeholder}{ESCAPE}"
+                )),
             ));
+            postprocessing_params.retain(|(name, _)| name != placeholder);
+            postprocessing_params
+                .push((placeholder.clone(), I18nParamExpr::Vars(sub_vars.clone())));
         }
     }
 }
 
 /// Generate a message string from params (fallback when message AST is not available).
-fn generate_message_from_params(params: &[(String, String)]) -> String {
+fn generate_message_from_params(params: &[(String, I18nParamExpr)]) -> String {
     let mut result = String::new();
     for (name, _value) in params {
         let formatted_name = format_i18n_placeholder_name(name, true);
@@ -619,7 +666,7 @@ fn format_context_params(
 fn create_localize_expression<'a>(
     allocator: &'a oxc_allocator::Allocator,
     message_string: &str,
-    params: &[(String, String)],
+    params: &[(String, I18nParamExpr)],
     description: Option<String>,
     meaning: Option<String>,
     custom_id: Option<String>,
@@ -632,7 +679,7 @@ fn create_localize_expression<'a>(
     let mut expressions = ArenaVec::new_in(allocator);
 
     // Build a map from placeholder name to value for quick lookup
-    let params_map: FxHashMap<String, String> =
+    let params_map: FxHashMap<String, I18nParamExpr> =
         params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     // First message part: includes metadata block + first text segment
@@ -654,15 +701,7 @@ fn create_localize_expression<'a>(
         // uses camelCase (from format_i18n_placeholder_name with use_camel_case=true).
         // We need to find the matching param key.
         let value = find_param_value(&params_map, placeholder);
-        let value_str = allocator.alloc_str(&value);
-        let literal_expr = OutputExpression::Literal(oxc_allocator::Box::new_in(
-            crate::output::ast::LiteralExpr {
-                value: LiteralValue::String(Ident::from(value_str)),
-                source_span: None,
-            },
-            allocator,
-        ));
-        expressions.push(literal_expr);
+        expressions.push(value.to_expr(allocator));
 
         // Text part after this placeholder
         let text_part = text_parts.get(i + 1).map(|s| s.as_str()).unwrap_or("");
@@ -790,7 +829,10 @@ fn serialize_i18n_template_part(placeholder_name: &str, text: &str) -> String {
 /// The message_string uses camelCase placeholder names (e.g., `interpolation`),
 /// but the params_map is keyed by the original placeholder names (e.g., `INTERPOLATION`).
 /// This function tries to find the matching param key by comparing the formatted names.
-fn find_param_value(params_map: &FxHashMap<String, String>, placeholder_name: &str) -> String {
+fn find_param_value(
+    params_map: &FxHashMap<String, I18nParamExpr>,
+    placeholder_name: &str,
+) -> I18nParamExpr {
     // First try direct lookup
     if let Some(value) = params_map.get(placeholder_name) {
         return value.clone();
@@ -811,18 +853,16 @@ fn find_param_value(params_map: &FxHashMap<String, String>, placeholder_name: &s
     }
 
     // Fallback to empty string if no match found
-    String::new()
+    I18nParamExpr::Literal(String::new())
 }
 
 /// Wrap an i18n expression with i18nPostprocess for ICU message handling.
 fn wrap_with_postprocess<'a>(
     allocator: &'a oxc_allocator::Allocator,
     expr: OutputExpression<'a>,
-    postprocessing_params: &[(String, Vec<String>)],
+    postprocessing_params: &[(String, I18nParamExpr)],
 ) -> OutputExpression<'a> {
-    use crate::output::ast::{
-        InvokeFunctionExpr, LiteralArrayExpr, LiteralMapEntry, LiteralMapExpr,
-    };
+    use crate::output::ast::{InvokeFunctionExpr, LiteralMapEntry, LiteralMapExpr};
 
     // Create ɵɵi18nPostprocess function reference (i0.ɵɵi18nPostprocess)
     let fn_var = OutputExpression::ReadProp(oxc_allocator::Box::new_in(
@@ -848,27 +888,11 @@ fn wrap_with_postprocess<'a>(
     // Add postprocessing params if any
     if !postprocessing_params.is_empty() {
         let mut entries = ArenaVec::new_in(allocator);
-        for (placeholder, var_names) in postprocessing_params {
-            // Format placeholder name
+        for (placeholder, value) in postprocessing_params {
             let formatted_name = format_i18n_placeholder_name(placeholder, false);
-            let key_str = allocator.alloc_str(&formatted_name);
-
-            // Create array of variable references
-            let mut var_refs = ArenaVec::new_in(allocator);
-            for var_name in var_names {
-                let var_str = allocator.alloc_str(var_name);
-                var_refs.push(OutputExpression::ReadVar(oxc_allocator::Box::new_in(
-                    ReadVarExpr { name: Ident::from(var_str), source_span: None },
-                    allocator,
-                )));
-            }
-
             entries.push(LiteralMapEntry {
-                key: Ident::from(key_str),
-                value: OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
-                    LiteralArrayExpr { entries: var_refs, source_span: None },
-                    allocator,
-                )),
+                key: Ident::from(allocator.alloc_str(&formatted_name)),
+                value: value.to_expr(allocator),
                 quoted: true,
             });
         }
@@ -945,7 +969,10 @@ mod tests {
             &allocator,
         ));
 
-        let params = vec![("ICU_0".to_string(), vec!["i18n_1".to_string(), "i18n_2".to_string()])];
+        let params = vec![(
+            "ICU_0".to_string(),
+            I18nParamExpr::Vars(vec!["i18n_1".to_string(), "i18n_2".to_string()]),
+        )];
 
         let result = wrap_with_postprocess(&allocator, input_expr, &params);
 

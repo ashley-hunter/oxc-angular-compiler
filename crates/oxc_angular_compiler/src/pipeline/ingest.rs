@@ -25,10 +25,10 @@ use super::compilation::{
 use super::conversion::prefix_with_namespace;
 use crate::ast::expression::{AngularExpression, ParsedEventType};
 use crate::ast::r3::{
-    I18nIcuPlaceholder, I18nMeta, I18nNode, R3BoundAttribute, R3BoundEvent, R3BoundText, R3Content,
-    R3DeferredBlock, R3Element, R3ForLoopBlock, R3Icu, R3IcuPlaceholder, R3IfBlock,
-    R3LetDeclaration, R3Node, R3SwitchBlock, R3Template, R3TemplateAttr, R3Text, R3TextAttribute,
-    SecurityContext,
+    I18nIcuPlaceholder, I18nMessage, I18nMeta, I18nNode, R3BoundAttribute, R3BoundEvent,
+    R3BoundText, R3Content, R3DeferredBlock, R3Element, R3ForLoopBlock, R3Icu, R3IcuPlaceholder,
+    R3IfBlock, R3LetDeclaration, R3Node, R3SwitchBlock, R3Template, R3TemplateAttr, R3Text,
+    R3TextAttribute, SecurityContext,
 };
 use crate::ir::enums::{
     AnimationKind, BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace, TemplateKind,
@@ -897,6 +897,29 @@ fn get_single_icu_placeholder<'a, 'b>(
     None
 }
 
+/// Records an i18n message's metadata for later phases, keyed by its instance id, and returns
+/// that id. Metadata already recorded for the same message is kept.
+fn record_i18n_message_metadata<'a>(
+    job: &mut ComponentCompilationJob<'a>,
+    message: &I18nMessage<'a>,
+) -> u32 {
+    let allocator = job.allocator;
+    let non_empty = |value: &Ident<'a>| (!value.is_empty()).then_some(*value);
+    job.i18n_message_metadata.entry(message.instance_id).or_insert_with(|| {
+        let mut legacy_ids = Vec::new_in(allocator);
+        legacy_ids.extend(message.legacy_ids.iter().copied());
+        I18nMessageMetadata {
+            message_id: non_empty(&message.id),
+            custom_id: non_empty(&message.custom_id),
+            meaning: non_empty(&message.meaning),
+            description: non_empty(&message.description),
+            legacy_ids,
+            message_string: non_empty(&message.message_string),
+        }
+    });
+    message.instance_id
+}
+
 /// Ingests an ICU expression node (plural, select, selectordinal).
 ///
 /// Creates IcuStartOp and IcuEndOp to bracket the ICU expression,
@@ -918,6 +941,13 @@ fn ingest_icu<'a>(job: &mut ComponentCompilationJob<'a>, view_xref: XrefId, icu:
         }
     };
 
+    // The ICU's own message (Angular: `createIcuStartOp(xref, icu.i18n, ...)`). When it is the
+    // same message as the enclosing i18n block, the ICU is the message rather than a sub-message.
+    let message = match &icu.i18n {
+        Some(I18nMeta::Message(message)) => Some(record_i18n_message_metadata(job, message)),
+        _ => None,
+    };
+
     let xref = job.allocate_xref_id();
 
     // Create IcuStartOp
@@ -925,7 +955,7 @@ fn ingest_icu<'a>(job: &mut ComponentCompilationJob<'a>, view_xref: XrefId, icu:
         base: CreateOpBase { source_span: Some(icu.source_span), ..Default::default() },
         xref,
         context: None, // Will be set by create_i18n_contexts phase
-        message: None, // Will be set by phases
+        message,
         icu_placeholder: Some(icu_placeholder_name),
     });
 
@@ -1528,11 +1558,11 @@ fn ingest_binding_owned<'a>(
         // unique placeholder names in first-seen order.
         let mut i18n_placeholders: Vec<'_, Ident<'_>> = Vec::new_in(allocator);
         if let Some(I18nMeta::Message(message)) = &input.i18n {
-            for node in message.nodes.iter() {
-                if let I18nNode::Placeholder(ph) = node {
-                    if !i18n_placeholders.contains(&ph.name) {
-                        i18n_placeholders.push(ph.name.clone());
-                    }
+            for node in &message.nodes {
+                if let I18nNode::Placeholder(ph) = node
+                    && !i18n_placeholders.contains(&ph.name)
+                {
+                    i18n_placeholders.push(ph.name);
                 }
             }
         }

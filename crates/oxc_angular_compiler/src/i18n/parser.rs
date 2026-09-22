@@ -125,6 +125,29 @@ impl I18nMessageFactory {
         )
     }
 
+    /// Converts a single ICU expansion to an i18n Message.
+    ///
+    /// Equivalent to Angular's `createI18nMessage([expansion], ...)`: the message consists of
+    /// the ICU itself, with `VAR_*` and interpolation placeholders registered inside it.
+    pub fn create_icu_message(
+        &self,
+        expansion: &HtmlExpansion<'_>,
+        source_file: Arc<ParseSourceFile>,
+    ) -> Message {
+        let mut context = I18nVisitorContext::new(source_file);
+        context.is_icu = true;
+        let nodes =
+            self.visit_expansion(expansion, &mut context, noop_visit_node).into_iter().collect();
+        Message::new(
+            nodes,
+            context.placeholders,
+            context.placeholder_to_message,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
     /// Visits all HTML nodes and converts them to i18n nodes.
     fn visit_all(
         &self,
