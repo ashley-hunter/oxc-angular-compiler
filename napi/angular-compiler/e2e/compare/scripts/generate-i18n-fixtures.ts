@@ -34,7 +34,6 @@ interface GeneratedFixture {
   className: string
   sourceCode: string
   skipReason?: string
-  i18nUseExternalIds?: boolean
 }
 
 function slug(text: string): string {
@@ -102,7 +101,6 @@ function complianceFixtures(testCasesFile: string): GeneratedFixture[] {
         source = convertLineEndingMarkers(source)
       }
       source = makeStandalone(source)
-      const options = testCase.angularCompilerOptions ?? {}
       fixtures.push({
         name: `i18n-compliance-${slug(relative(complianceDir, dir) || 'root')}-${slug(testCase.description)}-${slug(basename(file, '.ts'))}`.slice(
           0,
@@ -114,7 +112,6 @@ function complianceFixtures(testCasesFile: string): GeneratedFixture[] {
         skipReason: /templateUrl/.test(source)
           ? 'external templates are not supported by the compare tool'
           : undefined,
-        i18nUseExternalIds: options.i18nUseExternalIds,
       })
     }
   }
@@ -223,9 +220,6 @@ function writeFixtureFile(file: string, origin: string, fixtures: GeneratedFixtu
       `    className: ${JSON.stringify(f.className)},`,
       `    type: 'full-transform',`,
       f.skipReason ? `    skipReason: ${JSON.stringify(f.skipReason)},` : undefined,
-      f.i18nUseExternalIds !== undefined
-        ? `    i18nUseExternalIds: ${f.i18nUseExternalIds},`
-        : undefined,
       `    sourceCode: ${JSON.stringify(f.sourceCode)},`,
     ]
     return `  {\n${fields.filter(Boolean).join('\n')}\n  },`

@@ -145,7 +145,6 @@ export const fixtures: Fixture[] = [
     description: 'Angular compliance: should sanitize ids and generate proper variable names',
     className: 'MyComponent',
     type: 'full-transform',
-    i18nUseExternalIds: false,
     sourceCode:
       'import {CommonModule} from \'@angular/common\';\nimport {Component} from \'@angular/core\';\n\n@Component({\n    selector: \'my-component\',\n    template: `\n  <div i18n="@@ID.WITH.INVALID.CHARS.2" i18n-title="@@ID.WITH.INVALID.CHARS" title="Element title">\n    Some content\n  </div>\n  `,\n    standalone: false\n})\nexport class MyComponent {\n}\n\n',
   },
