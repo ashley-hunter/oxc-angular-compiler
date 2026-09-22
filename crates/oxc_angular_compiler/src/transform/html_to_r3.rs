@@ -1382,18 +1382,19 @@ impl<'a> HtmlToR3Transform<'a> {
             let span =
                 Span::new(placeholder.source_span.start.offset, placeholder.source_span.end.offset);
             let text = self.allocator.alloc_str(&placeholder.text);
-            let value = match self.has_interpolation(text) {
-                true => self.parse_interpolation(text, span).map(|value| {
+            let value = if self.has_interpolation(text) {
+                self.parse_interpolation(text, span).map(|value| {
                     R3IcuPlaceholder::BoundText(R3BoundText {
                         value,
                         source_span: span,
                         i18n: None,
                     })
-                }),
-                false => None,
+                })
+            } else {
+                None
             };
             let value = value.unwrap_or_else(|| {
-                R3IcuPlaceholder::Text(R3Text { value: Ident::from(&*text), source_span: span })
+                R3IcuPlaceholder::Text(R3Text { value: Ident::from(text), source_span: span })
             });
             ordered_insert_placeholder(
                 &mut placeholders,
@@ -4242,10 +4243,8 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Use the names from the enclosing i18n message, as Angular does.
-        let (start_name, close_name) = match self.tag_placeholder_names.remove(&element.span.start)
-        {
-            Some(names) => names,
-            None => {
+        let (start_name, close_name) =
+            self.tag_placeholder_names.remove(&element.span.start).unwrap_or_else(|| {
                 let start_name = self
                     .i18n_placeholder_registry
                     .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
@@ -4255,8 +4254,7 @@ impl<'a> HtmlToR3Transform<'a> {
                     self.i18n_placeholder_registry.get_close_tag_placeholder_name(tag_name)
                 };
                 (start_name, close_name)
-            }
-        };
+            });
 
         // Create TagPlaceholder
         let mut placeholder_attrs = HashMap::new_in(self.allocator);

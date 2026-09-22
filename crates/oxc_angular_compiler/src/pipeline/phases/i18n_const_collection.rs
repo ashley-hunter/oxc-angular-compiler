@@ -632,7 +632,9 @@ fn add_sub_message_params(
 fn generate_message_from_params(params: &[(String, I18nParamExpr)]) -> String {
     let mut result = String::new();
     for (name, _value) in params {
-        result.push_str(&format!("{{${name}}}"));
+        result.push_str("{$");
+        result.push_str(name);
+        result.push('}');
     }
     result
 }
@@ -646,7 +648,9 @@ fn to_get_msg_string(message: &str) -> String {
         let Some(len) = rest[start..].find('}') else { break };
         result.push_str(&rest[..start]);
         let name = &rest[start + 2..start + len];
-        result.push_str(&format!("{{${}}}", format_i18n_placeholder_name(name, true)));
+        result.push_str("{$");
+        result.push_str(&format_i18n_placeholder_name(name, true));
+        result.push('}');
         rest = &rest[start + len + 1..];
     }
     result.push_str(rest);

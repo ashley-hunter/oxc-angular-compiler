@@ -2314,8 +2314,8 @@ fn ingest_content<'a>(
     // Angular: createProjectionOp(id, content.selector, content.i18n, ...)
     let i18n_placeholder = match &content.i18n {
         Some(I18nMeta::Node(I18nNode::TagPlaceholder(tag))) => Some(I18nPlaceholder::new(
-            tag.start_name.clone(),
-            if tag.is_void { None } else { Some(tag.close_name.clone()) },
+            tag.start_name,
+            if tag.is_void { None } else { Some(tag.close_name) },
         )),
         _ => None,
     };

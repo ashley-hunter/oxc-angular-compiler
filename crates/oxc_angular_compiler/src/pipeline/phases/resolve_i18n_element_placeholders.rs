@@ -451,7 +451,7 @@ fn record_template<'a>(
     operations.push(OpInfo::TemplateStart {
         view_xref,
         slot: slot.0,
-        start_name: placeholder.start_name.clone(),
+        start_name: placeholder.start_name,
         context_xref: ops.i18n_context_xref,
         sub_template_index: ops.sub_template_index,
         pending_structural: pending,
@@ -462,7 +462,7 @@ fn record_template<'a>(
         operations.push(OpInfo::TemplateEnd {
             view_xref,
             slot: slot.0,
-            close_name: close_name.clone(),
+            close_name: *close_name,
             context_xref: ops.i18n_context_xref,
             sub_template_index: ops.sub_template_index,
             pending_structural: pending,
