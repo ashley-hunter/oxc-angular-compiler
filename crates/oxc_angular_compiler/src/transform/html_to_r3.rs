@@ -493,6 +493,8 @@ impl<'a> HtmlToR3Transform<'a> {
         self.element_full_names.push(full_name);
         let children = self.visit_children(&element.children);
         self.element_full_names.pop();
+        // Consumed by the ICU child, if any; do not leak it to a later ICU.
+        self.sole_icu_message = None;
 
         // Decrement non_bindable depth if we incremented it
         if has_non_bindable {
