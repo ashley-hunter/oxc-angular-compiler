@@ -847,7 +847,7 @@ pub fn create_i18n_message_factory(
 /// - `// i18n(ph="NAME")` - line comment format (at the end)
 ///
 /// Returns `Some(name)` if a custom placeholder name is found, `None` otherwise.
-fn extract_placeholder_name(expression: &str) -> Option<String> {
+pub(crate) fn extract_placeholder_name(expression: &str) -> Option<String> {
     // Look for block comment format: /* i18n(ph="NAME") */
     if let Some(start) = expression.find("i18n(ph=") {
         let rest = &expression[start + 8..]; // Skip "i18n(ph="

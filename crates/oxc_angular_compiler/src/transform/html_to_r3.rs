@@ -4370,9 +4370,13 @@ impl<'a> HtmlToR3Transform<'a> {
                 let expr = text[abs_start + 2..abs_end].trim();
 
                 if !expr.is_empty() {
-                    // Generate placeholder name using the i18n placeholder registry
-                    let placeholder_name =
-                        self.i18n_placeholder_registry.get_placeholder_name("INTERPOLATION", expr);
+                    // Generate placeholder name using the i18n placeholder registry, honouring a
+                    // custom name from `// i18n(ph="NAME")` as Angular's i18n parser does.
+                    let base_name = crate::i18n::parser::extract_placeholder_name(expr);
+                    let placeholder_name = self.i18n_placeholder_registry.get_placeholder_name(
+                        base_name.as_deref().unwrap_or("INTERPOLATION"),
+                        expr,
+                    );
                     let name_atom = Ident::from_in(&placeholder_name, self.allocator);
                     let value_atom = Ident::from_in(expr, self.allocator);
 
