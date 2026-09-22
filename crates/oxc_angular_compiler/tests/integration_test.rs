@@ -4432,6 +4432,27 @@ fn test_i18n_sole_icu_without_interpolation() {
     assert_contains(&js, "return [i18n_0]");
 }
 
+/// Elements inside a sole ICU become tag placeholders that `ɵɵi18nPostprocess` maps back to
+/// markup. Angular 22.1.5:
+///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "CLOSE_BOLD_TEXT": "</b>", "CLOSE_ITALIC_TEXT": "</i>",
+///     "INTERPOLATION": "�1�", "START_BOLD_TEXT": "<b>", "START_ITALIC_TEXT": "<i>",
+///     "VAR_PLURAL": "�0�" });
+#[test]
+fn test_i18n_sole_icu_with_elements() {
+    let js = compile_i18n_component(
+        r#"<span i18n>{count, plural, =1 {<b>one</b>} other {<i>{{count}}</i> items}}</span>"#,
+    );
+    assert_contains(
+        &js,
+        r#"goog.getMsg("{VAR_PLURAL, plural, =1 {{START_BOLD_TEXT}one{CLOSE_BOLD_TEXT}} other {{START_ITALIC_TEXT}{INTERPOLATION}{CLOSE_ITALIC_TEXT} items}}")"#,
+    );
+    assert_contains(
+        &js,
+        "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"CLOSE_BOLD_TEXT\":\"</b>\",\"CLOSE_ITALIC_TEXT\":\"</i>\",\"INTERPOLATION\":\"\u{FFFD}1\u{FFFD}\",\"START_BOLD_TEXT\":\"<b>\",\"START_ITALIC_TEXT\":\"<i>\",\"VAR_PLURAL\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(&js, "return [i18n_0]");
+}
+
 /// An ICU next to text and an interpolation is a real sub-message, referenced from the root
 /// message through the `icu` placeholder by variable. Angular 22.1.5:
 ///   i18n_0 = "{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"
