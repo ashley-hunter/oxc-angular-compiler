@@ -98,7 +98,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                             associated_message_id: msg_op
                                 .associated_message_id
                                 .as_ref()
-                                .map(|a| a.to_string()),
+                                .map(ToString::to_string),
                             needs_postprocessing: msg_op.needs_postprocessing,
                             sub_messages: msg_op.sub_messages.iter().copied().collect(),
                         },

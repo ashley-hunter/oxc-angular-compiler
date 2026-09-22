@@ -413,16 +413,17 @@ pub trait Visitor {
 // Serialization
 // ============================================================================
 
-/// Serialize message nodes as Angular's `serializeMessage` does for `Message.messageString`,
-/// the text from which `$localize` message ids are computed (`computeMsgId`). Placeholders are
-/// `{$NAME}` everywhere, including inside ICUs, and a void tag keeps its empty close
-/// placeholder. This differs from the string used for code generation.
+/// Serialize message nodes as Angular's `serializeMessage` does for `Message.messageString`.
+///
+/// This is the text from which `$localize` message ids are computed (`computeMsgId`).
+/// Placeholders are `{$NAME}` everywhere, including inside ICUs, and a void tag keeps its empty
+/// close placeholder. This differs from the string used for code generation.
 pub fn serialize_message_for_id(nodes: &[Node]) -> String {
     struct MessageStringVisitor;
     impl Visitor for MessageStringVisitor {
         type Context = ();
         type Result = String;
-        fn visit_text(&mut self, text: &Text, _: &mut ()) -> String {
+        fn visit_text(&mut self, text: &Text, (): &mut ()) -> String {
             text.value.clone()
         }
         fn visit_container(&mut self, container: &Container, ctx: &mut ()) -> String {
@@ -438,10 +439,10 @@ pub fn serialize_message_for_id(nodes: &[Node]) -> String {
             let children: String = ph.children.iter().map(|c| c.visit(self, ctx)).collect();
             format!("{{${}}}{children}{{${}}}", ph.start_name, ph.close_name)
         }
-        fn visit_placeholder(&mut self, ph: &Placeholder, _: &mut ()) -> String {
+        fn visit_placeholder(&mut self, ph: &Placeholder, (): &mut ()) -> String {
             format!("{{${}}}", ph.name)
         }
-        fn visit_icu_placeholder(&mut self, ph: &IcuPlaceholder, _: &mut ()) -> String {
+        fn visit_icu_placeholder(&mut self, ph: &IcuPlaceholder, (): &mut ()) -> String {
             format!("{{${}}}", ph.name)
         }
         fn visit_block_placeholder(&mut self, ph: &BlockPlaceholder, ctx: &mut ()) -> String {
@@ -522,7 +523,7 @@ impl Visitor for LocalizeMessageStringVisitor {
             return self.format_ph(&ph.start_name);
         }
         let children: String =
-            ph.children.iter().map(|child| child.visit(self, context)).collect::<Vec<_>>().join("");
+            ph.children.iter().map(|child| child.visit(self, context)).collect::<String>();
         format!("{}{children}{}", self.format_ph(&ph.start_name), self.format_ph(&ph.close_name))
     }
 
@@ -548,7 +549,7 @@ impl Visitor for LocalizeMessageStringVisitor {
         context: &mut Self::Context,
     ) -> Self::Result {
         let children: String =
-            ph.children.iter().map(|child| child.visit(self, context)).collect::<Vec<_>>().join("");
+            ph.children.iter().map(|child| child.visit(self, context)).collect::<String>();
         format!("{}{children}{}", self.format_ph(&ph.start_name), self.format_ph(&ph.close_name))
     }
 }
