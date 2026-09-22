@@ -420,11 +420,12 @@ fn serialize_message(nodes: &[Node]) -> String {
     nodes.iter().map(|n| n.visit(&mut visitor, &mut ctx)).collect::<Vec<_>>().join("")
 }
 
-/// Visitor that serializes i18n nodes to $localize format.
+/// Visitor that serializes i18n nodes to the message string stored for code generation.
 ///
-/// Placeholders are written as `{$camelCase}` markers, except inside an ICU, where Angular's
-/// `IcuSerializerVisitor` keeps them as literal `{UPPER_CASE}` ICU text that is resolved by
-/// `ɵɵi18nPostprocess` at runtime rather than split into `$localize` substitutions.
+/// Placeholders are written as `{$NAME}` markers with their original names: `$localize` uses
+/// the name as-is and `goog.getMsg` its camelCase form, as Angular's two serializers do.
+/// Inside an ICU, Angular's `IcuSerializerVisitor` keeps them as literal `{UPPER_CASE}` ICU
+/// text that is resolved by `ɵɵi18nPostprocess` at runtime.
 struct LocalizeMessageStringVisitor {
     in_icu: bool,
 }
@@ -434,7 +435,7 @@ impl LocalizeMessageStringVisitor {
         if self.in_icu {
             format!("{{{}}}", format_i18n_placeholder_name(name, false))
         } else {
-            format!("{{${}}}", format_i18n_placeholder_name(name, true))
+            format!("{{${name}}}")
         }
     }
 }
@@ -713,6 +714,7 @@ mod tests {
             String::new(),
             String::new(),
         );
-        assert_eq!(msg.message_string, "Hello {$interpolation}!");
+        // Original placeholder names; goog.getMsg converts them to camelCase.
+        assert_eq!(msg.message_string, "Hello {$INTERPOLATION}!");
     }
 }

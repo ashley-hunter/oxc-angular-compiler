@@ -543,15 +543,15 @@ fn collect_message<'a>(
         None
     };
 
-    // Serialize message for goog.getMsg format
-    // Use stored message_string if available, otherwise fallback to generating from params
-    let message_for_closure =
+    // The stored message string names placeholders as `{$NAME}`; goog.getMsg uses camelCase.
+    let message_string =
         msg_info.message_string.clone().unwrap_or_else(|| generate_message_from_params(&params));
+    let message_for_closure = to_get_msg_string(&message_string);
 
     // Create $localize expression
     let localized_expr = create_localize_expression(
         allocator,
-        &message_for_closure,
+        &message_string,
         &params,
         msg_info.description.clone(),
         msg_info.meaning.clone(),
@@ -632,9 +632,24 @@ fn add_sub_message_params(
 fn generate_message_from_params(params: &[(String, I18nParamExpr)]) -> String {
     let mut result = String::new();
     for (name, _value) in params {
-        let formatted_name = format_i18n_placeholder_name(name, true);
-        result.push_str(&format!("{{${formatted_name}}}"));
+        result.push_str(&format!("{{${name}}}"));
     }
+    result
+}
+
+/// Converts a stored message string to goog.getMsg format by writing each `{$NAME}` placeholder
+/// in camelCase, as Angular's `GetMsgSerializerVisitor` does.
+fn to_get_msg_string(message: &str) -> String {
+    let mut result = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find("{$") {
+        let Some(len) = rest[start..].find('}') else { break };
+        result.push_str(&rest[..start]);
+        let name = &rest[start + 2..start + len];
+        result.push_str(&format!("{{${}}}", format_i18n_placeholder_name(name, true)));
+        rest = &rest[start + len + 1..];
+    }
+    result.push_str(rest);
     result
 }
 
@@ -824,36 +839,16 @@ fn serialize_i18n_template_part(placeholder_name: &str, text: &str) -> String {
     format!(":{}:{}", placeholder_name, text)
 }
 
-/// Find the parameter value for a placeholder name from the message string.
-///
-/// The message_string uses camelCase placeholder names (e.g., `interpolation`),
-/// but the params_map is keyed by the original placeholder names (e.g., `INTERPOLATION`).
-/// This function tries to find the matching param key by comparing the formatted names.
+/// Find the parameter value for a placeholder, by its name in the message (Angular:
+/// `params[ph.text]`).
 fn find_param_value(
     params_map: &FxHashMap<String, I18nParamExpr>,
     placeholder_name: &str,
 ) -> I18nParamExpr {
-    // First try direct lookup
-    if let Some(value) = params_map.get(placeholder_name) {
-        return value.clone();
-    }
-
-    // Try UPPERCASE lookup first since that's the most common format
-    let uppercase_name = format_i18n_placeholder_name(placeholder_name, false);
-    if let Some(value) = params_map.get(&uppercase_name) {
-        return value.clone();
-    }
-
-    // Try to find a key that matches when formatted to camelCase
-    for (key, value) in params_map {
-        let formatted_key = format_i18n_placeholder_name(key, true);
-        if formatted_key == placeholder_name {
-            return value.clone();
-        }
-    }
-
-    // Fallback to empty string if no match found
-    I18nParamExpr::Literal(String::new())
+    params_map
+        .get(placeholder_name)
+        .cloned()
+        .unwrap_or_else(|| I18nParamExpr::Literal(String::new()))
 }
 
 /// Wrap an i18n expression with i18nPostprocess for ICU message handling.
