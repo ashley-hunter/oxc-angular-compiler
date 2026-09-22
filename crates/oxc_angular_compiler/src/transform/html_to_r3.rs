@@ -1243,7 +1243,9 @@ impl<'a> HtmlToR3Transform<'a> {
     /// message, or a newly generated one.
     fn icu_var_name(&mut self, start: u32, base_name: &str) -> String {
         match self.icu_var_names.remove(&start) {
-            Some(name) => name,
+            // Angular's visitExpansion trims the key: `{count, select , ...}` is named
+            // "VAR_SELECT " in the message but the var is VAR_SELECT.
+            Some(name) => name.trim().to_string(),
             None => self.generate_unique_icu_placeholder(base_name),
         }
     }
