@@ -171,7 +171,7 @@ pub struct HtmlToR3Transform<'a> {
     /// Placeholder names from the message of the ICU being visited.
     icu_names: IcuPlaceholderNames,
     /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
-    element_full_names: std::vec::Vec<String>,
+    element_full_names: std::vec::Vec<std::borrow::Cow<'a, str>>,
 }
 
 /// Placeholder names taken from an i18n message, keyed by source offset, so that the r3 AST
@@ -376,7 +376,7 @@ impl<'a> HtmlToR3Transform<'a> {
         // the namespace for its children (pushed to stack).
         let full_name = crate::i18n::parser::element_full_name(
             element.name.as_str(),
-            self.element_full_names.last().map(String::as_str),
+            self.element_full_names.last().map(AsRef::as_ref),
         );
         let parent_namespace = self.current_namespace();
         let child_namespace = self.resolve_namespace(raw_name, parent_namespace);
@@ -1308,7 +1308,7 @@ impl<'a> HtmlToR3Transform<'a> {
             std::sync::Arc::new(crate::util::ParseSourceFile::new(self.source_text, "<template>"));
         let icu_message = I18nMessageFactory::new(false, true).create_icu_message(
             expansion,
-            self.element_full_names.last().map(String::as_str),
+            self.element_full_names.last().map(AsRef::as_ref),
             source_file,
         );
         let message_string = icu_message.serialize();

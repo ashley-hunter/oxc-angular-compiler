@@ -4,6 +4,7 @@
 //!
 //! Ported from Angular's `i18n/i18n_parser.ts`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -609,7 +610,7 @@ impl I18nMessageFactory {
     ) -> Option<Node> {
         // Angular names placeholders from the element's full name (`:svg:circle`).
         let full_name = element_full_name(element.name.as_str(), context.parent_element.as_deref());
-        let tag_name = full_name.as_str();
+        let tag_name: &str = &full_name;
         let is_void = is_void_element(tag_name);
 
         // Convert element attributes to an IndexMap for placeholder registry (ordered for consistent serialization)
@@ -626,7 +627,7 @@ impl I18nMessageFactory {
         }
 
         // Visit children first: Angular names nested tags before their parent.
-        let parent = context.parent_element.replace(full_name.clone());
+        let parent = context.parent_element.replace(full_name.to_string());
         let children = self.visit_all(&element.children, context, visit_fn);
         context.parent_element = parent;
 
@@ -863,21 +864,22 @@ pub fn create_i18n_message_factory(
 /// An element's full name with its namespace prefix: explicit (`:xhtml:div`), implicit for the
 /// tag (`:svg:svg`) or inherited from its parent (`:svg:circle`), as Angular's HTML parser
 /// computes it in `_getElementFullName`.
-pub(crate) fn element_full_name(name: &str, parent: Option<&str>) -> String {
-    use crate::parser::html::{
-        get_html_tag_definition, get_ns_prefix, merge_ns_and_name, split_ns_name,
-    };
+pub(crate) fn element_full_name<'a>(name: &'a str, parent: Option<&str>) -> Cow<'a, str> {
+    use crate::parser::html::{get_html_tag_definition, get_ns_prefix, split_ns_name};
     if name.starts_with(':') {
-        return name.to_string();
+        return Cow::Borrowed(name);
     }
     let mut prefix = get_html_tag_definition(name).implicit_namespace_prefix;
     if prefix.is_none()
-        && let Some(parent) = parent
+        && let Some(parent) = parent.filter(|parent| parent.starts_with(':'))
         && !get_html_tag_definition(split_ns_name(parent).1).prevent_namespace_inheritance
     {
         prefix = get_ns_prefix(parent);
     }
-    merge_ns_and_name(prefix, name)
+    match prefix {
+        Some(prefix) => Cow::Owned(format!(":{prefix}:{name}")),
+        None => Cow::Borrowed(name),
+    }
 }
 
 /// Extracts a custom placeholder name from an expression if present.
