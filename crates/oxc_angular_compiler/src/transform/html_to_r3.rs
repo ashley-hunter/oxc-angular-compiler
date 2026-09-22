@@ -169,6 +169,9 @@ pub struct HtmlToR3Transform<'a> {
     /// Placeholder names of the ICU being visited, keyed by their interpolation text
     /// (e.g. `{{count}}` -> `INTERPOLATION`), from the ICU's i18n message.
     icu_interpolation_names: FxHashMap<String, String>,
+    /// ICU placeholder names (`ICU`, `ICU_1`, ...) from the enclosing i18n message, keyed by
+    /// the ICU's start offset.
+    icu_placeholder_names: FxHashMap<u32, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +206,7 @@ impl<'a> HtmlToR3Transform<'a> {
             i18n_message_instance_counter: 0,
             sole_icu_message: None,
             icu_interpolation_names: FxHashMap::default(),
+            icu_placeholder_names: FxHashMap::default(),
         }
     }
 
@@ -408,6 +412,7 @@ impl<'a> HtmlToR3Transform<'a> {
                     None,
                     source_file,
                 );
+                collect_icu_placeholder_names(&message.nodes, &mut self.icu_placeholder_names);
                 message.serialize()
             }
         } else {
@@ -1300,7 +1305,13 @@ impl<'a> HtmlToR3Transform<'a> {
                 },
                 self.allocator,
             ),
-            name: Ident::from_in("ICU", self.allocator),
+            name: Ident::from_in(
+                self.icu_placeholder_names
+                    .remove(&expansion.span.start)
+                    .as_deref()
+                    .unwrap_or("ICU"),
+                self.allocator,
+            ),
             source_span: expansion.span,
         }));
 
@@ -4820,6 +4831,26 @@ fn is_style_url_resolvable(url: &str) -> bool {
     } else {
         // No scheme = relative URL = resolvable
         true
+    }
+}
+
+/// Records the placeholder name of each ICU in an i18n message, keyed by the ICU's start
+/// offset. Angular names them with `getPlaceholderName('ICU', ...)`, giving `ICU`, `ICU_1`, ...
+fn collect_icu_placeholder_names(
+    nodes: &[crate::i18n::ast::Node],
+    names: &mut FxHashMap<u32, String>,
+) {
+    use crate::i18n::ast::Node;
+    for node in nodes {
+        match node {
+            Node::IcuPlaceholder(ph) => {
+                names.insert(ph.source_span.start.offset, ph.name.clone());
+            }
+            Node::Container(container) => collect_icu_placeholder_names(&container.children, names),
+            Node::TagPlaceholder(tag) => collect_icu_placeholder_names(&tag.children, names),
+            Node::BlockPlaceholder(block) => collect_icu_placeholder_names(&block.children, names),
+            Node::Text(_) | Node::Icu(_) | Node::Placeholder(_) => {}
+        }
     }
 }
 
