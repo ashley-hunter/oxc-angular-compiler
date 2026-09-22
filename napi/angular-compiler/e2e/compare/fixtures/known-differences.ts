@@ -14,6 +14,8 @@ const NG_MODULE_IMPORTS = 'ɵmod includes imports, which Angular omits in full c
 const HOST_ATTRS_ORDER = 'hostAttrs are emitted in a different order'
 const CUSTOM_DECORATOR =
   'the reference ngtsc compile leaves a class with a non-Angular decorator uncompiled, so only Oxc emits ɵfac/ɵcmp'
+const SELECTOR_WHITESPACE =
+  'runs of whitespace inside shimmed selectors are collapsed where Angular keeps them'
 
 export const KNOWN_DIFFERENCES: Record<string, string[]> = {
   'animations/animation-metadata-with-host-bindings': ['hostVars is 2 where Angular emits 3'],
@@ -24,7 +26,6 @@ export const KNOWN_DIFFERENCES: Record<string, string[]> = {
   'component-meta/change-detection-default': ['changeDetection is omitted where Angular emits it'],
   'edge-cases/multiple-custom-decorators': [CUSTOM_DECORATOR],
   'edge-cases/single-custom-decorator': [CUSTOM_DECORATOR],
-  'edge-cases/unicode-special-escapes': ['a tab in template text becomes a space'],
   'full-file/component-with-pipes': ['component styles keep a leading newline'],
   'full-transform/full-transform-host-attribute': [HOST_ATTRS_ORDER],
   'host-bindings/host-attribute': [HOST_ATTRS_ORDER],
@@ -64,4 +65,28 @@ export const KNOWN_DIFFERENCES: Record<string, string[]> = {
   'styles/shadow-css-polyfill-unscoped-rule': [
     'polyfill-unscoped-rule is not scoped and rewritten as Angular does',
   ],
+  'i18n/i18n-compliance-element-attributes-should-correctly-bind-to-context-in-nested-template-interpolation-nested-context':
+    [FACTORY],
+  'i18n/i18n-compliance-element-attributes-should-support-i18n-attributes-with-interpolations-on-explicit-ng-template-elements-with-structural-directives-ng-t':
+    [FACTORY],
+  'i18n/i18n-compliance-element-attributes-should-support-interpolation-interpolation-basic': [
+    FACTORY,
+  ],
+  'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-and-nested-elements-in-content-nested-elements':
+    [FACTORY],
+  'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-in-content-and-element-attributes-nested-elements-with-i18n-attributes':
+    [FACTORY],
+  'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-in-content-bindings-in-content':
+    [FACTORY],
+  'i18n/i18n-compliance-nested-nodes-should-support-interpolations-with-complex-expressions-interpolation-complex-expressions':
+    [FACTORY],
+  'i18n/i18n-compliance-ng-container-ng-template-should-be-able-to-act-as-child-elements-inside-i18n-block-child-elements':
+    [FACTORY],
+  'i18n/i18n-compliance-ng-container-ng-template-should-handle-single-translation-message-using-ng-container-single-ng-container':
+    [FACTORY],
+  'i18n/i18n-compliance-root-should-support-i18n-message-with-multiple-pipes-multiple-pipes': [
+    FACTORY,
+  ],
+  'styles/shadow-css-host-context-with-descendant': [SELECTOR_WHITESPACE],
+  'styles/shadow-css-where-with-host': [SELECTOR_WHITESPACE],
 }

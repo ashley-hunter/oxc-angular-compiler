@@ -2169,12 +2169,9 @@ function extractClassStaticFields(program: Program, sourceCode: string): StaticF
       ) {
         continue
       }
-      // oxc-parser's JS API reports UTF-16 offsets, so they index the string directly.
-      const value = sourceCode
-        .slice(member.value.start, member.value.end)
-        .trim()
-        .replace(/\s+/g, ' ')
-        .replace(/,\s+/g, ',')
+      // oxc-parser's JS API reports UTF-16 offsets, so they index the string directly. Keep
+      // whitespace: collapsing it would also change multi-line template literals.
+      const value = sourceCode.slice(member.value.start, member.value.end).trim()
       fields.push({ className: cls.id.name, fieldName: member.key.name, value })
     }
   }
@@ -2880,7 +2877,7 @@ function compareStaticFields(
         normalizedOxc !== normalizedTs &&
         // Also try the unmapped value: when both sides already use the same const names, the
         // name mapping can only introduce differences.
-        !staticFieldValuesEquivalent(normalizedOxc, normalizedTs) &&
+        !staticFieldValuesEquivalent(normalizedOxcValue, tsField.value) &&
         !staticFieldValuesEquivalent(oxcField.value, tsField.value)
       ) {
         // For ɵcmp fields, perform granular input/output comparison
