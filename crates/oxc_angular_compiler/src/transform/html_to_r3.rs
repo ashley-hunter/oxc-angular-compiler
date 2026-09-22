@@ -1306,6 +1306,11 @@ impl<'a> HtmlToR3Transform<'a> {
             source_file,
         );
         let message_string = icu_message.serialize();
+        // Angular's meta visitor gives an ICU sub-message no meaning.
+        let associated_message_id = crate::i18n::compute_msg_id(
+            &crate::i18n::ast::serialize_message_for_id(&icu_message.nodes),
+            "",
+        );
         // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
         // vars, interpolations become bound text, and element markup becomes plain text.
         let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
@@ -1321,15 +1326,19 @@ impl<'a> HtmlToR3Transform<'a> {
             .map(|(name, placeholder)| (placeholder.text, name))
             .collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        let (meta_value, instance_id) = match self.sole_icu_message.take() {
-            Some(parent) => parent,
-            None => (String::new(), self.allocate_i18n_message_instance_id()),
+        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
+            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
+            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
         };
         let I18nMeta::Message(mut i18n_message) =
             parse_i18n_meta_with_message(self.allocator, &meta_value, instance_id, &message_string)
         else {
             unreachable!("parse_i18n_meta_with_message always returns a Message")
         };
+        if is_sub_message {
+            i18n_message.associated_message_id =
+                Ident::from_in(associated_message_id.as_str(), self.allocator);
+        }
 
         // The pipeline identifies the ICU by a message holding a single IcuPlaceholder.
         let icu_type_upper = expansion.expansion_type.as_str().to_uppercase();
@@ -4987,6 +4996,7 @@ fn parse_i18n_meta_with_message<'a>(
         id: Ident::from(""),
         legacy_ids: Vec::new_in(allocator),
         message_string: Ident::from_in(message_string, allocator),
+        associated_message_id: Ident::from(""),
     })
 }
 

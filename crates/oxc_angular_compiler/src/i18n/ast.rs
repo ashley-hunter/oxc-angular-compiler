@@ -413,6 +413,45 @@ pub trait Visitor {
 // Serialization
 // ============================================================================
 
+/// Serialize message nodes as Angular's `serializeMessage` does for `Message.messageString`,
+/// the text from which `$localize` message ids are computed (`computeMsgId`). Placeholders are
+/// `{$NAME}` everywhere, including inside ICUs, and a void tag keeps its empty close
+/// placeholder. This differs from the string used for code generation.
+pub fn serialize_message_for_id(nodes: &[Node]) -> String {
+    struct MessageStringVisitor;
+    impl Visitor for MessageStringVisitor {
+        type Context = ();
+        type Result = String;
+        fn visit_text(&mut self, text: &Text, _: &mut ()) -> String {
+            text.value.clone()
+        }
+        fn visit_container(&mut self, container: &Container, ctx: &mut ()) -> String {
+            container.children.iter().map(|c| c.visit(self, ctx)).collect()
+        }
+        fn visit_icu(&mut self, icu: &Icu, ctx: &mut ()) -> String {
+            let cases: Vec<String> =
+                icu.cases.iter().map(|(k, v)| format!("{k} {{{}}}", v.visit(self, ctx))).collect();
+            let placeholder = icu.expression_placeholder.as_deref().unwrap_or_default();
+            format!("{{{placeholder}, {}, {}}}", icu.icu_type, cases.join(" "))
+        }
+        fn visit_tag_placeholder(&mut self, ph: &TagPlaceholder, ctx: &mut ()) -> String {
+            let children: String = ph.children.iter().map(|c| c.visit(self, ctx)).collect();
+            format!("{{${}}}{children}{{${}}}", ph.start_name, ph.close_name)
+        }
+        fn visit_placeholder(&mut self, ph: &Placeholder, _: &mut ()) -> String {
+            format!("{{${}}}", ph.name)
+        }
+        fn visit_icu_placeholder(&mut self, ph: &IcuPlaceholder, _: &mut ()) -> String {
+            format!("{{${}}}", ph.name)
+        }
+        fn visit_block_placeholder(&mut self, ph: &BlockPlaceholder, ctx: &mut ()) -> String {
+            let children: String = ph.children.iter().map(|c| c.visit(self, ctx)).collect();
+            format!("{{${}}}{children}{{${}}}", ph.start_name, ph.close_name)
+        }
+    }
+    nodes.iter().map(|n| n.visit(&mut MessageStringVisitor, &mut ())).collect()
+}
+
 /// Serialize the message to the $localize backtick string format.
 fn serialize_message(nodes: &[Node]) -> String {
     let mut visitor = LocalizeMessageStringVisitor { in_icu: false };

@@ -133,6 +133,8 @@ pub fn extract_i18n_messages(job: &mut ComponentCompilationJob<'_>) {
                                 meaning: metadata.and_then(|m| m.meaning.clone()),
                                 description: metadata.and_then(|m| m.description.clone()),
                                 message_string: metadata.and_then(|m| m.message_string.clone()),
+                                associated_message_id: metadata
+                                    .and_then(|m| m.associated_message_id),
                                 needs_postprocessing,
                                 sub_messages: oxc_allocator::Vec::new_in(allocator),
                             });

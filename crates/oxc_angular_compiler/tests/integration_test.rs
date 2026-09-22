@@ -4459,6 +4459,9 @@ fn test_i18n_sole_icu_with_elements() {
 ///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "INTERPOLATION": "�2�", "VAR_PLURAL": "�1�" });
 ///   goog.getMsg("Hello {$interpolation}! {$icu}", { "icu": i18n_0, "interpolation": "�0�" }, ...)
 ///   $localize `Hello ${"�0�"}:INTERPOLATION:! ${i18n_0}:ICU:`
+///
+/// The `$localize` ICU placeholders carry the sub-message id (`:ICU@@<id>:`), as Angular emits
+/// when legacy message ids are disabled; oxc emits no legacy ids.
 #[test]
 fn test_i18n_icu_with_sibling_content_is_sub_message() {
     let js = compile_i18n_component(
@@ -4482,7 +4485,7 @@ fn test_i18n_icu_with_sibling_content_is_sub_message() {
     );
     assert_contains(
         &js,
-        "__tpl([\"Hello \", \":INTERPOLATION:! \", \":ICU:\"], [\"Hello \", \":INTERPOLATION:! \", \":ICU:\"]), \"\u{FFFD}0\u{FFFD}\", i18n_0)",
+        "__tpl([\"Hello \", \":INTERPOLATION:! \", \":ICU@@3633748910064245637:\"], [\"Hello \", \":INTERPOLATION:! \", \":ICU@@3633748910064245637:\"]), \"\u{FFFD}0\u{FFFD}\", i18n_0)",
     );
     assert_contains(&js, "return [i18n_1]");
     assert_contains(&js, "i0.ɵɵi18nExp(ctx.name)(ctx.count)(ctx.count);");
@@ -4492,6 +4495,9 @@ fn test_i18n_icu_with_sibling_content_is_sub_message() {
 /// sub-message. Angular 22.1.5:
 ///   goog.getMsg("{$icu} and {$icu_1}", { "icu": i18n_0, "icu_1": i18n_1 }, ...)
 ///   $localize `${i18n_0}:ICU: and ${i18n_1}:ICU_1:`
+///
+/// The `$localize` ICU placeholders carry the sub-message id (`:ICU@@<id>:`), as Angular emits
+/// when legacy message ids are disabled; oxc emits no legacy ids.
 #[test]
 fn test_i18n_two_icus_in_one_message() {
     let js = compile_i18n_component(
@@ -4508,7 +4514,7 @@ fn test_i18n_two_icus_in_one_message() {
     assert_contains(&js, r#"goog.getMsg("{$icu} and {$icu_1}",{"icu":i18n_0,"icu_1":i18n_1}"#);
     assert_contains(
         &js,
-        r#"__tpl(["", ":ICU: and ", ":ICU_1:"], ["", ":ICU: and ", ":ICU_1:"]), i18n_0, i18n_1)"#,
+        r#"__tpl(["", ":ICU@@3286071892512017447: and ", ":ICU_1@@8078998681144872872:"], ["", ":ICU@@3286071892512017447: and ", ":ICU_1@@8078998681144872872:"]), i18n_0, i18n_1)"#,
     );
     assert!(!js.contains("i18nPostprocess(i18n_2"), "Root message needs no post-processing:\n{js}");
     assert_contains(&js, "return [i18n_2]");
@@ -4554,13 +4560,19 @@ fn test_i18n_custom_interpolation_placeholder_name() {
 
 /// Whitespace next to an ICU is part of the message. Angular 22.1.5:
 ///   goog.getMsg("{$icu} {$startBoldText}x{$closeBoldText}", ...)
+///
+/// The `$localize` ICU placeholders carry the sub-message id (`:ICU@@<id>:`), as Angular emits
+/// when legacy message ids are disabled; oxc emits no legacy ids.
 #[test]
 fn test_i18n_keeps_whitespace_next_to_icu() {
     let js = compile_i18n_component(
         r#"<div i18n>{count, plural, =1 {one} other {many}} <b>x</b></div>"#,
     );
     assert_contains(&js, r#"goog.getMsg("{$icu} {$startBoldText}x{$closeBoldText}","#);
-    assert_contains(&js, r#"__tpl(["", ":ICU: ", ":START_BOLD_TEXT:x", ":CLOSE_BOLD_TEXT:"]"#);
+    assert_contains(
+        &js,
+        r#"__tpl(["", ":ICU@@8078998681144872872: ", ":START_BOLD_TEXT:x", ":CLOSE_BOLD_TEXT:"]"#,
+    );
 }
 
 /// An element with a structural directive inside an i18n block gets one combined value per

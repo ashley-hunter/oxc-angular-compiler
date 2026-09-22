@@ -904,19 +904,9 @@ fn record_i18n_message_metadata<'a>(
     message: &I18nMessage<'a>,
 ) -> u32 {
     let allocator = job.allocator;
-    let non_empty = |value: &Ident<'a>| (!value.is_empty()).then_some(*value);
-    job.i18n_message_metadata.entry(message.instance_id).or_insert_with(|| {
-        let mut legacy_ids = Vec::new_in(allocator);
-        legacy_ids.extend(message.legacy_ids.iter().copied());
-        I18nMessageMetadata {
-            message_id: non_empty(&message.id),
-            custom_id: non_empty(&message.custom_id),
-            meaning: non_empty(&message.meaning),
-            description: non_empty(&message.description),
-            legacy_ids,
-            message_string: non_empty(&message.message_string),
-        }
-    });
+    job.i18n_message_metadata
+        .entry(message.instance_id)
+        .or_insert_with(|| I18nMessageMetadata::from_message(allocator, message));
     message.instance_id
 }
 
@@ -1168,35 +1158,7 @@ fn ingest_element<'a>(
             let instance_id = message.instance_id;
 
             // Store i18n message metadata keyed by instance_id
-            let mut legacy_ids = Vec::new_in(allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            let metadata = I18nMessageMetadata {
-                message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                custom_id: if message.custom_id.is_empty() {
-                    None
-                } else {
-                    Some(message.custom_id.clone())
-                },
-                meaning: if message.meaning.is_empty() {
-                    None
-                } else {
-                    Some(message.meaning.clone())
-                },
-                description: if message.description.is_empty() {
-                    None
-                } else {
-                    Some(message.description.clone())
-                },
-                legacy_ids,
-                message_string: if message.message_string.is_empty() {
-                    None
-                } else {
-                    Some(message.message_string.clone())
-                },
-            };
+            let metadata = I18nMessageMetadata::from_message(allocator, message);
             job.i18n_message_metadata.insert(instance_id, metadata);
 
             // Create I18nStartOp
@@ -1337,35 +1299,7 @@ fn ingest_static_attributes_with_i18n<'a>(
 
             // Store i18n message metadata for later phases (only if not already stored)
             if !job.i18n_message_metadata.contains_key(&instance_id) {
-                let mut legacy_ids = Vec::new_in(allocator);
-                for id in message.legacy_ids.iter() {
-                    legacy_ids.push(id.clone());
-                }
-
-                let metadata = I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                };
+                let metadata = I18nMessageMetadata::from_message(allocator, message);
                 job.i18n_message_metadata.insert(instance_id, metadata);
             }
 
@@ -1582,35 +1516,7 @@ fn ingest_binding_owned<'a>(
 
         // Store i18n message metadata for later phases (keyed by instance_id)
         if !job.i18n_message_metadata.contains_key(&instance_id) {
-            let mut legacy_ids = Vec::new_in(allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            let metadata = I18nMessageMetadata {
-                message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                custom_id: if message.custom_id.is_empty() {
-                    None
-                } else {
-                    Some(message.custom_id.clone())
-                },
-                meaning: if message.meaning.is_empty() {
-                    None
-                } else {
-                    Some(message.meaning.clone())
-                },
-                description: if message.description.is_empty() {
-                    None
-                } else {
-                    Some(message.description.clone())
-                },
-                legacy_ids,
-                message_string: if message.message_string.is_empty() {
-                    None
-                } else {
-                    Some(message.message_string.clone())
-                },
-            };
+            let metadata = I18nMessageMetadata::from_message(allocator, message);
             job.i18n_message_metadata.insert(instance_id, metadata);
         }
 
@@ -1890,38 +1796,7 @@ fn ingest_template<'a>(
         if let Some(I18nMeta::Message(ref message)) = template.i18n {
             let instance_id = message.instance_id;
             // Clone legacy_ids using the allocator
-            let mut legacy_ids = Vec::new_in(allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            Some((
-                instance_id,
-                I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                },
-            ))
+            Some((instance_id, I18nMessageMetadata::from_message(allocator, message)))
         } else {
             None
         }
@@ -4401,35 +4276,7 @@ fn ingest_control_flow_insertion_point<'a, 'b>(
 
             // Store i18n message metadata for later phases (only if not already stored)
             if !job.i18n_message_metadata.contains_key(&instance_id) {
-                let mut legacy_ids = Vec::new_in(allocator);
-                for id in message.legacy_ids.iter() {
-                    legacy_ids.push(id.clone());
-                }
-
-                let metadata = I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                };
+                let metadata = I18nMessageMetadata::from_message(allocator, message);
                 job.i18n_message_metadata.insert(instance_id, metadata);
             }
 
@@ -4558,6 +4405,7 @@ mod tests {
             id: Ident::from(""),
             legacy_ids: Vec::new_in(&allocator),
             message_string: Ident::from(""),
+            associated_message_id: Ident::from(""),
         });
 
         let result = convert_i18n_meta_to_placeholder(

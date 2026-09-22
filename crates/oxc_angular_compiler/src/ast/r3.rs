@@ -55,6 +55,10 @@ pub struct I18nMessage<'a> {
     /// The serialized message string for goog.getMsg and $localize.
     /// Contains the message text with placeholder markers like "{$interpolation}".
     pub message_string: Ident<'a>,
+    /// For an ICU sub-message, its `$localize` id (Angular's
+    /// `computeMsgId(message.messageString, message.meaning)`), written on the parent message's
+    /// ICU placeholder. Empty otherwise.
+    pub associated_message_id: Ident<'a>,
 }
 
 /// i18n AST node.
@@ -213,6 +217,7 @@ impl<'a> I18nMessage<'a> {
             id: self.id.clone(),
             legacy_ids,
             message_string: self.message_string.clone(),
+            associated_message_id: self.associated_message_id,
         }
     }
 }

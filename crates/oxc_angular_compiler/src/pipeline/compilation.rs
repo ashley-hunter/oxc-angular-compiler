@@ -13,6 +13,7 @@ use oxc_span::{Ident, Span};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::AngularVersion;
+use crate::ast::r3::I18nMessage;
 use crate::ir::enums::CompatibilityMode;
 use crate::ir::list::{CreateOpList, UpdateOpList};
 use crate::ir::ops::XrefId;
@@ -98,6 +99,27 @@ pub struct I18nMessageMetadata<'a> {
     /// The serialized message string for goog.getMsg and $localize.
     /// Contains the message text with placeholder markers like "{$interpolation}".
     pub message_string: Option<Ident<'a>>,
+    /// For an ICU sub-message, its `$localize` id, written on the parent message's ICU
+    /// placeholder (`:ICU@@<id>:`).
+    pub associated_message_id: Option<Ident<'a>>,
+}
+
+impl<'a> I18nMessageMetadata<'a> {
+    /// Builds the metadata of an i18n message from the template.
+    pub fn from_message(allocator: &'a Allocator, message: &I18nMessage<'a>) -> Self {
+        let non_empty = |value: &Ident<'a>| (!value.is_empty()).then_some(*value);
+        let mut legacy_ids = Vec::new_in(allocator);
+        legacy_ids.extend(message.legacy_ids.iter().copied());
+        Self {
+            message_id: non_empty(&message.id),
+            custom_id: non_empty(&message.custom_id),
+            meaning: non_empty(&message.meaning),
+            description: non_empty(&message.description),
+            legacy_ids,
+            message_string: non_empty(&message.message_string),
+            associated_message_id: non_empty(&message.associated_message_id),
+        }
+    }
 }
 
 /// A complete compilation job for a single component template.

@@ -95,6 +95,10 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                             custom_id: msg_op.custom_id.as_ref().map(|a| a.to_string()),
                             message_id: msg_op.message_id.as_ref().map(|a| a.to_string()),
                             message_string: msg_op.message_string.as_ref().map(|a| a.to_string()),
+                            associated_message_id: msg_op
+                                .associated_message_id
+                                .as_ref()
+                                .map(|a| a.to_string()),
                             needs_postprocessing: msg_op.needs_postprocessing,
                             sub_messages: msg_op.sub_messages.iter().copied().collect(),
                         },
@@ -446,6 +450,7 @@ struct MessageInfo {
     custom_id: Option<String>,
     message_id: Option<String>,
     message_string: Option<String>,
+    associated_message_id: Option<String>,
     needs_postprocessing: bool,
     sub_messages: Vec<XrefId>,
 }
@@ -472,6 +477,8 @@ fn collect_message<'a>(
 
     // Recursively collect sub-messages first
     let mut sub_message_placeholders: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    // Placeholder -> `$localize` id of its sub-message.
+    let mut associated_message_ids: FxHashMap<String, String> = FxHashMap::default();
     for &sub_msg_xref in &msg_info.sub_messages {
         if let Some(sub_msg) = messages.get(&sub_msg_xref) {
             let (sub_var_name, sub_statements) = collect_message(
@@ -488,6 +495,9 @@ fn collect_message<'a>(
 
             if let Some(ref placeholder) = sub_msg.message_placeholder {
                 sub_message_placeholders.entry(placeholder.clone()).or_default().push(sub_var_name);
+                if let Some(id) = &sub_msg.associated_message_id {
+                    associated_message_ids.insert(placeholder.clone(), id.clone());
+                }
             }
         }
     }
@@ -556,6 +566,7 @@ fn collect_message<'a>(
         msg_info.description.clone(),
         msg_info.meaning.clone(),
         msg_info.custom_id.clone(),
+        &associated_message_ids,
     );
 
     // Generate dual-mode translation declaration
@@ -689,6 +700,7 @@ fn create_localize_expression<'a>(
     description: Option<String>,
     meaning: Option<String>,
     custom_id: Option<String>,
+    associated_message_ids: &FxHashMap<String, String>,
 ) -> OutputExpression<'a> {
     // Parse message_string to extract text parts and placeholder names in order
     let (text_parts, placeholder_order) = parse_message_string(message_string);
@@ -727,7 +739,13 @@ fn create_localize_expression<'a>(
 
         // Text part after this placeholder
         let text_part = text_parts.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-        push_part(create_cooked_raw_string(&formatted_name, text_part));
+        // Angular's serializeI18nTemplatePart names an ICU placeholder's sub-message when the
+        // sub-message has no legacy ids (always, in Oxc): `:ICU@@<id>:`.
+        let meta_block = match associated_message_ids.get(placeholder) {
+            Some(id) => format!("{formatted_name}@@{id}"),
+            None => formatted_name.clone(),
+        };
+        push_part(create_cooked_raw_string(&meta_block, text_part));
     }
 
     // Store metadata for potential future use (JSDoc generation in emitter)
