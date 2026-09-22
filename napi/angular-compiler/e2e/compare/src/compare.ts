@@ -2150,29 +2150,30 @@ function compareExports(
  */
 function extractClassStaticFields(program: Program, sourceCode: string): StaticFieldAssignment[] {
   const fields: StaticFieldAssignment[] = []
-  for (const statement of program.body as any[]) {
-    const cls =
-      statement.type === 'ClassDeclaration'
-        ? statement
-        : statement.type === 'ExportNamedDeclaration' ||
-            statement.type === 'ExportDefaultDeclaration'
-          ? statement.declaration
-          : undefined
-    if (cls?.type !== 'ClassDeclaration' || !cls.id?.name) continue
-    for (const member of cls.body.body) {
+  for (const statement of program.body as unknown as NormAstNode[]) {
+    const exported =
+      statement.type === 'ExportNamedDeclaration' || statement.type === 'ExportDefaultDeclaration'
+    const cls = (exported ? statement.declaration : statement) as NormAstNode | undefined
+    const className = (cls?.id as NormAstNode | undefined)?.name
+    if (cls?.type !== 'ClassDeclaration' || typeof className !== 'string') continue
+    for (const member of (cls.body as NormAstNode).body as NormAstNode[]) {
+      const key = member.key as NormAstNode | undefined
+      const value = member.value as NormAstNode | undefined
       if (
         member.type !== 'PropertyDefinition' ||
         !member.static ||
-        member.key?.type !== 'Identifier' ||
-        !member.key.name.startsWith('ɵ') ||
-        !member.value
+        key?.type !== 'Identifier' ||
+        typeof key.name !== 'string' ||
+        !key.name.startsWith('ɵ') ||
+        value?.start === undefined ||
+        value.end === undefined
       ) {
         continue
       }
       // oxc-parser's JS API reports UTF-16 offsets, so they index the string directly. Keep
       // whitespace: collapsing it would also change multi-line template literals.
-      const value = sourceCode.slice(member.value.start, member.value.end).trim()
-      fields.push({ className: cls.id.name, fieldName: member.key.name, value })
+      const text = sourceCode.slice(value.start, value.end).trim()
+      fields.push({ className, fieldName: key.name, value: text })
     }
   }
   return fields
@@ -2721,99 +2722,103 @@ function canonicalStaticFieldValue(value: string): string | null {
   if (result.errors.length > 0) {
     return null
   }
-  const statement = result.program.body[0] as any
-  const closureNames = new Map<string, string>()
-  return normalizeAst(canonicalizeNode(statement.expression, closureNames))
+  const statement = result.program.body[0] as NormAstNode
+  return normalizeAst(canonicalizeNode(statement.expression, new Map()))
 }
 
-function stringElements(node: any): string[] | null {
-  if (node?.type !== 'ArrayExpression') return null
-  const strings = node.elements.map((e: any) =>
-    e?.type === 'Literal' && typeof e.value === 'string' ? e.value : null,
+/** The string values of an array of string literals, or null if it is not one. */
+function stringElements(node: unknown): string[] | null {
+  const array = node as NormAstNode
+  if (array?.type !== 'ArrayExpression') return null
+  const strings = (array.elements as NormAstNode[]).map((element) =>
+    element?.type === 'Literal' && typeof element.value === 'string' ? element.value : null,
   )
-  return strings.every((s: string | null) => s !== null) ? strings : null
+  return strings.every((value) => value !== null) ? (strings as string[]) : null
 }
 
-function canonicalizeNode(node: any, closureNames: Map<string, string>): any {
+function canonicalizeNode(node: unknown, closureNames: Map<string, string>): unknown {
   if (Array.isArray(node)) {
-    return node.map((n) => canonicalizeNode(n, closureNames))
+    return node.map((element) => canonicalizeNode(element, closureNames))
   }
   if (node === null || typeof node !== 'object') {
     return node
   }
+  const ast = node as NormAstNode
+  const child = (value: unknown) => value as NormAstNode | undefined
+  const children = (value: unknown) => (value ?? []) as NormAstNode[]
+  const args = children(ast.arguments)
+
   // `() => {...}` and `function () {...}` without a name behave the same here.
   if (
-    (node.type === 'ArrowFunctionExpression' && node.body?.type === 'BlockStatement') ||
-    (node.type === 'FunctionExpression' && !node.id)
+    (ast.type === 'ArrowFunctionExpression' && child(ast.body)?.type === 'BlockStatement') ||
+    (ast.type === 'FunctionExpression' && !ast.id)
   ) {
     return {
       type: 'AnonymousFunction',
-      params: canonicalizeNode(node.params, closureNames),
-      body: canonicalizeNode(node.body, closureNames),
+      params: canonicalizeNode(ast.params, closureNames),
+      body: canonicalizeNode(ast.body, closureNames),
     }
   }
+
   // $localize`...`
-  if (
-    node.type === 'TaggedTemplateExpression' &&
-    node.tag?.type === 'Identifier' &&
-    node.tag.name === '$localize'
-  ) {
+  if (ast.type === 'TaggedTemplateExpression' && child(ast.tag)?.name === '$localize') {
+    const quasi = child(ast.quasi)
     return {
       type: 'Localize',
-      cooked: node.quasi.quasis.map((q: any) => q.value.cooked),
-      rawStrings: node.quasi.quasis.map((q: any) => q.value.raw),
-      substitutions: canonicalizeNode(node.quasi.expressions, closureNames),
+      cooked: children(quasi?.quasis).map((part) => child(part.value)?.cooked),
+      rawStrings: children(quasi?.quasis).map((part) => child(part.value)?.raw),
+      substitutions: canonicalizeNode(quasi?.expressions, closureNames),
     }
   }
+
   // $localize(__makeTemplateObject([cooked], [raw]), ...substitutions)
-  if (
-    node.type === 'CallExpression' &&
-    node.callee?.type === 'Identifier' &&
-    node.callee.name === '$localize' &&
-    node.arguments[0]?.type === 'CallExpression' &&
-    node.arguments[0].arguments.length === 2
-  ) {
-    const cooked = stringElements(node.arguments[0].arguments[0])
-    const raw = stringElements(node.arguments[0].arguments[1])
+  if (ast.type === 'CallExpression' && child(ast.callee)?.name === '$localize') {
+    const [cookedArg, rawArg] = children(args[0]?.arguments)
+    const cooked = stringElements(cookedArg)
+    const raw = stringElements(rawArg)
     if (cooked && raw) {
       return {
         type: 'Localize',
         cooked,
         rawStrings: raw,
-        substitutions: canonicalizeNode(node.arguments.slice(1), closureNames),
+        substitutions: canonicalizeNode(args.slice(1), closureNames),
       }
     }
   }
+
   // goog.getMsg(message, params, { original_code: {...} }): the third argument is Closure-only.
+  const callee = child(ast.callee)
   if (
-    node.type === 'CallExpression' &&
-    node.callee?.type === 'MemberExpression' &&
-    node.callee.object?.name === 'goog' &&
-    node.callee.property?.name === 'getMsg' &&
-    node.arguments.length === 3 &&
-    node.arguments[2]?.type === 'ObjectExpression' &&
-    node.arguments[2].properties.some((p: any) => p.key?.name === 'original_code')
+    ast.type === 'CallExpression' &&
+    callee?.type === 'MemberExpression' &&
+    child(callee.object)?.name === 'goog' &&
+    child(callee.property)?.name === 'getMsg' &&
+    args.length === 3 &&
+    args[2].type === 'ObjectExpression' &&
+    children(args[2].properties).some((property) => child(property.key)?.name === 'original_code')
   ) {
-    return canonicalizeNode({ ...node, arguments: node.arguments.slice(0, 2) }, closureNames)
+    return canonicalizeNode({ ...ast, arguments: args.slice(0, 2) }, closureNames)
   }
+
   // Closure translation variable names: compare them by order of appearance.
-  if (node.type === 'Identifier' && node.name.startsWith('MSG_')) {
-    if (!closureNames.has(node.name)) closureNames.set(node.name, `MSG_${closureNames.size}`)
-    return { type: 'Identifier', name: closureNames.get(node.name) }
-  }
-  // ɵɵdefinePipe({ pure: true }) is the default.
-  if (node.type === 'ObjectExpression') {
-    const properties = node.properties.filter(
-      (p: any) =>
-        !(p.key?.name === 'pure' && p.value?.type === 'Literal' && p.value.value === true),
-    )
-    return {
-      ...node,
-      properties: canonicalizeNode(properties, closureNames),
+  if (ast.type === 'Identifier' && typeof ast.name === 'string' && ast.name.startsWith('MSG_')) {
+    if (!closureNames.has(ast.name)) {
+      closureNames.set(ast.name, `MSG_${closureNames.size}`)
     }
+    return { type: 'Identifier', name: closureNames.get(ast.name) }
   }
+
+  // ɵɵdefinePipe({ pure: true }) is the default.
+  if (ast.type === 'ObjectExpression') {
+    const properties = children(ast.properties).filter(
+      (property) =>
+        !(child(property.key)?.name === 'pure' && child(property.value)?.value === true),
+    )
+    return { ...ast, properties: canonicalizeNode(properties, closureNames) }
+  }
+
   const result: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(node)) {
+  for (const [key, value] of Object.entries(ast)) {
     result[key] = canonicalizeNode(value, closureNames)
   }
   return result
