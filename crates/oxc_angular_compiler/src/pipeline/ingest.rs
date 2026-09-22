@@ -2311,12 +2311,21 @@ fn ingest_content<'a>(
         None
     };
 
+    // Angular: createProjectionOp(id, content.selector, content.i18n, ...)
+    let i18n_placeholder = match &content.i18n {
+        Some(I18nMeta::Node(I18nNode::TagPlaceholder(tag))) => Some(I18nPlaceholder::new(
+            tag.start_name.clone(),
+            if tag.is_void { None } else { Some(tag.close_name.clone()) },
+        )),
+        _ => None,
+    };
+
     let op = CreateOp::Projection(ProjectionOp {
         base: CreateOpBase { source_span: Some(content.source_span), ..Default::default() },
         xref,
         slot: None,
         projection_slot_index: 0, // Will be set during projection phase
-        i18n_placeholder: None,
+        i18n_placeholder,
         selector: Some(content.selector.clone()),
         fallback,
         fallback_i18n_placeholder: None,

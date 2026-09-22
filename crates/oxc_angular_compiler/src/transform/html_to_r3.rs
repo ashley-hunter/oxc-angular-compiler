@@ -538,7 +538,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 source_span: element.span,
                 start_source_span: element.start_span,
                 end_source_span: element.end_span,
-                i18n: None,
+                // Inside an i18n block, <ng-content> is a tag placeholder like any element.
+                i18n: i18n_meta,
             };
             let mut result = R3Node::Content(Box::new_in(content, self.allocator));
 
