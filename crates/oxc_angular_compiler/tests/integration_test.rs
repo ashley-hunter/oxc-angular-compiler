@@ -4789,6 +4789,45 @@ fn test_i18n_message_keeps_ngsp() {
     assert_contains(&js, "goog.getMsg(\"a\u{E500}b\")");
 }
 
+/// An ICU placeholder in `$localize` carries the id of its sub-message (Angular's
+/// serializeI18nTemplatePart adds it when the message has no legacy ids). Angular 22.1.5 with
+/// enableI18nLegacyMessageIdFormat false: $localize `a ${i18n_0}:ICU@@911278603808503436: b`
+#[test]
+fn test_i18n_icu_placeholder_has_associated_message_id() {
+    let js =
+        compile_i18n_component(r#"<span i18n>a {count, plural, =1 {one} other {more}} b</span>"#);
+    assert_contains(
+        &js,
+        r#"__tpl(["a ", ":ICU@@911278603808503436: b"], ["a ", ":ICU@@911278603808503436: b"]), i18n_0)"#,
+    );
+}
+
+/// Text expressions of an i18n block are applied at the block's last slot, so Angular advances
+/// past an element with i18n attributes first. Angular 22.1.5:
+///   i0.ɵɵadvance(2); i0.ɵɵi18nExp(ctx.attr); i0.ɵɵi18nApply(3);
+///   i0.ɵɵadvance(); i0.ɵɵi18nExp(ctx.text); i0.ɵɵi18nApply(1);
+#[test]
+fn test_i18n_text_expressions_advance_to_last_slot() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{{ text }}<h1 i18n-title title="{{ attr }}"></h1></div>"#,
+    );
+    assert_contains(
+        &js,
+        "i0.ɵɵadvance(2);i0.ɵɵi18nExp(ctx.attr);i0.ɵɵi18nApply(3);i0.ɵɵadvance();i0.ɵɵi18nExp(ctx.text);i0.ɵɵi18nApply(1);",
+    );
+}
+
+/// An interpolated i18n attribute on an explicit `<ng-template>` is a binding (marker 3), not an
+/// i18n attribute (marker 6): Angular only uses the i18n marker when `templateKind === null`.
+/// Angular 22.1.5: return [["title", i18n_0], [3, "title"]]
+#[test]
+fn test_i18n_attribute_on_ng_template_uses_bindings_marker() {
+    let js = compile_i18n_component(
+        r#"<ng-template i18n-title title="Hello {{ name }}"></ng-template>"#,
+    );
+    assert_contains(&js, r#"return [["title",i18n_0],[3,"title"]]"#);
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
