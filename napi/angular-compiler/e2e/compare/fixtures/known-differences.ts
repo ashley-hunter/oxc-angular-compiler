@@ -15,8 +15,6 @@ interface KnownDifference {
 
 const FACTORY =
   'ɵfac uses ɵɵgetInheritedFactory where Angular emits a factory that calls the constructor'
-const QUERY_CHAINING =
-  'viewQuery/contentQuery calls are emitted separately where Angular chains them'
 const NG_MODULE_IMPORTS = 'ɵmod includes imports, which Angular omits in full compilation'
 const HOST_ATTRS_ORDER = 'hostAttrs are emitted in a different order'
 const CUSTOM_DECORATOR =
