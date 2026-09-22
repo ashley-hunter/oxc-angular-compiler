@@ -2144,6 +2144,43 @@ function compareExports(
 /**
  * Extract static field assignments from code (e.g., ClassName.ɵcmp = ...).
  */
+/**
+ * Extract `static ɵxxx = ...` class fields (e.g. `static ɵcmp = i0.ɵɵdefineComponent(...)`),
+ * which the `ClassName.ɵxxx = ...` pattern in extractStaticFieldAssignments does not match.
+ */
+function extractClassStaticFields(program: Program, sourceCode: string): StaticFieldAssignment[] {
+  const fields: StaticFieldAssignment[] = []
+  for (const statement of program.body as any[]) {
+    const cls =
+      statement.type === 'ClassDeclaration'
+        ? statement
+        : statement.type === 'ExportNamedDeclaration' ||
+            statement.type === 'ExportDefaultDeclaration'
+          ? statement.declaration
+          : undefined
+    if (cls?.type !== 'ClassDeclaration' || !cls.id?.name) continue
+    for (const member of cls.body.body) {
+      if (
+        member.type !== 'PropertyDefinition' ||
+        !member.static ||
+        member.key?.type !== 'Identifier' ||
+        !member.key.name.startsWith('ɵ') ||
+        !member.value
+      ) {
+        continue
+      }
+      // oxc-parser's JS API reports UTF-16 offsets, so they index the string directly.
+      const value = sourceCode
+        .slice(member.value.start, member.value.end)
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/,\s+/g, ',')
+      fields.push({ className: cls.id.name, fieldName: member.key.name, value })
+    }
+  }
+  return fields
+}
+
 function extractStaticFieldAssignments(code: string): StaticFieldAssignment[] {
   const assignments: StaticFieldAssignment[] = []
 
@@ -2665,6 +2702,126 @@ function compareOutputMetadata(
 /**
  * Compare static field assignments between Oxc and TS outputs.
  */
+/**
+ * Compare two static field values (e.g. the `i0.ɵɵdefineComponent({...})` of `ɵcmp`) by AST,
+ * ignoring differences that do not change behaviour:
+ *
+ * - formatting, trailing commas and string escapes (`"\\uFFFD"` vs `"�"`)
+ * - `consts: () => {...}` vs `consts: function () {...}`
+ * - `$localize\`...\`` vs `$localize(__makeTemplateObject(cooked, raw), ...)`, comparing the
+ *   cooked and raw strings and the substitutions
+ * - `pure: true` in `ɵɵdefinePipe`, which is the default
+ * - Closure-only i18n metadata that Oxc does not emit: the `goog.getMsg` variable names
+ *   (`MSG_EXTERNAL_<id>$$<file>` in Angular) and the `original_code` argument of `goog.getMsg`
+ */
+function staticFieldValuesEquivalent(oxcValue: string, tsValue: string): boolean {
+  const oxcKey = canonicalStaticFieldValue(oxcValue)
+  return oxcKey !== null && oxcKey === canonicalStaticFieldValue(tsValue)
+}
+
+function canonicalStaticFieldValue(value: string): string | null {
+  const result = parseSync('field.js', `(${value});`, { sourceType: 'module' })
+  if (result.errors.length > 0) {
+    return null
+  }
+  const statement = result.program.body[0] as any
+  const closureNames = new Map<string, string>()
+  return normalizeAst(canonicalizeNode(statement.expression, closureNames))
+}
+
+function stringElements(node: any): string[] | null {
+  if (node?.type !== 'ArrayExpression') return null
+  const strings = node.elements.map((e: any) =>
+    e?.type === 'Literal' && typeof e.value === 'string' ? e.value : null,
+  )
+  return strings.every((s: string | null) => s !== null) ? strings : null
+}
+
+function canonicalizeNode(node: any, closureNames: Map<string, string>): any {
+  if (Array.isArray(node)) {
+    return node.map((n) => canonicalizeNode(n, closureNames))
+  }
+  if (node === null || typeof node !== 'object') {
+    return node
+  }
+  // `() => {...}` and `function () {...}` without a name behave the same here.
+  if (
+    (node.type === 'ArrowFunctionExpression' && node.body?.type === 'BlockStatement') ||
+    (node.type === 'FunctionExpression' && !node.id)
+  ) {
+    return {
+      type: 'AnonymousFunction',
+      params: canonicalizeNode(node.params, closureNames),
+      body: canonicalizeNode(node.body, closureNames),
+    }
+  }
+  // $localize`...`
+  if (
+    node.type === 'TaggedTemplateExpression' &&
+    node.tag?.type === 'Identifier' &&
+    node.tag.name === '$localize'
+  ) {
+    return {
+      type: 'Localize',
+      cooked: node.quasi.quasis.map((q: any) => q.value.cooked),
+      rawStrings: node.quasi.quasis.map((q: any) => q.value.raw),
+      substitutions: canonicalizeNode(node.quasi.expressions, closureNames),
+    }
+  }
+  // $localize(__makeTemplateObject([cooked], [raw]), ...substitutions)
+  if (
+    node.type === 'CallExpression' &&
+    node.callee?.type === 'Identifier' &&
+    node.callee.name === '$localize' &&
+    node.arguments[0]?.type === 'CallExpression' &&
+    node.arguments[0].arguments.length === 2
+  ) {
+    const cooked = stringElements(node.arguments[0].arguments[0])
+    const raw = stringElements(node.arguments[0].arguments[1])
+    if (cooked && raw) {
+      return {
+        type: 'Localize',
+        cooked,
+        rawStrings: raw,
+        substitutions: canonicalizeNode(node.arguments.slice(1), closureNames),
+      }
+    }
+  }
+  // goog.getMsg(message, params, { original_code: {...} }): the third argument is Closure-only.
+  if (
+    node.type === 'CallExpression' &&
+    node.callee?.type === 'MemberExpression' &&
+    node.callee.object?.name === 'goog' &&
+    node.callee.property?.name === 'getMsg' &&
+    node.arguments.length === 3 &&
+    node.arguments[2]?.type === 'ObjectExpression' &&
+    node.arguments[2].properties.some((p: any) => p.key?.name === 'original_code')
+  ) {
+    return canonicalizeNode({ ...node, arguments: node.arguments.slice(0, 2) }, closureNames)
+  }
+  // Closure translation variable names: compare them by order of appearance.
+  if (node.type === 'Identifier' && node.name.startsWith('MSG_')) {
+    if (!closureNames.has(node.name)) closureNames.set(node.name, `MSG_${closureNames.size}`)
+    return { type: 'Identifier', name: closureNames.get(node.name) }
+  }
+  // ɵɵdefinePipe({ pure: true }) is the default.
+  if (node.type === 'ObjectExpression') {
+    const properties = node.properties.filter(
+      (p: any) =>
+        !(p.key?.name === 'pure' && p.value?.type === 'Literal' && p.value.value === true),
+    )
+    return {
+      ...node,
+      properties: canonicalizeNode(properties, closureNames),
+    }
+  }
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(node)) {
+    result[key] = canonicalizeNode(value, closureNames)
+  }
+  return result
+}
+
 function compareStaticFields(
   oxcFields: StaticFieldAssignment[],
   tsFields: StaticFieldAssignment[],
@@ -2719,7 +2876,13 @@ function compareStaticFields(
         // Remove trailing commas in arrays
         .replaceAll(',]', ']')
 
-      if (normalizedOxc !== normalizedTs) {
+      if (
+        normalizedOxc !== normalizedTs &&
+        // Also try the unmapped value: when both sides already use the same const names, the
+        // name mapping can only introduce differences.
+        !staticFieldValuesEquivalent(normalizedOxc, normalizedTs) &&
+        !staticFieldValuesEquivalent(oxcField.value, tsField.value)
+      ) {
         // For ɵcmp fields, perform granular input/output comparison
         if (tsField.fieldName === 'ɵcmp') {
           const tsInputsOutputs = extractInputsOutputsFromCmpDefinition(tsField.value)
@@ -2994,9 +3157,16 @@ export async function compareFullFileSemantically(
     const tsClasses = extractClasses(tsResult.program as unknown as Program)
     const classDiffs = compareClasses(oxcClasses, tsClasses)
 
-    // Extract and compare static field assignments
-    const oxcFields = extractStaticFieldAssignments(normalizedOxcCode)
-    const tsFields = extractStaticFieldAssignments(normalizedTsCode)
+    // Extract and compare static field assignments, both `ClassName.ɵcmp = ...` and the
+    // `static ɵcmp = ...` class fields that current Angular and Oxc emit.
+    const oxcFields = [
+      ...extractStaticFieldAssignments(normalizedOxcCode),
+      ...extractClassStaticFields(oxcResult.program as unknown as Program, normalizedOxcCode),
+    ]
+    const tsFields = [
+      ...extractStaticFieldAssignments(normalizedTsCode),
+      ...extractClassStaticFields(tsResult.program as unknown as Program, normalizedTsCode),
+    ]
     const staticFieldDiffs = compareStaticFields(oxcFields, tsFields, constMapping)
 
     // Extract and compare class metadata (setClassMetadata calls)

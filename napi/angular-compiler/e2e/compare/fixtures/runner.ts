@@ -22,6 +22,7 @@ import {
 } from '../src/compilers/angular-ngtsc.js'
 import { compileWithOxcFullFile } from '../src/compilers/oxc.js'
 import { discoverFixtures } from './index.js'
+import { KNOWN_DIFFERENCES } from './known-differences.js'
 
 /**
  * Path to the tsconfig.json used for fixture compilation.
@@ -123,9 +124,29 @@ export async function runFixtures(options: FixtureRunnerOptions = {}): Promise<F
 }
 
 /**
- * Test a single fixture.
+ * Test a single fixture, applying its documented known differences: a listed fixture that
+ * differs is reported as a known difference, and one that now matches fails so that the stale
+ * entry is removed.
  */
 async function testFixture(fixture: Fixture, verbose?: boolean): Promise<FixtureResult> {
+  const result = await compareFixture(fixture, verbose)
+  const knownDifferences = KNOWN_DIFFERENCES[`${fixture.category}/${fixture.name}`]
+  if (!knownDifferences) {
+    return result
+  }
+  if (result.status === 'mismatch') {
+    return { ...result, status: 'known-difference', knownDifferences }
+  }
+  if (result.status === 'match') {
+    return { ...result, status: 'mismatch', knownDifferences, staleKnownDifference: true }
+  }
+  return result
+}
+
+/**
+ * Compare a single fixture's output from both compilers.
+ */
+async function compareFixture(fixture: Fixture, verbose?: boolean): Promise<FixtureResult> {
   // Handle skipped fixtures (via skip flag or skipReason)
   if (fixture.skip || fixture.skipReason) {
     return {
@@ -801,6 +822,7 @@ function generateReport(
   let tsErrors = 0
   let bothErrors = 0
   let skipped = 0
+  let knownDifferences = 0
 
   const byCategory = new Map<string, FixtureResult[]>()
 
@@ -830,6 +852,9 @@ function generateReport(
       case 'skipped':
         skipped++
         break
+      case 'known-difference':
+        knownDifferences++
+        break
     }
   }
 
@@ -842,18 +867,20 @@ function generateReport(
       (r) => r.status === 'mismatch' || r.status.includes('error'),
     ).length
     const categorySkipped = categoryResults.filter((r) => r.status === 'skipped').length
-    const denominator = total - categorySkipped
+    const categoryKnown = categoryResults.filter((r) => r.status === 'known-difference').length
+    const denominator = total - categorySkipped - categoryKnown
 
     categoryStats[category] = {
       total,
       passed,
       failed,
       skipped: categorySkipped,
+      knownDifferences: categoryKnown,
       passRate: denominator > 0 ? (passed / denominator) * 100 : 100,
     }
   }
 
-  const denominator = results.length - skipped
+  const denominator = results.length - skipped - knownDifferences
   const passRate = denominator > 0 ? (matched / denominator) * 100 : 100
 
   return {
@@ -865,6 +892,7 @@ function generateReport(
       tsErrors,
       bothErrors,
       skipped,
+      knownDifferences,
       passRate,
       byCategory: categoryStats,
     },
@@ -894,6 +922,7 @@ export function printFixtureSummary(report: FixtureReport): void {
   console.log(`TS errors:          ${report.summary.tsErrors}`)
   console.log(`Both errors:        ${report.summary.bothErrors}`)
   console.log(`Skipped:            ${report.summary.skipped}`)
+  console.log(`Known differences:  ${report.summary.knownDifferences}`)
 
   // Show skipped fixtures with reasons
   const skippedFixtures = report.fixtures.filter((r) => r.status === 'skipped')
@@ -903,6 +932,27 @@ export function printFixtureSummary(report: FixtureReport): void {
     for (const result of skippedFixtures) {
       const reason = result.skipReason || 'No reason provided'
       console.log(`  ${result.fixture.category}/${result.fixture.name}: ${reason}`)
+    }
+  }
+
+  // Show fixtures with documented known differences, and stale entries
+  const knownFixtures = report.fixtures.filter((r) => r.status === 'known-difference')
+  if (knownFixtures.length > 0) {
+    console.log('\nKnown Differences (see fixtures/known-differences.ts):')
+    console.log('-'.repeat(50))
+    for (const result of knownFixtures) {
+      console.log(`  ${result.fixture.category}/${result.fixture.name}:`)
+      for (const reason of result.knownDifferences!) {
+        console.log(`    - ${reason}`)
+      }
+    }
+  }
+  const staleFixtures = report.fixtures.filter((r) => r.staleKnownDifference)
+  if (staleFixtures.length > 0) {
+    console.log('\nStale Known Differences (now match; remove from fixtures/known-differences.ts):')
+    console.log('-'.repeat(50))
+    for (const result of staleFixtures) {
+      console.log(`  ${result.fixture.category}/${result.fixture.name}`)
     }
   }
 
@@ -945,7 +995,7 @@ export function printFixtureSummary(report: FixtureReport): void {
     console.log('\nBy Category:')
     console.log('-'.repeat(50))
     for (const [category, stats] of Object.entries(report.summary.byCategory)) {
-      const activeFixtures = stats.total - stats.skipped
+      const activeFixtures = stats.total - stats.skipped - stats.knownDifferences
       const status = stats.passed === activeFixtures ? 'PASS' : 'FAIL'
       console.log(
         `  ${category.padEnd(20)} ${stats.passed}/${activeFixtures} (${stats.passRate.toFixed(1)}%) [${status}]`,
