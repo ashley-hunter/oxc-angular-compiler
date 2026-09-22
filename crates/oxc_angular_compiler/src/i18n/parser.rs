@@ -835,37 +835,23 @@ pub fn create_i18n_message_factory(
 }
 
 /// Extracts a custom placeholder name from an expression if present.
-/// Looks for comments like `// i18n(ph="CUSTOM_NAME")` in the expression.
-///
-/// Supported formats:
-/// - `/* i18n(ph="NAME") */` - block comment format
-/// - `// i18n(ph="NAME")` - line comment format (at the end)
+/// Looks for a trailing comment like `// i18n(ph="CUSTOM_NAME")` in the expression, allowing
+/// whitespace between the parts (`// i18n(ph = 'name')`), as Angular's `_CUSTOM_PH_EXP` does.
 ///
 /// Returns `Some(name)` if a custom placeholder name is found, `None` otherwise.
 pub(crate) fn extract_placeholder_name(expression: &str) -> Option<String> {
-    // Look for block comment format: /* i18n(ph="NAME") */
-    if let Some(start) = expression.find("i18n(ph=") {
-        let rest = &expression[start + 8..]; // Skip "i18n(ph="
-
-        // Determine quote type (single or double)
-        let (quote, rest) = if rest.starts_with('"') {
-            ('"', &rest[1..])
-        } else if rest.starts_with('\'') {
-            ('\'', &rest[1..])
-        } else {
-            return None;
-        };
-
-        // Find the closing quote
-        if let Some(end) = rest.find(quote) {
-            let name = &rest[..end];
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
-    }
-
-    None
+    // Angular: /\/\/[\s\S]*i18n[\s\S]*\([\s\S]*ph[\s\S]*=[\s\S]*("|')([\s\S]*?)\1[\s\S]*\)/
+    let rest = &expression[expression.find("//")?..];
+    let rest = &rest[rest.find("i18n")?..];
+    let rest = &rest[rest.find('(')?..];
+    let rest = &rest[rest.find("ph")?..];
+    let rest = &rest[rest.find('=')? + 1..];
+    let start = rest.find(['"', '\''])?;
+    let quote = rest[start..].chars().next()?;
+    let body = &rest[start + 1..];
+    let end = body.find(quote)?;
+    let name = &body[..end];
+    (!name.is_empty() && body[end + 1..].contains(')')).then(|| name.to_string())
 }
 
 #[cfg(test)]
