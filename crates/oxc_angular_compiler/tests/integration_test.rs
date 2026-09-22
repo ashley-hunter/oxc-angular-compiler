@@ -4488,6 +4488,32 @@ fn test_i18n_icu_with_sibling_content_is_sub_message() {
     assert_contains(&js, "i0.ɵɵi18nExp(ctx.name)(ctx.count)(ctx.count);");
 }
 
+/// Two ICUs in one message get distinct placeholders (ICU, ICU_1), each passed its own
+/// sub-message. Angular 22.1.5:
+///   goog.getMsg("{$icu} and {$icu_1}", { "icu": i18n_0, "icu_1": i18n_1 }, ...)
+///   $localize `${i18n_0}:ICU: and ${i18n_1}:ICU_1:`
+#[test]
+fn test_i18n_two_icus_in_one_message() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{gender, select, male {X} other {Y}} and {count, plural, =1 {one} other {many}}</div>"#,
+    );
+    assert_contains(
+        &js,
+        "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(
+        &js,
+        "}(i18n_1 = i0.ɵɵi18nPostprocess(i18n_1,{\"VAR_PLURAL\":\"\u{FFFD}1\u{FFFD}\"}));",
+    );
+    assert_contains(&js, r#"goog.getMsg("{$icu} and {$icu_1}",{"icu":i18n_0,"icu_1":i18n_1}"#);
+    assert_contains(
+        &js,
+        r#"__tpl(["", ":ICU: and ", ":ICU_1:"], ["", ":ICU: and ", ":ICU_1:"]), i18n_0, i18n_1)"#,
+    );
+    assert!(!js.contains("i18nPostprocess(i18n_2"), "Root message needs no post-processing:\n{js}");
+    assert_contains(&js, "return [i18n_2]");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
