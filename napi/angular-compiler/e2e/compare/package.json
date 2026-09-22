@@ -11,6 +11,7 @@
     "compare:clickup:fast": "NODE_OPTIONS='--max-old-space-size=16384' oxnode src/index.ts --preset clickup --full-file --ng-baseline ./ng-baseline-clickup.json",
     "compare:clickup:save-baseline": "NODE_OPTIONS='--max-old-space-size=32768' oxnode src/index.ts --preset clickup --full-file --generate-ng-baseline --save-ng-baseline ./ng-baseline-clickup.json",
     "show-diff": "oxnode src/show-diff.ts",
+    "generate:i18n-fixtures": "oxnode scripts/generate-i18n-fixtures.ts",
     "test": "vitest run"
   },
   "dependencies": {
