@@ -166,23 +166,35 @@ pub struct HtmlToR3Transform<'a> {
     /// an ICU. That ICU is the element's message rather than a sub-message, so it reuses the
     /// element's message (Angular's I18nMetaVisitor: `currentMessage || meta`).
     sole_icu_message: Option<(String, u32)>,
-    /// Placeholder names of the ICU being visited, keyed by their interpolation text
-    /// (e.g. `{{count}}` -> `INTERPOLATION`), from the ICU's i18n message.
-    icu_interpolation_names: FxHashMap<String, String>,
-    /// `VAR_*` placeholder names of the ICU being visited and its nested ICUs, from the ICU's
-    /// i18n message, keyed by the start offset of each switch expression.
-    icu_var_names: FxHashMap<u32, String>,
-    /// ICU placeholder names (`ICU`, `ICU_1`, ...) from the enclosing i18n message, keyed by
-    /// the ICU's start offset.
-    icu_placeholder_names: FxHashMap<u32, String>,
-    /// Block placeholder start/close names (`START_BLOCK_IF`, `CLOSE_BLOCK_IF`, ...) from the
-    /// enclosing i18n message, keyed by the block's start offset.
-    block_placeholder_names: FxHashMap<u32, (String, String)>,
-    /// Tag placeholder start/close names from the enclosing i18n message, keyed by the
-    /// element's start offset.
-    tag_placeholder_names: FxHashMap<u32, (String, String)>,
+    /// Placeholder names from the enclosing i18n message.
+    message_names: MessagePlaceholderNames,
+    /// Placeholder names from the message of the ICU being visited.
+    icu_names: IcuPlaceholderNames,
     /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
     element_full_names: std::vec::Vec<String>,
+}
+
+/// Placeholder names taken from an i18n message, keyed by source offset, so that the r3 AST
+/// uses the same names as the message: Angular's placeholder registry numbers them per message.
+#[derive(Default)]
+struct MessagePlaceholderNames {
+    /// ICU placeholder names (`ICU`, `ICU_1`, ...), keyed by the ICU's start offset.
+    icus: FxHashMap<u32, String>,
+    /// Block start and close names (`START_BLOCK_IF`, `CLOSE_BLOCK_IF`, ...), keyed by the
+    /// block's start offset.
+    blocks: FxHashMap<u32, (String, String)>,
+    /// Tag start and close names, keyed by the element's start offset.
+    tags: FxHashMap<u32, (String, String)>,
+}
+
+/// Placeholder names taken from the message of the ICU being visited.
+#[derive(Default)]
+struct IcuPlaceholderNames {
+    /// `VAR_*` names of the ICU and its nested ICUs, keyed by the start offset of each switch
+    /// expression.
+    vars: FxHashMap<u32, String>,
+    /// Interpolation placeholder names, keyed by their interpolation text (`{{count}}`).
+    interpolations: FxHashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,11 +228,8 @@ impl<'a> HtmlToR3Transform<'a> {
             i18n_placeholder_registry: PlaceholderRegistry::new(),
             i18n_message_instance_counter: 0,
             sole_icu_message: None,
-            icu_interpolation_names: FxHashMap::default(),
-            icu_var_names: FxHashMap::default(),
-            icu_placeholder_names: FxHashMap::default(),
-            block_placeholder_names: FxHashMap::default(),
-            tag_placeholder_names: FxHashMap::default(),
+            message_names: MessagePlaceholderNames::default(),
+            icu_names: IcuPlaceholderNames::default(),
             element_full_names: std::vec::Vec::new(),
         }
     }
@@ -423,7 +432,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 };
                 let custom_id = attr.value.find("@@").map(|pos| &attr.value.as_str()[pos + 2..]);
 
-                let message = factory.create_message_in(
+                let message = factory.create_message(
                     &element.children,
                     Some(&full_name),
                     meaning,
@@ -432,12 +441,7 @@ impl<'a> HtmlToR3Transform<'a> {
                     None,
                     source_file,
                 );
-                collect_placeholder_names(
-                    &message.nodes,
-                    &mut self.icu_placeholder_names,
-                    &mut self.block_placeholder_names,
-                    &mut self.tag_placeholder_names,
-                );
+                collect_placeholder_names(&message.nodes, &mut self.message_names);
                 message.serialize()
             }
         } else {
@@ -1253,7 +1257,7 @@ impl<'a> HtmlToR3Transform<'a> {
     /// The `VAR_*` name of the ICU whose switch expression starts at `start`, from the ICU's
     /// message, or a newly generated one.
     fn icu_var_name(&mut self, start: u32, base_name: &str) -> String {
-        match self.icu_var_names.remove(&start) {
+        match self.icu_names.vars.remove(&start) {
             // Angular's visitExpansion trims the key: `{count, select , ...}` is named
             // "VAR_SELECT " in the message but the var is VAR_SELECT.
             Some(name) => name.trim().to_string(),
@@ -1315,13 +1319,13 @@ impl<'a> HtmlToR3Transform<'a> {
         // vars, interpolations become bound text, and element markup becomes plain text.
         let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
             icu_message.placeholders.into_iter().partition(|(name, _)| name.starts_with("VAR_"));
-        self.icu_var_names = vars
+        self.icu_names.vars = vars
             .into_iter()
             .map(|(name, placeholder)| (placeholder.source_span.start.offset, name))
             .collect();
         let (interpolations, mut tags): (std::vec::Vec<_>, std::vec::Vec<_>) =
             others.into_iter().partition(|(_, placeholder)| placeholder.text.starts_with("{{"));
-        self.icu_interpolation_names = interpolations
+        self.icu_names.interpolations = interpolations
             .into_iter()
             .map(|(name, placeholder)| (placeholder.text, name))
             .collect();
@@ -1359,10 +1363,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 self.allocator,
             ),
             name: Ident::from_in(
-                self.icu_placeholder_names
-                    .remove(&expansion.span.start)
-                    .as_deref()
-                    .unwrap_or("ICU"),
+                self.message_names.icus.remove(&expansion.span.start).as_deref().unwrap_or("ICU"),
                 self.allocator,
             ),
             source_span: expansion.span,
@@ -1544,7 +1545,8 @@ impl<'a> HtmlToR3Transform<'a> {
                     let parse_result = self.binding_parser.parse_binding(value_str, interp_span);
 
                     let placeholder_key = Ident::from_in(
-                        self.icu_interpolation_names
+                        self.icu_names
+                            .interpolations
                             .get(interpolation)
                             .map_or(interpolation, String::as_str),
                         self.allocator,
@@ -2058,7 +2060,7 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Use the names from the enclosing i18n message, as Angular does.
-        if let Some((start, close)) = self.block_placeholder_names.remove(&source_span.start) {
+        if let Some((start, close)) = self.message_names.blocks.remove(&source_span.start) {
             let mut params = Vec::new_in(self.allocator);
             params.extend(parameters.iter().copied());
             return Some(I18nMeta::BlockPlaceholder(I18nBlockPlaceholder {
@@ -4253,7 +4255,7 @@ impl<'a> HtmlToR3Transform<'a> {
 
         // Use the names from the enclosing i18n message, as Angular does.
         let (start_name, close_name) =
-            self.tag_placeholder_names.remove(&element.span.start).unwrap_or_else(|| {
+            self.message_names.tags.remove(&element.span.start).unwrap_or_else(|| {
                 let start_name = self
                     .i18n_placeholder_registry
                     .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
@@ -4923,32 +4925,30 @@ fn is_style_url_resolvable(url: &str) -> bool {
 /// `getStartBlockPlaceholderName(...)`), giving `ICU_1`, `START_BLOCK_IF_1`, ... as needed.
 fn collect_placeholder_names(
     nodes: &[crate::i18n::ast::Node],
-    icus: &mut FxHashMap<u32, String>,
-    blocks: &mut FxHashMap<u32, (String, String)>,
-    tags: &mut FxHashMap<u32, (String, String)>,
+    names: &mut MessagePlaceholderNames,
 ) {
     use crate::i18n::ast::Node;
     for node in nodes {
         match node {
             Node::IcuPlaceholder(ph) => {
-                icus.insert(ph.source_span.start.offset, ph.name.clone());
+                names.icus.insert(ph.source_span.start.offset, ph.name.clone());
             }
             Node::Container(container) => {
-                collect_placeholder_names(&container.children, icus, blocks, tags);
+                collect_placeholder_names(&container.children, names);
             }
             Node::TagPlaceholder(tag) => {
-                tags.insert(
+                names.tags.insert(
                     tag.source_span.start.offset,
                     (tag.start_name.clone(), tag.close_name.clone()),
                 );
-                collect_placeholder_names(&tag.children, icus, blocks, tags);
+                collect_placeholder_names(&tag.children, names);
             }
             Node::BlockPlaceholder(block) => {
-                blocks.insert(
+                names.blocks.insert(
                     block.source_span.start.offset,
                     (block.start_name.clone(), block.close_name.clone()),
                 );
-                collect_placeholder_names(&block.children, icus, blocks, tags);
+                collect_placeholder_names(&block.children, names);
             }
             Node::Text(_) | Node::Icu(_) | Node::Placeholder(_) => {}
         }

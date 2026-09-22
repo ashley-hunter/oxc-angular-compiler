@@ -80,30 +80,11 @@ impl I18nMessageFactory {
     }
 
     /// Converts HTML nodes to an i18n Message.
-    pub fn create_message(
-        &self,
-        nodes: &[HtmlNode<'_>],
-        meaning: Option<&str>,
-        description: Option<&str>,
-        custom_id: Option<&str>,
-        visit_node_fn: Option<VisitNodeFn>,
-        source_file: Arc<ParseSourceFile>,
-    ) -> Message {
-        self.create_message_in(
-            nodes,
-            None,
-            meaning,
-            description,
-            custom_id,
-            visit_node_fn,
-            source_file,
-        )
-    }
-
-    /// Converts the children of an element with the given full name (such as `:svg:text`) to
-    /// an i18n Message, so elements inherit its namespace as in Angular's HTML parser.
+    ///
+    /// `parent_element` is the full name (such as `:svg:text`) of the element whose children
+    /// these nodes are, from which child elements inherit their namespace.
     #[expect(clippy::too_many_arguments)]
-    pub fn create_message_in(
+    pub fn create_message(
         &self,
         nodes: &[HtmlNode<'_>],
         parent_element: Option<&str>,
@@ -932,7 +913,7 @@ mod tests {
     fn test_create_simple_message() {
         let factory = create_i18n_message_factory(false, false);
         let source_file = Arc::new(ParseSourceFile::new("", "<test>"));
-        let message = factory.create_message(&[], None, None, None, None, source_file);
+        let message = factory.create_message(&[], None, None, None, None, None, source_file);
         assert!(message.nodes.is_empty());
     }
 
@@ -957,7 +938,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello {{name}}!", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have one Container with Text, Placeholder, Text inside
         assert_eq!(message.nodes.len(), 1);
@@ -988,7 +969,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello World", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have one Text node
         assert_eq!(message.nodes.len(), 1);
@@ -1009,7 +990,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
         let source_file = Arc::new(ParseSourceFile::new("{{greeting}} {{name}}!", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have Container with multiple placeholders
         assert_eq!(message.nodes.len(), 1);
