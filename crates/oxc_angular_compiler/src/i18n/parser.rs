@@ -103,6 +103,28 @@ impl I18nMessageFactory {
         )
     }
 
+    /// Converts a single attribute to an i18n Message.
+    ///
+    /// Equivalent to Angular's `createI18nMessage([attr], ...)`, without having to wrap the
+    /// attribute in an `HtmlNode`. Metadata (meaning, description, id) is left empty because
+    /// callers only need the message text.
+    pub fn create_attribute_message(
+        &self,
+        attribute: &HtmlAttribute<'_>,
+        source_file: Arc<ParseSourceFile>,
+    ) -> Message {
+        let mut context = I18nVisitorContext::new(source_file);
+        let nodes = self.visit_attribute(attribute, &mut context).into_iter().collect();
+        Message::new(
+            nodes,
+            context.placeholders,
+            context.placeholder_to_message,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
     /// Visits all HTML nodes and converts them to i18n nodes.
     fn visit_all(
         &self,

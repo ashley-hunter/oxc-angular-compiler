@@ -2882,7 +2882,23 @@ impl<'a> HtmlToR3Transform<'a> {
             let name = attr.name.as_str();
             if let Some(target_attr) = name.strip_prefix("i18n-") {
                 let instance_id = self.allocate_i18n_message_instance_id();
-                let meta = parse_i18n_meta(self.allocator, attr.value.as_str(), instance_id);
+                // The attribute's own value is the message text. Angular's I18nMetaVisitor
+                // builds it with `_generateI18nMessage([attr], meta)` when `attr.value` is set.
+                let target =
+                    attrs.iter().find(|a| a.name.as_str() == target_attr && !a.value.is_empty());
+                let (message_string, nodes) = match target {
+                    Some(target) => self.create_attribute_i18n_message(target),
+                    None => (String::new(), Vec::new_in(self.allocator)),
+                };
+                let mut meta = parse_i18n_meta_with_message(
+                    self.allocator,
+                    attr.value.as_str(),
+                    instance_id,
+                    &message_string,
+                );
+                if let I18nMeta::Message(message) = &mut meta {
+                    message.nodes = nodes;
+                }
                 i18n_attrs_meta.insert(target_attr, meta);
             }
         }
@@ -3126,6 +3142,46 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         (attributes, inputs, outputs, references, variables, template_attr_info)
+    }
+
+    /// Builds the i18n message for a translated attribute from the attribute's value.
+    ///
+    /// Returns the serialized message and its top-level nodes. An attribute message only
+    /// contains text and interpolation placeholders; the placeholder nodes give ingest the
+    /// names Angular reads from `Object.keys(message.placeholders)`.
+    fn create_attribute_i18n_message(
+        &self,
+        attr: &HtmlAttribute<'a>,
+    ) -> (String, Vec<'a, I18nNode<'a>>) {
+        let source_file =
+            std::sync::Arc::new(crate::util::ParseSourceFile::new(self.source_text, "<template>"));
+        let message =
+            I18nMessageFactory::new(false, true).create_attribute_message(attr, source_file);
+        let span = |s: &crate::util::ParseSourceSpan| Span::new(s.start.offset, s.end.offset);
+        let mut nodes = Vec::new_in(self.allocator);
+        let mut push = |node: &crate::i18n::ast::Node| match node {
+            crate::i18n::ast::Node::Text(text) => nodes.push(I18nNode::Text(I18nText {
+                value: Ident::from_in(text.value.as_str(), self.allocator),
+                source_span: span(&text.source_span),
+            })),
+            crate::i18n::ast::Node::Placeholder(ph) => {
+                nodes.push(I18nNode::Placeholder(I18nPlaceholder {
+                    value: Ident::from_in(ph.value.as_str(), self.allocator),
+                    name: Ident::from_in(ph.name.as_str(), self.allocator),
+                    source_span: span(&ph.source_span),
+                }));
+            }
+            _ => {}
+        };
+        for node in &message.nodes {
+            match node {
+                crate::i18n::ast::Node::Container(container) => {
+                    container.children.iter().for_each(&mut push);
+                }
+                node => push(node),
+            }
+        }
+        (message.serialize(), nodes)
     }
 
     /// Normalizes an attribute name by stripping the data- prefix (case-insensitive).
@@ -4725,21 +4781,6 @@ fn is_style_url_resolvable(url: &str) -> bool {
         // No scheme = relative URL = resolvable
         true
     }
-}
-
-/// Parses i18n metadata from an attribute value (for i18n-* attributes).
-///
-/// Format: `meaning|description@@customId`
-/// Examples:
-/// - `"Save button tooltip|Click to save@@SAVE_BTN"` -> meaning: "Save button tooltip", description: "Click to save", customId: "SAVE_BTN"
-/// - `"Click to save@@SAVE_BTN"` -> description: "Click to save", customId: "SAVE_BTN"
-/// - `"Click to save"` -> description: "Click to save"
-/// - `"@@SAVE_BTN"` -> customId: "SAVE_BTN"
-///
-/// This variant is used for i18n-* attributes where the message content comes from
-/// the attribute value itself, not from children.
-fn parse_i18n_meta<'a>(allocator: &'a Allocator, value: &str, instance_id: u32) -> I18nMeta<'a> {
-    parse_i18n_meta_with_message(allocator, value, instance_id, "")
 }
 
 /// Parses i18n metadata from an attribute value.

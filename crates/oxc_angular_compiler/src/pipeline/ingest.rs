@@ -612,19 +612,6 @@ fn convert_binary_op(
     }
 }
 
-/// Converts an interpolation expression to an IR interpolation, storing inner expressions.
-///
-/// This is needed because interpolations contain inner expressions that need to be
-/// resolved during name resolution. By converting to IR Interpolation, the inner
-/// expressions become visible to the expression transformer.
-fn convert_interpolation_to_ir<'a>(
-    job: &mut ComponentCompilationJob<'a>,
-    expr: AngularExpression<'a>,
-) -> Box<'a, IrExpression<'a>> {
-    let allocator = job.allocator;
-    convert_interpolation_to_ir_with_i18n_placeholders(job, expr, Vec::new_in(allocator))
-}
-
 /// Converts an Angular expression to IR, handling interpolations with i18n placeholders.
 ///
 /// This is used for bound text inside i18n blocks where the i18n metadata contains
@@ -1537,7 +1524,19 @@ fn ingest_binding_owned<'a>(
     // For interpolated attributes (e.g., title="{{ 'text' | i18n }}"), use
     // convert_interpolation_to_ir to properly extract pipes from the interpolation.
     let expression = if matches!(&input.value, AngularExpression::Interpolation(_)) {
-        convert_interpolation_to_ir(job, input.value)
+        // Angular: `Object.keys(asMessage(i18nMeta)?.placeholders ?? {})`, i.e. the message's
+        // unique placeholder names in first-seen order.
+        let mut i18n_placeholders: Vec<'_, Ident<'_>> = Vec::new_in(allocator);
+        if let Some(I18nMeta::Message(message)) = &input.i18n {
+            for node in message.nodes.iter() {
+                if let I18nNode::Placeholder(ph) = node {
+                    if !i18n_placeholders.contains(&ph.name) {
+                        i18n_placeholders.push(ph.name.clone());
+                    }
+                }
+            }
+        }
+        convert_interpolation_to_ir_with_i18n_placeholders(job, input.value, i18n_placeholders)
     } else {
         convert_ast_to_ir(job, input.value)
     };
