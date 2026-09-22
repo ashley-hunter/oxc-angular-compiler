@@ -192,11 +192,6 @@ impl I18nMessageFactory {
     fn visit_text(&self, text: &HtmlText<'_>, context: &mut I18nVisitorContext) -> Option<Node> {
         let value = text.value.as_str();
 
-        // Skip empty text unless configured to retain
-        if value.trim().is_empty() && !self.retain_empty_tokens {
-            return None;
-        }
-
         // Check if text contains interpolations
         if value.contains("{{") && value.contains("}}") {
             return Some(self.visit_text_with_interpolation(value, text.span, context));
