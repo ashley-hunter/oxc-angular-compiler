@@ -125,10 +125,10 @@ interface TransformOptions {
   hmr?: boolean
 
   // Enable cross-file type elision
-  enableCrossFileElision?: boolean
+  crossFileElision?: boolean
 
-  // i18n configuration
-  i18nUseExternalIds?: boolean
+  // i18n configuration (note the capital N, as the N-API bindings generate it)
+  i18NUseExternalIds?: boolean
 
   // Style encapsulation mode
   // 'emulated' | 'none' | 'shadow-dom'
