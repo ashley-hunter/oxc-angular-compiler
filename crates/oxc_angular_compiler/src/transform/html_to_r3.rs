@@ -10,6 +10,7 @@ use oxc_span::Span;
 use oxc_str::Ident;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::AngularVersion;
 use crate::ast::expression::{
     AbsoluteSourceSpan, AngularExpression, BindingType, ParseSpan, ParsedEventType,
 };
@@ -28,8 +29,11 @@ use crate::ast::r3::{
 use crate::i18n::parser::I18nMessageFactory;
 use crate::i18n::placeholder::PlaceholderRegistry;
 use crate::parser::expression::{BindingParser, find_comment_start};
-use crate::parser::html::decode_entities_in_string;
-use crate::schema::get_security_context;
+use crate::parser::html::{decode_entities_in_string, get_html_tag_definition, split_ns_name};
+use crate::schema::{
+    get_security_context_for, is_known_element, is_trusted_types_sink_at,
+    strips_namespaced_svg_script, strips_namespaced_svg_style, uses_namespaced_schema,
+};
 use crate::transform::control_flow::{parse_conditional_params, parse_defer_triggers};
 use crate::util::ParseError;
 
@@ -98,6 +102,8 @@ struct TemplateAttrInfo<'a> {
 pub struct TransformOptions {
     /// Whether to collect comment nodes.
     pub collect_comment_nodes: bool,
+    /// Angular version being compiled. `None` uses the latest (v22) security schema.
+    pub angular_version: Option<AngularVersion>,
 }
 
 /// Inserts or updates a var entry in an ordered Vec, preserving first-insertion order.
@@ -143,7 +149,9 @@ pub struct HtmlToR3Transform<'a> {
     ng_content_selectors: Vec<'a, Ident<'a>>,
     comment_nodes: Option<Vec<'a, R3Comment<'a>>>,
     processed_nodes: FxHashSet<usize>,
-    namespace_stack: std::vec::Vec<ElementNamespace>,
+    /// Prefix each open element passes to its children (`svg`, `math`, `xml`,
+    /// or empty), matching `getNsPrefix(parentName)` in `_getPrefix`.
+    namespace_stack: std::vec::Vec<String>,
     /// Depth counter for ngNonBindable. When > 0, bindings are suppressed.
     non_bindable_depth: u32,
     /// Depth counter for i18n context. When > 0, ICU expansions are emitted.
@@ -156,6 +164,8 @@ pub struct HtmlToR3Transform<'a> {
     /// Placeholder registry for generating unique tag placeholder names within i18n blocks.
     /// Reset when entering a new i18n block.
     i18n_placeholder_registry: PlaceholderRegistry,
+    /// Angular version for security-schema and script-stripping compatibility.
+    angular_version: Option<AngularVersion>,
     /// Counter for generating unique i18n message instance IDs.
     ///
     /// Each i18n message gets a unique instance ID that's used to track message identity
@@ -163,13 +173,6 @@ pub struct HtmlToR3Transform<'a> {
     /// (e.g., by `ingestControlFlowInsertionPoint` and `ingestStaticAttributes`), both
     /// can share the same i18n context.
     i18n_message_instance_counter: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ElementNamespace {
-    Html,
-    Svg,
-    Math,
 }
 
 impl<'a> HtmlToR3Transform<'a> {
@@ -195,7 +198,12 @@ impl<'a> HtmlToR3Transform<'a> {
             icu_placeholder_counts: FxHashMap::default(),
             i18n_placeholder_registry: PlaceholderRegistry::new(),
             i18n_message_instance_counter: 0,
+            angular_version: options.angular_version,
         }
+    }
+
+    fn security_context(&self, element: &str, property: &str) -> SecurityContext {
+        get_security_context_for(element, property, self.angular_version)
     }
 
     /// Allocates a new unique instance ID for an i18n message.
@@ -308,53 +316,110 @@ impl<'a> HtmlToR3Transform<'a> {
     fn visit_element(&mut self, element: &HtmlElement<'a>) -> Option<R3Node<'a>> {
         let raw_name = element.name.as_str();
 
-        // Check for special elements. `<script>`/`<style>` are only treated
-        // specially in the HTML namespace: Angular classifies them by the
-        // lowercased element name, so a namespaced SVG `<style>` (`:svg:style`)
-        // is a normal element, not a stylesheet to extract (v22 conformance).
-        let in_html_namespace = self.current_namespace() == ElementNamespace::Html;
-        if in_html_namespace && raw_name == "script" {
-            return None;
-        }
-        if in_html_namespace && raw_name == "style" {
-            // Extract style content
-            if let Some(content) = self.get_text_content(element) {
-                self.styles.push(content);
-            }
-            return None;
-        }
-        if raw_name == "link" {
-            // Collect stylesheet URLs
-            if let Some(href) = self.get_stylesheet_href(element) {
-                self.style_urls.push(href);
-            }
-            // Filter out <link rel="stylesheet"> inside ngNonBindable elements
-            if self.non_bindable_depth > 0 && self.is_stylesheet_link(element) {
+        // Angular's parser bakes the namespace into the element name with
+        // `_getPrefix` + `mergeNsAndName` (`:svg:rect`, `:xml:div`). The parser
+        // here keeps the local name plus an explicit `:ns:` prefix, so the
+        // upstream name is reconstructed and the inherited prefix is tracked
+        // on a stack.
+        let parent_prefix = self.current_prefix();
+        // `<MyComp:iframe>` keeps the class in `name`. The host tag is what
+        // `isTrustedTypesSink` and the binding security lookup see, including an
+        // explicit prefix and a prefix inherited from the parent
+        // (`:svg:ng-component`, `:svg:iframe`). No prefix and no local tag is
+        // `tagName === null`.
+        let host_tag = if element.is_component {
+            Self::selectorless_host_tag(element, parent_prefix)
+        } else {
+            None
+        };
+        // `_getPrefix`: the explicit `:ns:` prefix wins, then the tag's implicit
+        // namespace (`svg`, `math`, `foreignObject`), then the parent's prefix —
+        // kept verbatim, so arbitrary prefixes like `:xml:` inherit too.
+        let resolved_name = if element.is_component {
+            String::new()
+        } else {
+            Self::resolve_element_name(raw_name, parent_prefix)
+        };
+        let security_name = if element.is_component {
+            Self::component_security_name(host_tag.as_deref(), self.angular_version)
+        } else {
+            // The security lookup gets the verbatim resolved name;
+            // `get_security_context_for` decides per target version whether
+            // `normalizeTagName` strips non-svg/math prefixes.
+            resolved_name.clone()
+        };
+        // Trusted Types and the script/style sets use the parser's full name.
+        let qualified_name = resolved_name.to_ascii_lowercase();
+        // Children inherit this element's own resolved prefix, or nothing when
+        // its tag definition prevents namespace inheritance (`foreignObject`) or
+        // the host tag is `tagName === null`.
+        let child_prefix = if element.is_component {
+            Self::component_child_prefix(host_tag.as_deref())
+        } else {
+            Self::inheritable_prefix(&resolved_name)
+        };
+
+        if element.is_component {
+            // `visitComponent` does not run the element preparser. A class named
+            // `Script` is not an HTML script. Unsupported hosts are the host tag
+            // (`<MyComp:script>`), not the class.
+            if let Some(tag) = host_tag.as_deref()
+                && UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag)
+            {
+                self.report_error(
+                    &format!("Tag name \"{tag}\" cannot be used as a component tag"),
+                    element.start_span,
+                );
                 return None;
             }
+        } else {
+            // HTML `<script>` is always stripped. `:svg:script` is stripped from
+            // v22 (`SCRIPT_ELEMENTS`). Other prefixes, such as `:xml:script`, stay.
+            if qualified_name == "script"
+                || (strips_namespaced_svg_script(self.angular_version)
+                    && qualified_name == ":svg:script")
+            {
+                return None;
+            }
+            // The preparser classified `:svg:style` as a style element only on
+            // 20.3.22 and 21.2.14 (`STYLE_ELEMENTS`); elsewhere it stays an
+            // ordinary element.
+            if qualified_name == "style"
+                || (strips_namespaced_svg_style(self.angular_version)
+                    && qualified_name == ":svg:style")
+            {
+                if let Some(content) = self.get_text_content(element) {
+                    self.styles.push(content);
+                }
+                return None;
+            }
+            if raw_name == "link" {
+                // Collect stylesheet URLs
+                if let Some(href) = self.get_stylesheet_href(element) {
+                    self.style_urls.push(href);
+                }
+                // Filter out <link rel="stylesheet"> inside ngNonBindable elements
+                if self.non_bindable_depth > 0 && self.is_stylesheet_link(element) {
+                    return None;
+                }
+            }
         }
 
+        let i18n_element_name =
+            if element.is_component { host_tag.as_deref() } else { Some(qualified_name.as_str()) };
+
         // Parse attributes
-        let (attributes, inputs, outputs, references, variables, template_attr) =
-            self.parse_attributes(&element.attrs, raw_name, raw_name == "ng-template");
+        let (attributes, inputs, outputs, references, variables, template_attr) = self
+            .parse_attributes(
+                &element.attrs,
+                &security_name,
+                i18n_element_name,
+                raw_name == "ng-template",
+            );
 
-        // Resolve namespace for this element and its children.
-        // Note: foreignObject is an SVG element but its children use HTML namespace.
-        // We need to distinguish between the element's own namespace (for naming) and
-        // the namespace for its children (pushed to stack).
-        let parent_namespace = self.current_namespace();
-        let child_namespace = self.resolve_namespace(raw_name, parent_namespace);
-
-        // For foreignObject in SVG context: the element itself is SVG, only children are HTML.
-        // For all other elements: element namespace equals child namespace.
-        let element_namespace = if parent_namespace == ElementNamespace::Svg
-            && raw_name.eq_ignore_ascii_case("foreignObject")
-        {
-            ElementNamespace::Svg
-        } else {
-            child_namespace
-        };
-        self.namespace_stack.push(child_namespace);
+        // `child_prefix` is what children inherit; `foreignObject` already
+        // resolves to `:svg:foreignObject` and passes nothing on.
+        self.namespace_stack.push(child_prefix);
 
         // Check if element has ngNonBindable attribute
         let has_non_bindable =
@@ -461,7 +526,7 @@ impl<'a> HtmlToR3Transform<'a> {
         self.namespace_stack.pop();
 
         // Transform selectorless directives from HTML AST
-        let directives = self.transform_directives(&element.directives, raw_name);
+        let directives = self.transform_directives(&element.directives, &security_name);
 
         // Determine if element is self-closing (explicitly closed with />)
         let is_self_closing = element.is_self_closing;
@@ -521,7 +586,7 @@ impl<'a> HtmlToR3Transform<'a> {
 
         // Check for ng-template
         if raw_name == "ng-template" {
-            let name = self.qualify_element_name(element.name, element_namespace);
+            let name = Ident::from_in(resolved_name.as_str(), &self.allocator);
             let template = R3Template {
                 tag_name: Some(name),
                 attributes,
@@ -562,40 +627,32 @@ impl<'a> HtmlToR3Transform<'a> {
             }
         }
 
-        let name = self.qualify_element_name(element.name, element_namespace);
+        let name = Ident::from_in(resolved_name.as_str(), &self.allocator);
 
         // Check if this is a component (uppercase first letter or underscore)
         let first_char = raw_name.chars().next().unwrap_or('a');
         let is_component = first_char.is_ascii_uppercase() || first_char == '_';
 
         let mut result = if is_component {
-            // Validate selectorless component - check for unsupported tags
-            let tag_name_lower = raw_name.to_ascii_lowercase();
-            if UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag_name_lower.as_str()) {
-                self.report_error(
-                    &format!("Tag name \"{raw_name}\" cannot be used as a component tag"),
-                    element.start_span,
-                );
-                return None;
+            // Parsed components already checked the host tag. An uppercase element
+            // from a non-selectorless parse (`<Link>`) still uses the element name.
+            if !element.is_component {
+                let tag_name_lower = raw_name.to_ascii_lowercase();
+                if UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag_name_lower.as_str()) {
+                    self.report_error(
+                        &format!("Tag name \"{raw_name}\" cannot be used as a component tag"),
+                        element.start_span,
+                    );
+                    return None;
+                }
             }
 
             // Validate selectorless references
             self.validate_selectorless_references(&references);
 
-            // Compute tag_name from component_prefix and component_tag_name
-            // Format: ":prefix:tag_name" (e.g., ":svg:rect") or just "tag_name"
-            let tag_name = match (&element.component_prefix, &element.component_tag_name) {
-                (None, None) => None,
-                (None, Some(tag)) => Some(*tag),
-                (Some(prefix), None) => {
-                    // Has prefix but no tag name - use "ng-component" as default
-                    Some(Ident::from_in(&format!(":{prefix}:ng-component"), &self.allocator))
-                }
-                (Some(prefix), Some(tag)) => {
-                    // Both prefix and tag name: ":prefix:tag_name"
-                    Some(Ident::from_in(&format!(":{prefix}:{tag}"), &self.allocator))
-                }
-            };
+            // `tagName` is the resolved host tag (`_getComponentTagName`), so it
+            // carries an explicit, implicit, or inherited prefix.
+            let tag_name = host_tag.map(|tag| Ident::from_in(tag.as_str(), &self.allocator));
 
             // Compute full_name: "ComponentName:prefix:tag_name" or "ComponentName:tag_name"
             let full_name = match &tag_name {
@@ -642,7 +699,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 source_span: element.span,
                 start_source_span: element.start_span,
                 end_source_span: element.end_span,
-                is_void: self.is_void_element(element.name.as_str()),
+                is_void: self.is_void_element(resolved_name.as_str()),
                 i18n: i18n_meta,
             };
             R3Node::Element(Box::new_in(r3_element, &self.allocator))
@@ -658,15 +715,29 @@ impl<'a> HtmlToR3Transform<'a> {
 
     /// Visits an HTML component (selectorless component AST node).
     fn visit_html_component(&mut self, component: &HtmlComponent<'a>) -> Option<R3Node<'a>> {
-        // Parse attributes
-        let (attributes, inputs, outputs, references, _variables, template_attr) =
-            self.parse_attributes(&component.attrs, component.full_name.as_str(), false);
+        let parent_prefix = self.current_prefix();
+        let host_tag = Self::component_node_host_tag(component, parent_prefix);
+        if let Some(tag) = host_tag.as_deref()
+            && UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag)
+        {
+            self.report_error(
+                &format!("Tag name \"{tag}\" cannot be used as a component tag"),
+                component.start_span,
+            );
+            return None;
+        }
 
-        // Resolve namespace for this component and its children.
-        let parent_namespace = self.current_namespace();
-        let element_namespace =
-            self.resolve_namespace(component.full_name.as_str(), parent_namespace);
-        self.namespace_stack.push(element_namespace);
+        // `tagName === null` is not a Trusted Types sink. `full_name` is the class.
+        let i18n_element_name = host_tag.as_deref();
+        let security_name =
+            Self::component_security_name(host_tag.as_deref(), self.angular_version);
+        let (attributes, inputs, outputs, references, _variables, template_attr) =
+            self.parse_attributes(&component.attrs, &security_name, i18n_element_name, false);
+
+        // Children inherit the host tag's prefix verbatim (`_getPrefix` uses
+        // `component.tagName` as the parent name), honoring
+        // `preventNamespaceInheritance` on hosts like `foreignObject`.
+        self.namespace_stack.push(Self::component_child_prefix(host_tag.as_deref()));
 
         // Check if component has ngNonBindable attribute
         let has_non_bindable =
@@ -706,10 +777,8 @@ impl<'a> HtmlToR3Transform<'a> {
         self.namespace_stack.pop();
 
         // Transform selectorless directives from HTML AST
-        // For components, tag_name may be None (e.g., `<MyComp>`), in which case we use empty string
-        // which matches TypeScript's behavior where elementName can be null.
-        let element_name = component.tag_name.as_ref().map_or("", Ident::as_str);
-        let directives = self.transform_directives(&component.directives, element_name);
+        // `security_name` is empty when the host tag is `tagName === null`.
+        let directives = self.transform_directives(&component.directives, &security_name);
 
         // Validate selectorless references
         self.validate_selectorless_references(&references);
@@ -741,83 +810,127 @@ impl<'a> HtmlToR3Transform<'a> {
         Some(result)
     }
 
-    fn current_namespace(&self) -> ElementNamespace {
-        self.namespace_stack.last().copied().unwrap_or(ElementNamespace::Html)
+    /// Prefix inherited from the innermost open element (`""` at the root).
+    fn current_prefix(&self) -> &str {
+        self.namespace_stack.last().map_or("", String::as_str)
     }
 
-    fn resolve_namespace(&self, raw_name: &str, parent: ElementNamespace) -> ElementNamespace {
-        if let Some(explicit) = Self::namespace_from_prefixed_name(raw_name) {
-            return explicit;
+    /// `_getPrefix` + `mergeNsAndName`: explicit `:ns:` prefix, then the tag's
+    /// `implicitNamespacePrefix`, then the parent's prefix kept verbatim so
+    /// arbitrary prefixes (`:xml:div`) inherit.
+    fn resolve_element_name(raw_name: &str, parent_prefix: &str) -> String {
+        let (explicit_ns, local) = split_ns_name(raw_name);
+        if let Some(prefix) = explicit_ns {
+            return format!(":{prefix}:{local}");
         }
+        let prefix = get_html_tag_definition(local)
+            .implicit_namespace_prefix
+            .map_or_else(|| parent_prefix.to_string(), str::to_string);
+        if prefix.is_empty() { local.to_string() } else { format!(":{prefix}:{local}") }
+    }
 
-        if raw_name.eq_ignore_ascii_case("svg") {
-            return ElementNamespace::Svg;
+    /// Prefix this element passes on to its children. `foreignObject` (and any
+    /// other tag with `preventNamespaceInheritance`) passes nothing.
+    fn inheritable_prefix(resolved_name: &str) -> String {
+        let (ns, local) = split_ns_name(resolved_name);
+        if get_html_tag_definition(local).prevent_namespace_inheritance {
+            return String::new();
         }
-        if raw_name.eq_ignore_ascii_case("math") {
-            return ElementNamespace::Math;
-        }
+        ns.unwrap_or("").to_string()
+    }
 
-        match parent {
-            ElementNamespace::Svg => {
-                if raw_name.eq_ignore_ascii_case("foreignObject") {
-                    ElementNamespace::Html
-                } else {
-                    ElementNamespace::Svg
-                }
+    /// Host tag of a selectorless component, matching Angular's `tagName`.
+    ///
+    /// Prefix order matches `_getPrefix`: explicit prefix, then the host tag's
+    /// implicit namespace (`svg`, `math`, `foreignObject`), then the parent's
+    /// prefix verbatim. A prefix with no local tag becomes `ng-component`. No
+    /// prefix and no local tag is `tagName === null`.
+    fn selectorless_host_tag(element: &HtmlElement<'a>, parent_prefix: &str) -> Option<String> {
+        Self::canonical_host_tag(
+            element.component_prefix.as_ref().map(|prefix| prefix.as_str()),
+            element.component_tag_name.as_ref().map(|tag| tag.as_str()),
+            parent_prefix,
+        )
+    }
+
+    /// `HtmlComponent.tag_name` is either already `:ns:local` or a local name.
+    fn component_node_host_tag(
+        component: &HtmlComponent<'a>,
+        parent_prefix: &str,
+    ) -> Option<String> {
+        match component.tag_name.as_ref().map(|tag| tag.as_str()) {
+            Some(tag) if tag.starts_with(':') => Some(tag.to_string()),
+            other => Self::canonical_host_tag(None, other, parent_prefix),
+        }
+    }
+
+    fn canonical_host_tag(
+        explicit_prefix: Option<&str>,
+        local_tag: Option<&str>,
+        parent_prefix: &str,
+    ) -> Option<String> {
+        let mut prefix = explicit_prefix.unwrap_or("").to_string();
+        if prefix.is_empty()
+            && let Some(tag) = local_tag
+            && let Some(implicit) = get_html_tag_definition(tag).implicit_namespace_prefix
+        {
+            prefix = implicit.to_string();
+        }
+        if prefix.is_empty() {
+            prefix = parent_prefix.to_string();
+        }
+        match (prefix.is_empty(), local_tag) {
+            (true, None) => None,
+            (true, Some(tag)) => Some(tag.to_string()),
+            (false, local) => {
+                let local = local.unwrap_or("ng-component");
+                Some(format!(":{prefix}:{local}"))
             }
-            ElementNamespace::Math => ElementNamespace::Math,
-            ElementNamespace::Html => ElementNamespace::Html,
         }
     }
 
-    fn namespace_from_prefixed_name(raw_name: &str) -> Option<ElementNamespace> {
-        if raw_name.starts_with(':')
-            && let Some((prefix, _)) = raw_name[1..].split_once(':')
-        {
-            return Self::namespace_from_prefix(prefix);
-        }
-
-        if let Some((prefix, _)) = raw_name.split_once(':') {
-            return Self::namespace_from_prefix(prefix);
-        }
-
-        None
-    }
-
-    fn namespace_from_prefix(prefix: &str) -> Option<ElementNamespace> {
-        if prefix.eq_ignore_ascii_case("svg") {
-            Some(ElementNamespace::Svg)
-        } else if prefix.eq_ignore_ascii_case("math") {
-            Some(ElementNamespace::Math)
-        } else {
-            None
-        }
-    }
-
-    fn qualify_element_name(&self, name: Ident<'a>, namespace: ElementNamespace) -> Ident<'a> {
-        if namespace == ElementNamespace::Html {
-            return name;
-        }
-
-        let name_str = name.as_str();
-        if name_str.starts_with(':') {
-            return name;
-        }
-
-        if let Some((prefix, local)) = name_str.split_once(':')
-            && Self::namespace_from_prefix(prefix).is_some()
-        {
-            let qualified = format!(":{prefix}:{local}");
-            return Ident::from_in(&qualified, &self.allocator);
-        }
-
-        let ns = match namespace {
-            ElementNamespace::Svg => "svg",
-            ElementNamespace::Math => "math",
-            ElementNamespace::Html => return name,
+    /// Prefix a selectorless component passes to its children. `tagName ===
+    /// null` and hosts with `preventNamespaceInheritance` pass nothing.
+    fn component_child_prefix(host_tag: Option<&str>) -> String {
+        let Some(tag) = host_tag else {
+            return String::new();
         };
-        let qualified = format!(":{ns}:{name_str}");
-        Ident::from_in(&qualified, &self.allocator)
+        let (ns, local) = split_ns_name(tag);
+        if get_html_tag_definition(local).prevent_namespace_inheritance {
+            return String::new();
+        }
+        ns.unwrap_or("").to_string()
+    }
+
+    /// Security-schema name for a selectorless component, matching
+    /// `calcPossibleSecurityContexts(component.tagName, ...)`.
+    ///
+    /// On the namespaced schema a bare host tag that is not an HTML element is
+    /// rewritten to its known `:svg:`/`:math:` form (`animate` →
+    /// `:svg:animate`); pre-v22 versions look up the bare tag (`animate|to`).
+    /// `tagName === null` resolves over every known element upstream; the empty
+    /// name reproduces that through the `*|attr` fallback (`src` → `NONE`,
+    /// `innerHTML` → `HTML`).
+    fn component_security_name(host_tag: Option<&str>, version: Option<AngularVersion>) -> String {
+        let Some(tag) = host_tag else {
+            return String::new();
+        };
+        if !uses_namespaced_schema(version) {
+            return tag.to_string();
+        }
+        let lower = tag.to_ascii_lowercase();
+        let (ns, local) = split_ns_name(&lower);
+        if ns.is_none() && !is_known_element(local) {
+            let svg = format!(":svg:{local}");
+            if is_known_element(&svg) {
+                return svg;
+            }
+            let math = format!(":math:{local}");
+            if is_known_element(&math) {
+                return math;
+            }
+        }
+        tag.to_string()
     }
 
     /// Transforms HTML directives to R3 directives.
@@ -955,7 +1068,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 key_span: attr.name_span,
                                 value_span: Some(value_span),
                                 i18n: None,
-                                security_context: get_security_context(element_name, prop_name),
+                                security_context: self.security_context(element_name, prop_name),
                             });
                         }
                         BindingPrefix::On => {
@@ -990,7 +1103,7 @@ impl<'a> HtmlToR3Transform<'a> {
                                 key_span: attr.name_span,
                                 value_span: Some(value_span),
                                 i18n: None,
-                                security_context: get_security_context(element_name, rest),
+                                security_context: self.security_context(element_name, rest),
                             });
 
                             // Two-way binding also creates an output event
@@ -1056,7 +1169,7 @@ impl<'a> HtmlToR3Transform<'a> {
                         key_span: attr.name_span,
                         value_span: Some(value_span),
                         i18n: None,
-                        security_context: get_security_context(element_name, prop_name),
+                        security_context: self.security_context(element_name, prop_name),
                     });
 
                     // Two-way binding also creates an output event
@@ -1127,7 +1240,7 @@ impl<'a> HtmlToR3Transform<'a> {
                         key_span: attr.name_span,
                         value_span: Some(value_span),
                         i18n: None,
-                        security_context: get_security_context(element_name, prop_name),
+                        security_context: self.security_context(element_name, prop_name),
                     });
                 } else if attr_name.starts_with('(') && attr_name.ends_with(')') {
                     // Event binding: (event)="handler"
@@ -2909,6 +3022,7 @@ impl<'a> HtmlToR3Transform<'a> {
         &mut self,
         attrs: &[HtmlAttribute<'a>],
         element_name: &str,
+        i18n_element_name: Option<&str>,
         is_template: bool,
     ) -> (
         Vec<'a, R3TextAttribute<'a>>,  // Static attributes
@@ -2932,6 +3046,20 @@ impl<'a> HtmlToR3Transform<'a> {
         for attr in attrs {
             let name = attr.name.as_str();
             if let Some(target_attr) = name.strip_prefix("i18n-") {
+                // `isTrustedTypesSink` lowercases the parser's full name and does
+                // not strip a namespace prefix. `None` is a selectorless component
+                // with no host tag (`tagName === null`), which is not a sink.
+                if i18n_element_name.is_some_and(|element_name| {
+                    is_trusted_types_sink_at(element_name, target_attr, self.angular_version)
+                }) {
+                    self.report_error(
+                        &format!(
+                            "Translating attribute '{target_attr}' is disallowed for security reasons."
+                        ),
+                        attr.span,
+                    );
+                    continue;
+                }
                 let instance_id = self.allocate_i18n_message_instance_id();
                 let meta = parse_i18n_meta(self.allocator, attr.value.as_str(), instance_id);
                 i18n_attrs_meta.insert(target_attr, meta);
@@ -3224,7 +3352,7 @@ impl<'a> HtmlToR3Transform<'a> {
         let name_atom = Ident::from(self.allocator.alloc_str(property_name));
 
         // Look up security context based on element and property
-        let security_context = get_security_context(element_name, property_name);
+        let security_context = self.security_context(element_name, property_name);
 
         R3BoundAttribute {
             name: name_atom,
@@ -4570,7 +4698,7 @@ impl<'a> HtmlToR3Transform<'a> {
         let (binding_type, final_name, unit, security_context) =
             if let Some(stripped) = name.strip_prefix("attr.") {
                 // Attribute bindings use the attribute security context
-                let security_context = get_security_context(element_name, stripped);
+                let security_context = self.security_context(element_name, stripped);
                 (BindingType::Attribute, stripped, None, security_context)
             } else if let Some(stripped) = name.strip_prefix("class.") {
                 (BindingType::Class, stripped, None, SecurityContext::None)
@@ -4585,7 +4713,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 }
             } else {
                 // Property bindings use the property security context
-                let security_context = get_security_context(element_name, name);
+                let security_context = self.security_context(element_name, name);
                 (BindingType::Property, name, None, security_context)
             };
 
@@ -4839,4 +4967,465 @@ pub fn html_ast_to_r3_ast<'a>(
 ) -> R3ParseResult<'a> {
     let transformer = HtmlToR3Transform::new(allocator, source_text, options);
     transformer.transform(html_nodes)
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::parser::html::HtmlParser;
+    use oxc_allocator::Allocator;
+
+    fn compile(
+        source: &str,
+    ) -> (std::vec::Vec<String>, std::vec::Vec<(String, SecurityContext)>, std::vec::Vec<String>)
+    {
+        compile_at(source, None)
+    }
+
+    fn compile_at(
+        source: &str,
+        angular_version: Option<AngularVersion>,
+    ) -> (std::vec::Vec<String>, std::vec::Vec<(String, SecurityContext)>, std::vec::Vec<String>)
+    {
+        compile_with(source, angular_version, false)
+    }
+
+    fn compile_selectorless(
+        source: &str,
+    ) -> (std::vec::Vec<String>, std::vec::Vec<(String, SecurityContext)>, std::vec::Vec<String>)
+    {
+        compile_with(source, None, true)
+    }
+
+    fn compile_selectorless_at(
+        source: &str,
+        angular_version: Option<AngularVersion>,
+    ) -> (std::vec::Vec<String>, std::vec::Vec<(String, SecurityContext)>, std::vec::Vec<String>)
+    {
+        compile_with(source, angular_version, true)
+    }
+
+    fn compile_with(
+        source: &str,
+        angular_version: Option<AngularVersion>,
+        selectorless: bool,
+    ) -> (std::vec::Vec<String>, std::vec::Vec<(String, SecurityContext)>, std::vec::Vec<String>)
+    {
+        let allocator = Allocator::default();
+        let parsed = if selectorless {
+            HtmlParser::with_selectorless(&allocator, source, "test.html").parse()
+        } else {
+            HtmlParser::new(&allocator, source, "test.html").parse()
+        };
+        let result = html_ast_to_r3_ast(
+            &allocator,
+            source,
+            &parsed.nodes,
+            TransformOptions { angular_version, ..TransformOptions::default() },
+        );
+        let mut names = std::vec::Vec::new();
+        let mut contexts = std::vec::Vec::new();
+        fn walk<'a>(
+            nodes: &[R3Node<'a>],
+            names: &mut std::vec::Vec<String>,
+            contexts: &mut std::vec::Vec<(String, SecurityContext)>,
+        ) {
+            for node in nodes {
+                match node {
+                    R3Node::Element(element) => {
+                        names.push(element.name.as_str().to_string());
+                        for input in &element.inputs {
+                            contexts
+                                .push((input.name.as_str().to_string(), input.security_context));
+                        }
+                        walk(&element.children, names, contexts);
+                    }
+                    R3Node::Component(component) => {
+                        names.push(format!("component:{}", component.component_name.as_str()));
+                        if let Some(tag) = component.tag_name {
+                            names.push(format!("host:{}", tag.as_str()));
+                        }
+                        for input in &component.inputs {
+                            contexts
+                                .push((input.name.as_str().to_string(), input.security_context));
+                        }
+                        walk(&component.children, names, contexts);
+                    }
+                    R3Node::Template(template) => walk(&template.children, names, contexts),
+                    R3Node::Content(content) => walk(&content.children, names, contexts),
+                    _ => {}
+                }
+            }
+        }
+        walk(&result.nodes, &mut names, &mut contexts);
+        let errors = result.errors.iter().map(|err| err.msg.clone()).collect::<std::vec::Vec<_>>();
+        (names, contexts, errors)
+    }
+
+    #[test]
+    fn svg_script_is_stripped_and_animate_to_is_validated() {
+        let (names, contexts, errors) =
+            compile(r#"<svg><script>alert(1)</script><animate [attr.to]="url"></animate></svg>"#);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(names.iter().any(|name| name == ":svg:svg" || name == "svg"));
+        assert!(!names.iter().any(|name| name.contains("script")));
+        assert!(names.iter().any(|name| name.contains("animate")));
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "to" && *ctx == SecurityContext::AttributeNoBinding),
+            "{names:?} {contexts:?}"
+        );
+    }
+
+    #[test]
+    fn math_href_is_a_url() {
+        let (names, contexts, _) = compile(r#"<math><mi [attr.href]="url"></mi></math>"#);
+        assert!(names.iter().any(|name| name.contains("mi")), "{names:?}");
+        assert!(
+            contexts.iter().any(|(name, ctx)| name == "href" && *ctx == SecurityContext::Url),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn iframe_i18n_src_is_rejected() {
+        let (_, _, errors) = compile(r#"<iframe i18n-src src="https://example.com"></iframe>"#);
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn namespaced_iframe_i18n_src_stays_allowed() {
+        let (_, _, errors) =
+            compile(r#"<svg><iframe i18n-src src="https://example.com"></iframe></svg>"#);
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn v21_keeps_svg_script_and_does_not_validate_namespaced_animate() {
+        let version = Some(AngularVersion::new(21, 2, 7));
+        let (names, contexts, _) = compile_at(
+            r#"<svg><script>alert(1)</script><animate [attr.to]="url"></animate></svg>"#,
+            version,
+        );
+        assert!(names.iter().any(|name| name.contains("script")), "{names:?}");
+        assert!(
+            contexts.iter().any(|(name, ctx)| name == "to" && *ctx == SecurityContext::None),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn xml_script_is_kept_and_xml_iframe_src_stays_translatable() {
+        let (names, _, _) = compile(r#"<xml:script>alert(1)</xml:script>"#);
+        assert!(names.iter().any(|name| name.contains("script")), "{names:?}");
+        let (_, _, errors) =
+            compile(r#"<xml:iframe i18n-src src="https://example.com"></xml:iframe>"#);
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn v21_2_3_allows_iframe_src_translation() {
+        let (_, _, errors) = compile_at(
+            r#"<iframe i18n-src src="https://example.com"></iframe>"#,
+            Some(AngularVersion::new(21, 2, 3)),
+        );
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn selectorless_iframe_host_rejects_i18n_src() {
+        let (_, _, errors) = compile_selectorless(
+            r#"<MyComp:iframe i18n-src src="https://example.com"></MyComp:iframe>"#,
+        );
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_svg_iframe_host_is_not_the_iframe_sink() {
+        let (_, _, errors) = compile_selectorless(
+            r#"<MyComp:svg:iframe i18n-src src="https://example.com"></MyComp:svg:iframe>"#,
+        );
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn selectorless_without_host_tag_is_not_a_sink() {
+        let (_, _, errors) =
+            compile_selectorless(r#"<MyComp i18n-innerHTML innerHTML="<b>x</b>"></MyComp>"#);
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn selectorless_script_class_is_kept_and_script_host_is_rejected() {
+        let (names, _, errors) = compile_selectorless(r#"<Script>alert(1)</Script>"#);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(names.iter().any(|name| name == "component:Script"), "{names:?}");
+
+        let (names, _, errors) = compile_selectorless(
+            r#"<Script:iframe i18n-src src="https://example.com"></Script:iframe>"#,
+        );
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?} {names:?}"
+        );
+        assert!(names.iter().any(|name| name == "component:Script"), "{names:?}");
+
+        let (_, _, errors) = compile_selectorless(r#"<MyComp:script></MyComp:script>"#);
+        assert!(
+            errors
+                .iter()
+                .any(|msg| msg.contains("Tag name \"script\" cannot be used as a component tag")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn element_script_class_is_still_stripped() {
+        let (names, _, _) = compile(r#"<Script>alert(1)</Script>"#);
+        assert!(
+            !names.iter().any(|name| name.to_ascii_lowercase().contains("script")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_inside_svg_inherits_the_namespace() {
+        let (_, _, errors) = compile_selectorless(
+            r#"<svg><MyComp i18n-innerHTML innerHTML="<b>x</b>"></MyComp></svg>"#,
+        );
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?}"
+        );
+
+        let (_, _, errors) = compile_selectorless(
+            r#"<svg><MyComp:iframe i18n-src src="https://example.com"></MyComp:iframe></svg>"#,
+        );
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+
+        let (names, _, errors) =
+            compile_selectorless(r#"<svg><MyComp:script></MyComp:script></svg>"#);
+        assert!(
+            !errors.iter().any(|msg| msg.contains("cannot be used as a component tag")),
+            "{errors:?}"
+        );
+        assert!(names.iter().any(|name| name == "component:MyComp"), "{names:?}");
+
+        let (_, _, errors) = compile_selectorless(
+            r#"<math><MyComp i18n-innerHTML innerHTML="<b>x</b>"></MyComp></math>"#,
+        );
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_inside_foreign_object_does_not_inherit_svg() {
+        let (_, _, errors) = compile_selectorless(
+            r#"<svg><foreignObject><MyComp i18n-innerHTML innerHTML="<b>x</b>"></MyComp></foreignObject></svg>"#,
+        );
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+
+        let (_, _, errors) = compile_selectorless(
+            r#"<svg><foreignObject><MyComp:iframe i18n-src src="https://example.com"></MyComp:iframe></foreignObject></svg>"#,
+        );
+        assert!(
+            errors.iter().any(|msg| msg.contains("disallowed for security reasons")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_iframe_src_i18n_follows_version() {
+        let (_, _, errors) = compile_selectorless_at(
+            r#"<MyComp:iframe i18n-src src="https://example.com"></MyComp:iframe>"#,
+            Some(AngularVersion::new(21, 2, 3)),
+        );
+        assert!(!errors.iter().any(|msg| msg.contains("disallowed")), "{errors:?}");
+    }
+
+    #[test]
+    fn selectorless_binding_security_uses_the_host_tag() {
+        // `iframe|src` is a resource URL on the resolved host tag.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp:iframe [src]="url"></MyComp:iframe>"#);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{contexts:?}"
+        );
+
+        // The `:svg:` host hits the namespaced animation schema.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp:svg:animate [attr.to]="v"></MyComp:svg:animate>"#);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "to" && *ctx == SecurityContext::AttributeNoBinding),
+            "{contexts:?}"
+        );
+
+        // A namespaced host does not fall back to the bare iframe sink.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp:svg:iframe [src]="url"></MyComp:svg:iframe>"#);
+        assert!(
+            contexts.iter().all(|(name, ctx)| name != "src" || *ctx == SecurityContext::None),
+            "{contexts:?}"
+        );
+
+        // `tagName === null` resolves over every element: `*|innerHTML`.
+        let (_, contexts, _) = compile_selectorless(r#"<MyComp [innerHTML]="html"></MyComp>"#);
+        assert!(
+            contexts.iter().any(|(name, ctx)| name == "innerHTML" && *ctx == SecurityContext::Html),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn prefixed_element_does_not_inherit_the_parent_namespace_for_security() {
+        // `normalizeTagName` drops a non-svg/math prefix, so `<xml:iframe>`
+        // inside `<svg>` still requires the resource-URL sanitizer.
+        let (_, contexts, _) = compile(r#"<svg><xml:iframe [src]="url"></xml:iframe></svg>"#);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn children_inherit_an_arbitrary_prefix() {
+        // `_getPrefix` inherits `getNsPrefix(parentName)` verbatim, so `<iframe>`
+        // inside `<xml:div>` resolves to `:xml:iframe`. `normalizeTagName` drops
+        // the `xml` prefix and the `iframe|src` resource-URL sanitizer applies.
+        let (names, contexts, _) =
+            compile(r#"<svg><xml:div><iframe [src]="url"></iframe></xml:div></svg>"#);
+        assert!(names.iter().any(|name| name == ":xml:iframe"), "{names:?}");
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{names:?} {contexts:?}"
+        );
+
+        // The same inheritance drives selectorless host tags (`tagName`).
+        let (names, _, _) =
+            compile_selectorless(r#"<xml:div><MyComp [innerHTML]="html"></MyComp></xml:div>"#);
+        assert!(names.iter().any(|name| name == "host::xml:ng-component"), "{names:?}");
+    }
+
+    #[test]
+    fn selectorless_children_inherit_the_host_tag_namespace() {
+        // Children of `<MyComp:math>` are MathML: `mi` is only an href sink in
+        // the `:math:` namespace.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp:math><mi [href]="url"></mi></MyComp:math>"#);
+        assert!(
+            contexts.iter().any(|(name, ctx)| name == "href" && *ctx == SecurityContext::Url),
+            "{contexts:?}"
+        );
+
+        // `foreignObject` prevents namespace inheritance, so children of
+        // `<MyComp:foreignObject>` inside `<svg>` are HTML again.
+        let (_, contexts, _) = compile_selectorless(
+            r#"<svg><MyComp:foreignObject><iframe [src]="url"></iframe></MyComp:foreignObject></svg>"#,
+        );
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{contexts:?}"
+        );
+
+        // `<MyComp>` inside `<svg>` resolves to `:svg:ng-component`, so its
+        // children stay namespaced.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<svg><MyComp><iframe [src]="url"></iframe></MyComp></svg>"#);
+        assert!(
+            contexts.iter().all(|(name, ctx)| name != "src" || *ctx == SecurityContext::None),
+            "{contexts:?}"
+        );
+
+        // At the HTML root `tagName === null`: children are plain HTML.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp><iframe [src]="url"></iframe></MyComp>"#);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "src" && *ctx == SecurityContext::ResourceUrl),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_bare_host_stays_bare_before_the_namespaced_schema() {
+        // Pre-v22 `calcPossibleSecurityContexts` looks the bare tag up:
+        // `animate|to` is `AttributeNoBinding` on 21.2.7 while `:svg:animate|to`
+        // is not a key.
+        let (_, contexts, _) = compile_selectorless_at(
+            r#"<MyComp:animate [attr.to]="value"></MyComp:animate>"#,
+            Some(AngularVersion::new(21, 2, 7)),
+        );
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "to" && *ctx == SecurityContext::AttributeNoBinding),
+            "{contexts:?}"
+        );
+
+        // Same for bare MathML hosts: `mi|href` is a bare URL key pre-v22.
+        let (_, contexts, _) = compile_selectorless_at(
+            r#"<MyComp:mi [attr.href]="value"></MyComp:mi>"#,
+            Some(AngularVersion::new(21, 2, 7)),
+        );
+        assert!(
+            contexts.iter().any(|(name, ctx)| name == "href" && *ctx == SecurityContext::Url),
+            "{contexts:?}"
+        );
+
+        // v22 promotes the bare host to `:svg:animate` like upstream.
+        let (_, contexts, _) =
+            compile_selectorless(r#"<MyComp:animate [attr.to]="value"></MyComp:animate>"#);
+        assert!(
+            contexts
+                .iter()
+                .any(|(name, ctx)| name == "to" && *ctx == SecurityContext::AttributeNoBinding),
+            "{contexts:?}"
+        );
+    }
+
+    #[test]
+    fn prefixed_element_lookup_matches_the_versions_normalize_tag_name() {
+        // `normalizeTagName` in `securityContext` only exists at 19.2.23 /
+        // 20.3.22 / 21.2.15 and later. Before that the tag is lowercased
+        // verbatim, so `:xml:iframe|src` is not the `iframe|src` sink.
+        for (major, minor, patch, expected) in [
+            (21, 2, 13, SecurityContext::None),
+            (21, 2, 14, SecurityContext::None),
+            (21, 2, 15, SecurityContext::ResourceUrl),
+            (19, 2, 22, SecurityContext::None),
+            (19, 2, 23, SecurityContext::ResourceUrl),
+            (20, 3, 21, SecurityContext::None),
+            (20, 3, 22, SecurityContext::ResourceUrl),
+        ] {
+            let (_, contexts, _) = compile_at(
+                r#"<xml:iframe [src]="url"></xml:iframe>"#,
+                Some(AngularVersion::new(major, minor, patch)),
+            );
+            assert!(
+                contexts.iter().any(|(name, ctx)| name == "src" && *ctx == expected),
+                "v{major}.{minor}.{patch}: {contexts:?}"
+            );
+        }
+    }
 }

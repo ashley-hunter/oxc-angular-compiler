@@ -4122,7 +4122,18 @@ fn ingest_host_dom_property<'a>(
         name,
         expression,
         unit: property.unit,
-        security_context: property.security_context,
+        // Host property bindings recompute the context from the selector.
+        // `style` / `class` / animation ops are specialized before sanitizers run.
+        security_context: match binding_kind {
+            BindingKind::Attribute | BindingKind::Property | BindingKind::TwoWayProperty => {
+                crate::schema::host_binding_security_context_for(
+                    job.component_selector.as_str(),
+                    name.as_str(),
+                    job.angular_version,
+                )
+            }
+            _ => SecurityContext::None,
+        },
         i18n_message: None,
         is_text_attribute: false,
     });
@@ -4130,58 +4141,15 @@ fn ingest_host_dom_property<'a>(
     job.root.update.push(op);
 }
 
-/// Computes the security context for an attribute binding.
+/// Security context for a static host attribute.
 ///
-/// This is a simplified implementation of Angular's `calcPossibleSecurityContexts`
-/// that handles the most common cases based on element and property names.
-///
-/// Ported from Angular's `binding_parser.ts` and `dom_security_schema.ts`.
-fn compute_security_context(selector: &str, attr_name: &str) -> SecurityContext {
-    use crate::schema::{calc_security_context_for_unknown_element, get_security_context};
-
-    // Extract element name from selector if present (e.g., "a[myDirective]" → "a")
-    let element = extract_element_from_selector(selector);
-
-    match element {
-        Some(element_name) => {
-            // Element is known - use the specific lookup
-            get_security_context(&element_name, attr_name)
-        }
-        None => {
-            // Element is unknown (e.g., attribute-only directive like [myDirective])
-            // Use the ambiguous lookup that checks all possible elements
-            calc_security_context_for_unknown_element(attr_name)
-        }
-    }
-}
-
-/// Extracts the element name from a CSS selector.
-///
-/// Examples:
-/// - "a[myDirective]" → Some("a")
-/// - "div.my-class" → Some("div")
-/// - "[myDirective]" → None
-/// - ".my-class" → None
-fn extract_element_from_selector(selector: &str) -> Option<String> {
-    // Skip leading whitespace
-    let s = selector.trim();
-
-    // If starts with [, ., or :, there's no element
-    if s.starts_with('[') || s.starts_with('.') || s.starts_with(':') || s.starts_with('#') {
-        return None;
-    }
-
-    // Find the element name (alphanumeric and hyphens until a special char)
-    let mut element_end = 0;
-    for (i, c) in s.char_indices() {
-        if c.is_alphanumeric() || c == '-' || c == '_' {
-            element_end = i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    if element_end > 0 { Some(s[..element_end].to_lowercase()) } else { None }
+/// Same selector rules as host property bindings (`calcPossibleSecurityContexts`).
+fn compute_security_context(
+    selector: &str,
+    attr_name: &str,
+    version: Option<crate::AngularVersion>,
+) -> SecurityContext {
+    crate::schema::host_binding_security_context_for(selector, attr_name, version)
 }
 
 /// Ingests a static host attribute.
@@ -4202,7 +4170,11 @@ fn ingest_host_attribute<'a>(
     let allocator = job.allocator;
 
     // Compute security context based on selector and attribute name
-    let security_context = compute_security_context(job.component_selector.as_str(), name.as_str());
+    let security_context = compute_security_context(
+        job.component_selector.as_str(),
+        name.as_str(),
+        job.angular_version,
+    );
 
     // Wrap the OutputExpression in IrExpression::OutputExpr
     // This matches TypeScript which passes o.Expression directly to the IR
@@ -4442,7 +4414,11 @@ fn ingest_control_flow_insertion_point<'a, 'b>(
             continue;
         }
 
-        let security_context = crate::schema::get_security_context(NG_TEMPLATE_TAG_NAME, attr_name);
+        let security_context = crate::schema::get_security_context_for(
+            NG_TEMPLATE_TAG_NAME,
+            attr_name,
+            job.angular_version,
+        );
         let value_expr = create_string_literal_atom(allocator, attr.value.clone());
 
         // Handle i18n message if present (for i18n-* attribute markers)
@@ -4531,8 +4507,11 @@ fn ingest_control_flow_insertion_point<'a, 'b>(
             continue;
         }
 
-        let security_context =
-            crate::schema::get_security_context(NG_TEMPLATE_TAG_NAME, &input.name);
+        let security_context = crate::schema::get_security_context_for(
+            NG_TEMPLATE_TAG_NAME,
+            &input.name,
+            job.angular_version,
+        );
 
         let extracted_attr_op = CreateOp::ExtractedAttribute(ExtractedAttributeOp {
             base: CreateOpBase { source_span: Some(input.source_span), ..Default::default() },
