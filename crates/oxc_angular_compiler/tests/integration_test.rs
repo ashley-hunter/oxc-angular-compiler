@@ -4594,6 +4594,170 @@ fn test_i18n_if_else_block_placeholders() {
     assert!(!js.contains("i18nPostprocess"), "No post-processing expected:\n{js}");
 }
 
+/// Colons in meaning/description are escaped in the `$localize` raw metadata block, which the
+/// runtime reads to find the end of the block. Angular 22.1.5:
+///   $localize `:meaning\\:A|descA@@idA:Content A` and `:d\\: x@@t2:T`
+#[test]
+fn test_i18n_meta_block_escapes_colons() {
+    let js = compile_i18n_component(
+        r#"<div i18n="meaning:A|descA@@idA">Content A</div><div i18n-title="d: x@@t2" title="T">x</div>"#,
+    );
+    assert_contains(
+        &js,
+        "__tpl([\":meaning:A|descA@@idA:Content A\"], [\":meaning\\\\:A|descA@@idA:Content A\"])",
+    );
+    assert_contains(&js, "__tpl([\":d: x@@t2:T\"], [\":d\\\\: x@@t2:T\"])");
+}
+
+/// An ICU outside any i18n block still gets a message and is wrapped in its own i18n block.
+/// Angular 22.1.5: goog.getMsg("{VAR_SELECT, select, male {male} female {female} other {other}}"),
+///   i18n_0 = i0.ɵɵi18nPostprocess(i18n_0, { "VAR_SELECT": "\uFFFD0\uFFFD" }); i0.ɵɵi18n(1, 0);
+#[test]
+fn test_i18n_icu_outside_i18n_block() {
+    let js = compile_i18n_component(
+        r#"<div>{gender, select, male {male} female {female} other {other}}</div>"#,
+    );
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{VAR_SELECT, select, male {male} female {female} other {other}}\")",
+    );
+    assert_contains(
+        &js,
+        "(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+    assert_contains(&js, "i0.ɵɵi18n(1,0);");
+    assert_contains(&js, "i0.ɵɵi18nExp(ctx.gender);");
+}
+
+/// Nested ICUs are named and numbered children first. Angular 22.1.5:
+///   {VAR_SELECT_2, select, male {m {VAR_SELECT, ...}} female {f {VAR_SELECT_1, ...}} other {x}}
+///   { "VAR_SELECT": "\uFFFD0\uFFFD", "VAR_SELECT_1": "\uFFFD1\uFFFD", "VAR_SELECT_2": "\uFFFD2\uFFFD" }
+#[test]
+fn test_i18n_nested_icu_placeholder_order() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{gender, select, male {m {count, select, 3 {three} other {o}}} female {f {count, select, 3 {three} other {o}}} other {x}}</div>"#,
+    );
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{VAR_SELECT_2, select, male {m {VAR_SELECT, select, 3 {three} other {o}}} female {f {VAR_SELECT_1, select, 3 {three} other {o}}} other {x}}\")",
+    );
+    assert_contains(
+        &js,
+        "{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\",\"VAR_SELECT_1\":\"\u{FFFD}1\u{FFFD}\",\"VAR_SELECT_2\":\"\u{FFFD}2\u{FFFD}\"}",
+    );
+    assert_contains(&js, "i0.ɵɵi18nExp(ctx.count)(ctx.count)(ctx.gender);");
+}
+
+/// Interpolations in an attribute of an element inside an ICU become expression placeholders in
+/// the tag markup. Angular 22.1.5:
+///   { "CLOSE_TAG_SPAN": "</span>", "START_TAG_SPAN": "<span title=\"\uFFFD1\uFFFD-\uFFFD2\uFFFD\">", "VAR_SELECT": "\uFFFD0\uFFFD" }
+#[test]
+fn test_i18n_icu_element_with_interpolated_attribute() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{gender, select, other {<span title="{{name}}-{{name}}">foo</span>}}</div>"#,
+    );
+    assert_contains(
+        &js,
+        "{\"CLOSE_TAG_SPAN\":\"</span>\",\"START_TAG_SPAN\":\"<span title=\\\"\u{FFFD}1\u{FFFD}-\u{FFFD}2\u{FFFD}\\\">\",\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}",
+    );
+    assert_contains(&js, "i0.ɵɵi18nExp(ctx.gender)(ctx.name)(ctx.name);");
+}
+
+/// Spaces around ICU keywords are kept and the VAR placeholder still gets its value.
+/// Angular 22.1.5: "{VAR_SELECT , select , 3 {three} other {more}}", { "VAR_SELECT": "\uFFFD0\uFFFD" }
+#[test]
+fn test_i18n_icu_with_spaces_around_keywords() {
+    let js = compile_i18n_component(r#"<div i18n>{count, select , 3 {three} other {more}}</div>"#);
+    assert_contains(&js, "goog.getMsg(\"{VAR_SELECT , select , 3 {three} other {more}}\")");
+    assert_contains(
+        &js,
+        "(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}));",
+    );
+}
+
+/// A void element is a single placeholder. Angular 22.1.5:
+///   goog.getMsg("{$tagImg} is my logo", { "tagImg": "\uFFFD#2\uFFFD\uFFFD/#2\uFFFD" })
+#[test]
+fn test_i18n_void_element_placeholder() {
+    let js = compile_i18n_component(r#"<div i18n><img src="a.png"> is my logo</div>"#);
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$tagImg} is my logo\",{\"tagImg\":\"\u{FFFD}#2\u{FFFD}\u{FFFD}/#2\u{FFFD}\"})",
+    );
+}
+
+/// Tag placeholders are named children first, so the outer of two different spans gets _1.
+/// Angular 22.1.5: "{$startTagSpan_1}a{$startTagSpan}inner{$closeTagSpan}{$closeTagSpan}"
+#[test]
+fn test_i18n_nested_tag_placeholder_names() {
+    let js =
+        compile_i18n_component(r#"<div i18n><span title="x">a<span>inner</span></span></div>"#);
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$startTagSpan_1}a{$startTagSpan}inner{$closeTagSpan}{$closeTagSpan}\",{\"closeTagSpan\":\"[\u{FFFD}/#3\u{FFFD}|\u{FFFD}/#2\u{FFFD}]\",\"startTagSpan\":\"\u{FFFD}#3\u{FFFD}\",\"startTagSpan_1\":\"\u{FFFD}#2\u{FFFD}\"})",
+    );
+}
+
+/// `<ng-content>` inside an i18n block gets its projection slot as the tag value.
+/// Angular 22.1.5: { "closeTagNgContent": "\uFFFD/#2\uFFFD", "startTagNgContent": "\uFFFD#2\uFFFD" }
+#[test]
+fn test_i18n_ng_content_placeholder_values() {
+    let js = compile_i18n_component(r#"<div i18n><ng-content select="x"></ng-content>tail</div>"#);
+    assert_contains(
+        &js,
+        "{\"closeTagNgContent\":\"\u{FFFD}/#2\u{FFFD}\",\"startTagNgContent\":\"\u{FFFD}#2\u{FFFD}\"}",
+    );
+}
+
+/// Custom placeholder names may have spaces around `=`. Angular 22.1.5:
+///   goog.getMsg("Hi {$who}", { "who": "\uFFFD0\uFFFD" }), $localize `Hi ${...}:WHO:`
+#[test]
+fn test_i18n_custom_placeholder_name_with_spaces() {
+    let js = compile_i18n_component(r#"<div i18n>Hi {{ name // i18n(ph = "who") }}</div>"#);
+    assert_contains(&js, "goog.getMsg(\"Hi {$who}\",{\"who\":\"\u{FFFD}0\u{FFFD}\"})");
+    assert_contains(&js, "__tpl([\"Hi \", \":WHO:\"]");
+}
+
+/// An i18n element with a structural directive keeps its interpolation value. Angular 22.1.5:
+///   { "closeTagSpan": "\uFFFD/#2\uFFFD", "interpolation": "\uFFFD0\uFFFD", "startTagSpan": "\uFFFD#2\uFFFD" }
+#[test]
+fn test_i18n_block_on_element_with_structural_directive() {
+    let js =
+        compile_i18n_component(r#"<div i18n *ngIf="visible">Some <span>{{ name }}</span></div>"#);
+    assert_contains(
+        &js,
+        "goog.getMsg(\"Some {$startTagSpan}{$interpolation}{$closeTagSpan}\",{\"closeTagSpan\":\"\u{FFFD}/#2\u{FFFD}\",\"interpolation\":\"\u{FFFD}0\u{FFFD}\",\"startTagSpan\":\"\u{FFFD}#2\u{FFFD}\"})",
+    );
+}
+
+/// Text and attribute interpolations in the same i18n block are indexed separately.
+/// Angular 22.1.5: both messages map INTERPOLATION to "\uFFFD0\uFFFD".
+#[test]
+fn test_i18n_text_interpolation_next_to_i18n_attribute() {
+    let js = compile_i18n_component(
+        r#"<div i18n>{{ name }}<h1 i18n-title title="{{ name }}"></h1></div>"#,
+    );
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$interpolation}\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"})",
+    );
+    assert_contains(
+        &js,
+        "goog.getMsg(\"{$interpolation}{$startHeadingLevel1}{$closeHeadingLevel1}\",{\"closeHeadingLevel1\":\"\u{FFFD}/#2\u{FFFD}\",\"interpolation\":\"\u{FFFD}0\u{FFFD}\",\"startHeadingLevel1\":\"\u{FFFD}#2\u{FFFD}\"})",
+    );
+}
+
+/// Elements inheriting a namespace are named with it. Angular 22.1.5:
+///   $localize `Count: ${...}:START_TAG__XHTML_SPAN:5${...}:CLOSE_TAG__XHTML_SPAN:`
+#[test]
+fn test_i18n_namespaced_element_placeholders() {
+    let js = compile_i18n_component(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><xhtml:div xmlns="http://www.w3.org/1999/xhtml" i18n>Count: <span>5</span></xhtml:div></foreignObject></svg>"#,
+    );
+    assert_contains(&js, "goog.getMsg(\"Count: {$startTagXhtmlSpan}5{$closeTagXhtmlSpan}\"");
+    assert_contains(&js, "\":START_TAG__XHTML_SPAN:5\"");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
