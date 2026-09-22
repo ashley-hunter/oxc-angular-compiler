@@ -4470,13 +4470,9 @@ impl<'a> HtmlToR3Transform<'a> {
             }
         }
 
-        // Return Container if multiple children, otherwise single node
-        if children.len() == 1 {
-            let single_child = children.pop().unwrap();
-            I18nMeta::Node(single_child)
-        } else {
-            I18nMeta::Node(I18nNode::Container(I18nContainer { children, source_span: span }))
-        }
+        // Text with an interpolation is always a Container, even `{{ x }}` alone, as in
+        // Angular's _visitTextWithInterpolation; ingest reads placeholder names from it.
+        I18nMeta::Node(I18nNode::Container(I18nContainer { children, source_span: span }))
     }
 
     /// Parses an interpolation expression.
