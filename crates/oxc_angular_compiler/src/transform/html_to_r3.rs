@@ -172,6 +172,9 @@ pub struct HtmlToR3Transform<'a> {
     /// ICU placeholder names (`ICU`, `ICU_1`, ...) from the enclosing i18n message, keyed by
     /// the ICU's start offset.
     icu_placeholder_names: FxHashMap<u32, String>,
+    /// Block placeholder start/close names (`START_BLOCK_IF`, `CLOSE_BLOCK_IF`, ...) from the
+    /// enclosing i18n message, keyed by the block's start offset.
+    block_placeholder_names: FxHashMap<u32, (String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +210,7 @@ impl<'a> HtmlToR3Transform<'a> {
             sole_icu_message: None,
             icu_interpolation_names: FxHashMap::default(),
             icu_placeholder_names: FxHashMap::default(),
+            block_placeholder_names: FxHashMap::default(),
         }
     }
 
@@ -412,7 +416,11 @@ impl<'a> HtmlToR3Transform<'a> {
                     None,
                     source_file,
                 );
-                collect_icu_placeholder_names(&message.nodes, &mut self.icu_placeholder_names);
+                collect_placeholder_names(
+                    &message.nodes,
+                    &mut self.icu_placeholder_names,
+                    &mut self.block_placeholder_names,
+                );
                 message.serialize()
             }
         } else {
@@ -1991,6 +1999,22 @@ impl<'a> HtmlToR3Transform<'a> {
         // Only create placeholders when inside an i18n context
         if self.i18n_depth == 0 {
             return None;
+        }
+
+        // Use the names from the enclosing i18n message, as Angular does.
+        if let Some((start, close)) = self.block_placeholder_names.remove(&source_span.start) {
+            let mut params = Vec::new_in(self.allocator);
+            params.extend(parameters.iter().copied());
+            return Some(I18nMeta::BlockPlaceholder(I18nBlockPlaceholder {
+                name: Ident::from_in(block_name, self.allocator),
+                parameters: params,
+                start_name: Ident::from_in(start.as_str(), self.allocator),
+                close_name: Ident::from_in(close.as_str(), self.allocator),
+                children: Vec::new_in(self.allocator),
+                source_span,
+                start_source_span: Some(start_source_span),
+                end_source_span,
+            }));
         }
 
         // Generate unique placeholder names (following Angular's placeholder naming convention)
@@ -4838,21 +4862,31 @@ fn is_style_url_resolvable(url: &str) -> bool {
     }
 }
 
-/// Records the placeholder name of each ICU in an i18n message, keyed by the ICU's start
-/// offset. Angular names them with `getPlaceholderName('ICU', ...)`, giving `ICU`, `ICU_1`, ...
-fn collect_icu_placeholder_names(
+/// Records the placeholder names of each ICU and block in an i18n message, keyed by their start
+/// offset. Angular takes these names from the message (`getPlaceholderName('ICU', ...)`,
+/// `getStartBlockPlaceholderName(...)`), giving `ICU_1`, `START_BLOCK_IF_1`, ... as needed.
+fn collect_placeholder_names(
     nodes: &[crate::i18n::ast::Node],
-    names: &mut FxHashMap<u32, String>,
+    icus: &mut FxHashMap<u32, String>,
+    blocks: &mut FxHashMap<u32, (String, String)>,
 ) {
     use crate::i18n::ast::Node;
     for node in nodes {
         match node {
             Node::IcuPlaceholder(ph) => {
-                names.insert(ph.source_span.start.offset, ph.name.clone());
+                icus.insert(ph.source_span.start.offset, ph.name.clone());
             }
-            Node::Container(container) => collect_icu_placeholder_names(&container.children, names),
-            Node::TagPlaceholder(tag) => collect_icu_placeholder_names(&tag.children, names),
-            Node::BlockPlaceholder(block) => collect_icu_placeholder_names(&block.children, names),
+            Node::Container(container) => {
+                collect_placeholder_names(&container.children, icus, blocks)
+            }
+            Node::TagPlaceholder(tag) => collect_placeholder_names(&tag.children, icus, blocks),
+            Node::BlockPlaceholder(block) => {
+                blocks.insert(
+                    block.source_span.start.offset,
+                    (block.start_name.clone(), block.close_name.clone()),
+                );
+                collect_placeholder_names(&block.children, icus, blocks);
+            }
             Node::Text(_) | Node::Icu(_) | Node::Placeholder(_) => {}
         }
     }
