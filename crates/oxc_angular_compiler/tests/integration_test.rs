@@ -4780,6 +4780,15 @@ fn test_i18n_root_icu_template_drops_surrounding_whitespace() {
     assert!(!js.contains("ɵɵtext("), "Root whitespace next to the ICU must be removed:\n{js}");
 }
 
+/// `&ngsp;` stays in the i18n message as U+E500 (Angular builds the message from the text's
+/// tokens, and whitespace processing leaves entity tokens alone), so the message id matches
+/// Angular's. Angular 22.1.5: goog.getMsg("a\uE500b")
+#[test]
+fn test_i18n_message_keeps_ngsp() {
+    let js = compile_i18n_component("<div i18n>a&ngsp;b</div>");
+    assert_contains(&js, "goog.getMsg(\"a\u{E500}b\")");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
