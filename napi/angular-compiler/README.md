@@ -244,6 +244,10 @@ The Vite plugin consists of three sub-plugins:
 - External message IDs
 - File-based naming
 
+Not supported: legacy message IDs (Angular's `enableI18nLegacyMessageIdFormat`) and
+`i18nNormalizeLineEndingsInICUs`. `$localize` messages carry no legacy IDs, so translations
+keyed only by legacy IDs are not applied; translations keyed by the current message IDs are.
+
 ## Platform Support
 
 Pre-built binaries for:

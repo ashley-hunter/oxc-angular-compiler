@@ -128,7 +128,6 @@ interface TransformOptions {
   enableCrossFileElision?: boolean
 
   // i18n configuration
-  i18nNormalizeLineEndingsInIcus?: boolean
   i18nUseExternalIds?: boolean
 
   // Style encapsulation mode
