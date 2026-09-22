@@ -3,7 +3,8 @@
 //! This module defines the metadata extracted from `@Component` decorators.
 
 use oxc_allocator::Vec;
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use super::dependency::R3DependencyMetadata;
 use crate::directive::R3InputMetadata;
@@ -62,6 +63,78 @@ impl AngularVersion {
         self.major >= 20
     }
 
+    /// Check if this version supports the `@Service` decorator (v22.0.0+).
+    ///
+    /// Angular v22 introduced the `@Service` decorator as a lighter alternative to
+    /// `@Injectable`. The runtime gains `compileService`/`ɵɵdefineService` in the same
+    /// release, so earlier versions cannot consume downleveled `@Service` metadata.
+    pub fn supports_service_decorator(&self) -> bool {
+        self.major >= 22
+    }
+
+    /// Whether the default component change-detection strategy is `OnPush`
+    /// (v22.0.0+).
+    ///
+    /// Angular v22 made `OnPush` (0) the default strategy and added `Eager` (1).
+    /// The runtime computes `onPush = changeDetection !== Eager`, so the full
+    /// definition omits `changeDetection` for `OnPush` and emits `1` for `Eager`.
+    /// Before v22 the default was `Default`/`Eager` (1) and the runtime computed
+    /// `onPush = changeDetection === OnPush`, so the definition instead omits the
+    /// default and emits `0` for an explicit `OnPush`.
+    pub fn change_detection_default_is_on_push(&self) -> bool {
+        self.major >= 22
+    }
+
+    /// Check if this version emits control instructions for the extended set of
+    /// control properties (v22.0.0+).
+    ///
+    /// Angular v22 broadened `specializeControlProperties` beyond `formField`:
+    /// `formControl`, `formControlName`, and `ngModel` (including two-way
+    /// `[(ngModel)]`) now also emit the paired `ɵɵcontrolCreate()` /
+    /// `ɵɵcontrol()` instructions. Earlier versions only do this for `formField`,
+    /// so emitting the extra instructions against a < v22 runtime would diverge.
+    pub fn supports_extended_control_properties(&self) -> bool {
+        self.major >= 22
+    }
+
+    /// Check if this version uses modern optional-chaining semantics (v22.0.0+).
+    ///
+    /// Angular v22 changed the safe-navigation operator (`?.`) in template
+    /// expressions to yield `undefined` (native optional chaining) instead of the
+    /// legacy `null`. Earlier versions default to the legacy `== null ? null`
+    /// expansion. Users can opt back into legacy behavior with the
+    /// `legacyOptionalChaining` compiler option, or per-expression by wrapping it
+    /// in the `$safeNavigationMigration(...)` magic function.
+    ///
+    /// See `angular/angular@2896c93cc1`.
+    pub fn supports_modern_optional_chaining(&self) -> bool {
+        self.major >= 22
+    }
+
+    /// Check if this version's runtime supports chained query instructions
+    /// (`ɵɵviewQuery(p1)(p2)`, `ɵɵcontentQuerySignal(...)(...)`).
+    ///
+    /// Until `angular/angular@ae1c0dc4` ("perf(compiler): chain query creation
+    /// instructions", landed in v21.1.0 and cherry-picked into v21.0.4 as
+    /// `f901cc9e`), `ɵɵviewQuery` / `ɵɵcontentQuery` / `ɵɵviewQuerySignal` /
+    /// `ɵɵcontentQuerySignal` all returned `void`. Chained emit on those
+    /// versions throws at runtime: `TypeError: ɵɵviewQuery(...) is not a
+    /// function`. From v21.0.4+ they return `typeof <fn>` and chain safely.
+    pub fn supports_chained_queries(&self) -> bool {
+        // v22+ unconditionally, v21.1.0+ on the v21 line, v21.0.4+ on the
+        // v21.0 cherry-pick. Anything below v21 is `void`-return territory.
+        if self.major >= 22 {
+            return true;
+        }
+        if self.major == 21 {
+            if self.minor >= 1 {
+                return true;
+            }
+            return self.minor == 0 && self.patch >= 4;
+        }
+        false
+    }
+
     /// Parse a version string like "19.0.0" or "19.0.0-rc.1".
     ///
     /// Returns `None` if the version string is invalid.
@@ -103,11 +176,21 @@ pub enum ViewEncapsulation {
 /// Matches Angular's `ChangeDetectionStrategy` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangeDetectionStrategy {
-    /// Check the component on every change detection cycle.
+    /// Only check when inputs change or events are triggered. Angular v22's
+    /// default strategy (`OnPush = 0`).
     #[default]
-    Default,
-    /// Only check when inputs change or events are triggered.
     OnPush,
+    /// Check the component on every change detection cycle (`Eager = 1`). The
+    /// member introduced in Angular v22 to replace `Default`.
+    Eager,
+    /// Check the component on every change detection cycle. The pre-v22 spelling
+    /// (`Default = 1`), kept distinct from [`Eager`] so partial declarations
+    /// preserve the exact `ChangeDetectionStrategy` member the author wrote —
+    /// emitting `Eager` for an older Angular target would reference a member
+    /// that does not exist there.
+    ///
+    /// [`Eager`]: ChangeDetectionStrategy::Eager
+    Default,
 }
 
 /// Metadata extracted from an `@Component` decorator.
@@ -143,8 +226,9 @@ pub struct ComponentMetadata<'a> {
     /// View encapsulation mode.
     pub encapsulation: ViewEncapsulation,
 
-    /// Change detection strategy.
-    pub change_detection: ChangeDetectionStrategy,
+    /// Change detection strategy, or `None` when the decorator does not specify
+    /// one (so the runtime's version-dependent default applies).
+    pub change_detection: Option<ChangeDetectionStrategy>,
 
     /// Host bindings and listeners.
     pub host: Option<HostMetadata<'a>>,
@@ -255,6 +339,22 @@ pub struct ComponentMetadata<'a> {
     /// - A spread expression: `[...SHARED_IMPORTS, MyPipe]`
     pub raw_imports: Option<OutputExpression<'a>>,
 
+    /// Local identifiers from the `@Component.deferredImports` array.
+    ///
+    /// Each entry is a class binding the user explicitly opted into
+    /// lazy-loading via `@defer` blocks. The compiler wires them into the
+    /// per-component deferrable-dependencies resolver function emitted as
+    /// the third argument of `ɵɵdefer(...)`, and never includes them in the
+    /// eager dependency surface.
+    ///
+    /// Mirrors Angular's `analysis.explicitlyDeferredTypes` populated by
+    /// `collectExplicitlyDeferredSymbols` in
+    /// `packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts`.
+    /// Local compilation reads this field; full compilation additionally
+    /// derives candidates from template usage of `imports: [...]`, which
+    /// requires cross-file selector info OXC doesn't have.
+    pub deferred_imports: Vec<'a, Ident<'a>>,
+
     /// Animation triggers for the component.
     ///
     /// Corresponds to the `animations` property in `@Component`.
@@ -312,8 +412,8 @@ impl<'a> HostDirectiveMetadata<'a> {
         Self {
             directive,
             source_module: None,
-            inputs: Vec::new_in(allocator),
-            outputs: Vec::new_in(allocator),
+            inputs: Vec::new_in(&allocator),
+            outputs: Vec::new_in(&allocator),
             is_forward_reference: false,
         }
     }
@@ -436,9 +536,9 @@ impl<'a> TemplateDependency<'a> {
             type_name,
             source_module: None,
             selector: Some(selector),
-            inputs: Vec::new_in(allocator),
-            outputs: Vec::new_in(allocator),
-            export_as: Vec::new_in(allocator),
+            inputs: Vec::new_in(&allocator),
+            outputs: Vec::new_in(&allocator),
+            export_as: Vec::new_in(&allocator),
             is_component,
             pipe_name: None,
             is_forward_reference: false,
@@ -456,9 +556,9 @@ impl<'a> TemplateDependency<'a> {
             type_name,
             source_module: None,
             selector: None,
-            inputs: Vec::new_in(allocator),
-            outputs: Vec::new_in(allocator),
-            export_as: Vec::new_in(allocator),
+            inputs: Vec::new_in(&allocator),
+            outputs: Vec::new_in(&allocator),
+            export_as: Vec::new_in(&allocator),
             is_component: false,
             pipe_name: Some(pipe_name),
             is_forward_reference: false,
@@ -505,9 +605,9 @@ impl<'a> HostMetadata<'a> {
     /// Create a new empty HostMetadata.
     pub fn new(allocator: &'a oxc_allocator::Allocator) -> Self {
         Self {
-            properties: Vec::new_in(allocator),
-            attributes: Vec::new_in(allocator),
-            listeners: Vec::new_in(allocator),
+            properties: Vec::new_in(&allocator),
+            attributes: Vec::new_in(&allocator),
+            listeners: Vec::new_in(&allocator),
             class_attr: None,
             style_attr: None,
         }
@@ -534,31 +634,32 @@ impl<'a> ComponentMetadata<'a> {
             selector: None,
             template: None,
             template_url: None,
-            styles: Vec::new_in(allocator),
-            style_urls: Vec::new_in(allocator),
+            styles: Vec::new_in(&allocator),
+            style_urls: Vec::new_in(&allocator),
             standalone: implicit_standalone,
             encapsulation: ViewEncapsulation::default(),
-            change_detection: ChangeDetectionStrategy::default(),
+            change_detection: None,
             host: None,
-            imports: Vec::new_in(allocator),
-            export_as: Vec::new_in(allocator),
+            imports: Vec::new_in(&allocator),
+            export_as: Vec::new_in(&allocator),
             preserve_whitespaces: false,
             constructor_deps: None,
-            inputs: Vec::new_in(allocator),
-            outputs: Vec::new_in(allocator),
+            inputs: Vec::new_in(&allocator),
+            outputs: Vec::new_in(&allocator),
             // Feature-related fields
             providers: None,
             view_providers: None,
-            host_directives: Vec::new_in(allocator),
+            host_directives: Vec::new_in(&allocator),
             uses_inheritance: false,
             lifecycle: LifecycleMetadata::default(),
-            external_styles: Vec::new_in(allocator),
+            external_styles: Vec::new_in(&allocator),
             // Template dependency fields
-            declarations: Vec::new_in(allocator),
+            declarations: Vec::new_in(&allocator),
             declaration_list_emit_mode: DeclarationListEmitMode::default(),
             raw_imports: None,
+            deferred_imports: Vec::new_in(&allocator),
             animations: None,
-            schemas: Vec::new_in(allocator),
+            schemas: Vec::new_in(&allocator),
             is_signal: false,
         }
     }

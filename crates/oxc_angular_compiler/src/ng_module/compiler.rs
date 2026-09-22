@@ -14,7 +14,7 @@
 //! ```
 
 use oxc_allocator::{Allocator, Box, Vec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use super::metadata::{R3NgModuleMetadata, R3Reference};
 use crate::output::ast::{
@@ -49,7 +49,7 @@ pub fn compile_ng_module_from_metadata<'a>(
     allocator: &'a Allocator,
     metadata: &R3NgModuleMetadata<'a>,
 ) -> NgModuleCompileResult<'a> {
-    let mut statements = Vec::new_in(allocator);
+    let mut statements = Vec::new_in(&allocator);
 
     // Build the definition map
     let definition_map = build_definition_map(allocator, metadata);
@@ -78,24 +78,20 @@ fn build_definition_map<'a>(
     allocator: &'a Allocator,
     metadata: &R3NgModuleMetadata<'a>,
 ) -> Vec<'a, LiteralMapEntry<'a>> {
-    let mut entries = Vec::new_in(allocator);
+    let mut entries = Vec::new_in(&allocator);
 
     // type: ModuleClass
-    entries.push(LiteralMapEntry {
-        key: Ident::from("type"),
-        value: metadata.r#type.value.clone_in(allocator),
-        quoted: false,
-    });
+    entries.push(LiteralMapEntry::new(
+        Ident::from("type"),
+        metadata.r#type.value.clone_in(allocator),
+        false,
+    ));
 
     // bootstrap: [ComponentClass, ...]
     if metadata.has_bootstrap() {
         let bootstrap_array =
             create_reference_array(allocator, &metadata.bootstrap, metadata.contains_forward_decls);
-        entries.push(LiteralMapEntry {
-            key: Ident::from("bootstrap"),
-            value: bootstrap_array,
-            quoted: false,
-        });
+        entries.push(LiteralMapEntry::new(Ident::from("bootstrap"), bootstrap_array, false));
     }
 
     // Inline scope if mode is Inline
@@ -103,43 +99,35 @@ fn build_definition_map<'a>(
         // declarations: [DirectiveClass, PipeClass, ...]
         if metadata.has_declarations() {
             let declarations_array = create_reference_array(
-                allocator,
+                &allocator,
                 &metadata.declarations,
                 metadata.contains_forward_decls,
             );
-            entries.push(LiteralMapEntry {
-                key: Ident::from("declarations"),
-                value: declarations_array,
-                quoted: false,
-            });
+            entries.push(LiteralMapEntry::new(
+                Ident::from("declarations"),
+                declarations_array,
+                false,
+            ));
         }
 
         // imports: [ImportedModule, ...]
         if metadata.has_imports() {
             let imports_array = create_reference_array(
-                allocator,
+                &allocator,
                 &metadata.imports,
                 metadata.contains_forward_decls,
             );
-            entries.push(LiteralMapEntry {
-                key: Ident::from("imports"),
-                value: imports_array,
-                quoted: false,
-            });
+            entries.push(LiteralMapEntry::new(Ident::from("imports"), imports_array, false));
         }
 
         // exports: [ExportedClass, ...]
         if metadata.has_exports() {
             let exports_array = create_reference_array(
-                allocator,
+                &allocator,
                 &metadata.exports,
                 metadata.contains_forward_decls,
             );
-            entries.push(LiteralMapEntry {
-                key: Ident::from("exports"),
-                value: exports_array,
-                quoted: false,
-            });
+            entries.push(LiteralMapEntry::new(Ident::from("exports"), exports_array, false));
         }
     }
 
@@ -147,20 +135,12 @@ fn build_definition_map<'a>(
     if metadata.has_schemas() {
         let schemas_array =
             create_reference_array(allocator, &metadata.schemas, metadata.contains_forward_decls);
-        entries.push(LiteralMapEntry {
-            key: Ident::from("schemas"),
-            value: schemas_array,
-            quoted: false,
-        });
+        entries.push(LiteralMapEntry::new(Ident::from("schemas"), schemas_array, false));
     }
 
     // id: 'unique-module-id'
     if let Some(id) = &metadata.id {
-        entries.push(LiteralMapEntry {
-            key: Ident::from("id"),
-            value: id.clone_in(allocator),
-            quoted: false,
-        });
+        entries.push(LiteralMapEntry::new(Ident::from("id"), id.clone_in(allocator), false));
     }
 
     entries
@@ -173,28 +153,28 @@ fn create_reference_array<'a>(
     refs: &[R3Reference<'a>],
     wrap_in_function: bool,
 ) -> OutputExpression<'a> {
-    let mut items = Vec::new_in(allocator);
+    let mut items = Vec::new_in(&allocator);
     for r in refs {
         items.push(r.value.clone_in(allocator));
     }
 
     let array = OutputExpression::LiteralArray(Box::new_in(
         LiteralArrayExpr { entries: items, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     if wrap_in_function {
         // () => [Class1, Class2, ...]
-        let params = Vec::new_in(allocator);
-        let mut body = Vec::new_in(allocator);
+        let params = Vec::new_in(&allocator);
+        let mut body = Vec::new_in(&allocator);
         body.push(OutputStatement::Return(Box::new_in(
             ReturnStatement { value: array, source_span: None },
-            allocator,
+            &allocator,
         )));
 
         OutputExpression::Function(Box::new_in(
             FunctionExpr { name: None, params, statements: body, source_span: None },
-            allocator,
+            &allocator,
         ))
     } else {
         array
@@ -212,36 +192,36 @@ fn create_define_ng_module_call<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::DEFINE_NG_MODULE),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create the literal map expression
     let map_expr = OutputExpression::LiteralMap(Box::new_in(
         LiteralMapExpr { entries: definition_map, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     // Create the function call
-    let mut args = Vec::new_in(allocator);
+    let mut args = Vec::new_in(&allocator);
     args.push(map_expr);
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(define_ng_module_fn, allocator),
+            fn_expr: Box::new_in(define_ng_module_fn, &allocator),
             args,
             pure: true,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -268,44 +248,32 @@ fn create_set_scope_side_effect<'a>(
     }
 
     // Build the scope map
-    let mut scope_entries = Vec::new_in(allocator);
+    let mut scope_entries = Vec::new_in(&allocator);
 
     if metadata.has_declarations() {
         let decls = create_reference_array(
-            allocator,
+            &allocator,
             &metadata.declarations,
             metadata.contains_forward_decls,
         );
-        scope_entries.push(LiteralMapEntry {
-            key: Ident::from("declarations"),
-            value: decls,
-            quoted: false,
-        });
+        scope_entries.push(LiteralMapEntry::new(Ident::from("declarations"), decls, false));
     }
 
     if metadata.has_imports() {
         let imports =
             create_reference_array(allocator, &metadata.imports, metadata.contains_forward_decls);
-        scope_entries.push(LiteralMapEntry {
-            key: Ident::from("imports"),
-            value: imports,
-            quoted: false,
-        });
+        scope_entries.push(LiteralMapEntry::new(Ident::from("imports"), imports, false));
     }
 
     if metadata.has_exports() {
         let exports =
             create_reference_array(allocator, &metadata.exports, metadata.contains_forward_decls);
-        scope_entries.push(LiteralMapEntry {
-            key: Ident::from("exports"),
-            value: exports,
-            quoted: false,
-        });
+        scope_entries.push(LiteralMapEntry::new(Ident::from("exports"), exports, false));
     }
 
     let scope_map = OutputExpression::LiteralMap(Box::new_in(
         LiteralMapExpr { entries: scope_entries, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     // Create: ɵɵsetNgModuleScope(ModuleClass, scopeMap)
@@ -314,110 +282,110 @@ fn create_set_scope_side_effect<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::SET_NG_MODULE_SCOPE),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
-    let mut set_scope_args = Vec::new_in(allocator);
+    let mut set_scope_args = Vec::new_in(&allocator);
     set_scope_args.push(metadata.r#type.value.clone_in(allocator));
     set_scope_args.push(scope_map);
 
     let set_scope_call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(set_scope_fn, allocator),
+            fn_expr: Box::new_in(set_scope_fn, &allocator),
             args: set_scope_args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create: (typeof ngJitMode === "undefined" || ngJitMode)
     let typeof_expr = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from("typeof ngJitMode"), source_span: None },
-        allocator,
+        &allocator,
     ));
 
     let undefined_check = OutputExpression::BinaryOperator(Box::new_in(
         BinaryOperatorExpr {
             operator: BinaryOperator::Equals,
-            lhs: Box::new_in(typeof_expr, allocator),
+            lhs: Box::new_in(typeof_expr, &allocator),
             rhs: Box::new_in(
                 OutputExpression::Literal(Box::new_in(
                     LiteralExpr {
                         value: LiteralValue::String(Ident::from("undefined")),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     let ng_jit_mode = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from("ngJitMode"), source_span: None },
-        allocator,
+        &allocator,
     ));
 
     let jit_mode_check = OutputExpression::BinaryOperator(Box::new_in(
         BinaryOperatorExpr {
             operator: BinaryOperator::Or,
-            lhs: Box::new_in(undefined_check, allocator),
-            rhs: Box::new_in(ng_jit_mode, allocator),
+            lhs: Box::new_in(undefined_check, &allocator),
+            rhs: Box::new_in(ng_jit_mode, &allocator),
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create: (jitModeCheck) && setNgModuleScope(...)
     let guarded_call = OutputExpression::BinaryOperator(Box::new_in(
         BinaryOperatorExpr {
             operator: BinaryOperator::And,
-            lhs: Box::new_in(jit_mode_check, allocator),
-            rhs: Box::new_in(set_scope_call, allocator),
+            lhs: Box::new_in(jit_mode_check, &allocator),
+            rhs: Box::new_in(set_scope_call, &allocator),
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Wrap in IIFE: (function() { ... })()
-    let params = Vec::new_in(allocator);
-    let mut body = Vec::new_in(allocator);
+    let params = Vec::new_in(&allocator);
+    let mut body = Vec::new_in(&allocator);
     body.push(OutputStatement::Expression(Box::new_in(
         crate::output::ast::ExpressionStatement { expr: guarded_call, source_span: None },
-        allocator,
+        &allocator,
     )));
 
     let iife_fn = OutputExpression::Function(Box::new_in(
         FunctionExpr { name: None, params, statements: body, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     let iife_call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(iife_fn, allocator),
-            args: Vec::new_in(allocator),
+            fn_expr: Box::new_in(iife_fn, &allocator),
+            args: Vec::new_in(&allocator),
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     Some(OutputStatement::Expression(Box::new_in(
         crate::output::ast::ExpressionStatement { expr: iife_call, source_span: None },
-        allocator,
+        &allocator,
     )))
 }
 
@@ -432,35 +400,35 @@ fn create_register_ng_module_type<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::REGISTER_NG_MODULE_TYPE),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
-    let mut args = Vec::new_in(allocator);
+    let mut args = Vec::new_in(&allocator);
     args.push(module_type.clone_in(allocator));
     args.push(id.clone_in(allocator));
 
     let call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(register_fn, allocator),
+            fn_expr: Box::new_in(register_fn, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     OutputStatement::Expression(Box::new_in(
         crate::output::ast::ExpressionStatement { expr: call, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -475,7 +443,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("AppModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3NgModuleMetadataBuilder::new(&allocator)
@@ -497,11 +465,11 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("MyModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let component_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("MyComponent"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3NgModuleMetadataBuilder::new(&allocator)
@@ -525,15 +493,15 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("SharedModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let import_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("CommonModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let export_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("SharedComponent"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3NgModuleMetadataBuilder::new(&allocator)
@@ -559,11 +527,11 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("JitModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let decl_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("JitComponent"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3NgModuleMetadataBuilder::new(&allocator)
@@ -584,11 +552,11 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("ForwardModule"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let decl_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("ForwardComponent"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3NgModuleMetadataBuilder::new(&allocator)

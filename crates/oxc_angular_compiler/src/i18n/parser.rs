@@ -908,7 +908,7 @@ mod tests {
     use crate::ast::html::HtmlText;
     use crate::util::ParseSourceFile;
     use oxc_allocator::{Allocator, Box, Vec as AllocVec};
-    use oxc_span::Ident;
+    use oxc_str::Ident;
     use std::sync::Arc;
 
     #[test]
@@ -935,10 +935,10 @@ mod tests {
             value: Ident::from("Hello {{name}}!"),
             span: Span::default(),
             full_start: None,
-            tokens: AllocVec::new_in(&allocator),
+            tokens: AllocVec::new_in(&&allocator),
         };
 
-        let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
+        let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello {{name}}!", "<test>"));
         let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
@@ -966,10 +966,10 @@ mod tests {
             value: Ident::from("Hello World"),
             span: Span::default(),
             full_start: None,
-            tokens: AllocVec::new_in(&allocator),
+            tokens: AllocVec::new_in(&&allocator),
         };
 
-        let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
+        let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello World", "<test>"));
         let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
@@ -987,10 +987,10 @@ mod tests {
             value: Ident::from("{{greeting}} {{name}}!"),
             span: Span::default(),
             full_start: None,
-            tokens: AllocVec::new_in(&allocator),
+            tokens: AllocVec::new_in(&&allocator),
         };
 
-        let nodes = vec![HtmlNode::Text(Box::new_in(text, &allocator))];
+        let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("{{greeting}} {{name}}!", "<test>"));
         let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 

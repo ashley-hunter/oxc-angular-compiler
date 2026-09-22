@@ -29,6 +29,7 @@ mod util;
 pub mod ast;
 pub mod class_debug_info;
 pub mod class_metadata;
+pub mod compilation_mode;
 pub mod component;
 pub mod directive;
 pub mod dts;
@@ -43,16 +44,19 @@ pub mod ng_module;
 pub mod optimizer;
 pub mod output;
 pub mod parser;
+pub mod partial;
 pub mod pipe;
 pub mod pipeline;
 pub mod r3;
 pub mod schema;
+pub mod service;
 pub mod styles;
 pub mod transform;
 
 // Re-export key types
 pub use ast::expression::AngularExpression;
 pub use ast::r3::R3Node;
+pub use compilation_mode::CompilationMode;
 pub use transform::{HtmlToR3Transform, html_to_r3::html_ast_to_r3_ast};
 
 // Re-export component module types for convenience
@@ -92,14 +96,24 @@ pub use factory::{
     R3FactoryMetadata, compile_factory_function,
 };
 
+// Re-export partial-declaration emitters (library AOT)
+pub use partial::{
+    PartialComponentInputs, compile_component_declare_class_metadata,
+    compile_declare_class_metadata, compile_declare_class_metadata_async,
+    compile_declare_component_from_metadata, compile_declare_directive_from_metadata,
+    compile_declare_factory_function, compile_declare_injectable_from_metadata,
+    compile_declare_injector_from_metadata, compile_declare_ng_module_from_metadata,
+    compile_declare_pipe_from_metadata,
+};
+
 // Re-export directive types
 pub use directive::{
     DirectiveCompileResult, DirectiveDefinitions, QueryPredicate, R3DirectiveMetadata,
     R3DirectiveMetadataBuilder, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata,
-    R3QueryMetadata, compile_directive, compile_directive_from_metadata, extract_content_queries,
-    extract_directive_metadata, extract_host_bindings, extract_host_listeners,
-    extract_input_metadata, extract_output_metadata, extract_view_queries,
-    find_directive_decorator_span, generate_directive_definitions,
+    R3QueryMetadata, StringConsts, collect_string_consts, compile_directive,
+    compile_directive_from_metadata, extract_content_queries, extract_directive_metadata,
+    extract_host_bindings, extract_host_listeners, extract_input_metadata, extract_output_metadata,
+    extract_view_queries, find_directive_decorator_span, generate_directive_definitions,
 };
 
 // Re-export injectable types
@@ -108,6 +122,13 @@ pub use injectable::{
     R3InjectableMetadata, R3InjectableMetadataBuilder, compile_injectable,
     compile_injectable_from_metadata, extract_injectable_metadata, find_injectable_decorator_span,
     generate_injectable_definition, generate_injectable_definition_from_decorator,
+};
+
+// Re-export service types
+pub use service::{
+    R3ServiceMetadata, ServiceCompileResult, ServiceDefinition, ServiceMetadata, compile_service,
+    extract_service_metadata, find_service_decorator, find_service_decorator_span,
+    generate_service_definition, generate_service_definition_from_decorator,
 };
 
 // Re-export ng_module types

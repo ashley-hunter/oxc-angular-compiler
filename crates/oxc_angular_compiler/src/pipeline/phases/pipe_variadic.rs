@@ -32,7 +32,7 @@ pub fn create_variadic_pipes(job: &mut ComponentCompilationJob<'_>) {
             for op in view.update.iter_mut() {
                 transform_expressions_in_update_op(
                     op,
-                    &|expr, _flags| transform_pipe_binding(expr, allocator),
+                    &|expr, _flags| transform_pipe_binding(expr, &allocator),
                     VisitorContextFlag::NONE,
                 );
             }
@@ -54,19 +54,21 @@ fn transform_pipe_binding<'a>(
         let num_args = pipe.args.len() as u32;
 
         // Clone all arguments into a DerivedLiteralArray, preserving all IrExpression types
-        let mut entries = ArenaVec::with_capacity_in(pipe.args.len(), allocator);
+        let mut entries = ArenaVec::with_capacity_in(pipe.args.len(), &allocator);
+        let mut spreads = oxc_allocator::Vec::with_capacity_in(pipe.args.len(), &allocator);
         for arg in pipe.args.iter() {
             entries.push(arg.clone_in(allocator));
+            spreads.push(false);
         }
 
         // Create a DerivedLiteralArray to hold the arguments
         // This properly handles all IrExpression types, not just Ast
         let args_array = Box::new_in(
             IrExpression::DerivedLiteralArray(Box::new_in(
-                DerivedLiteralArrayExpr { entries, source_span: pipe.source_span },
-                allocator,
+                DerivedLiteralArrayExpr { entries, spreads, source_span: pipe.source_span },
+                &allocator,
             )),
-            allocator,
+            &allocator,
         );
 
         // Replace with variadic version
@@ -80,7 +82,7 @@ fn transform_pipe_binding<'a>(
                 var_offset: pipe.var_offset,
                 source_span: pipe.source_span,
             },
-            allocator,
+            &allocator,
         ));
     }
 }

@@ -9,7 +9,7 @@
 
 use std::ptr::NonNull;
 
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ir::enums::{I18nExpressionFor, I18nParamResolutionTime};
@@ -119,7 +119,7 @@ fn convert_i18n_text_in_view(job: &mut ComponentCompilationJob<'_>, view_xref: X
         icu_placeholder_by_text.insert(text_xref, icu_xref);
 
         // Create the IcuPlaceholder op with initial_value as the first string
-        let mut strings = oxc_allocator::Vec::new_in(allocator);
+        let mut strings = oxc_allocator::Vec::new_in(&allocator);
         strings.push(initial_value);
 
         let icu_placeholder_op = CreateOp::IcuPlaceholder(IcuPlaceholderOp {
@@ -127,7 +127,7 @@ fn convert_i18n_text_in_view(job: &mut ComponentCompilationJob<'_>, view_xref: X
             xref: icu_xref,
             name: icu_placeholder_name,
             strings,
-            expression_placeholders: oxc_allocator::Vec::new_in(allocator),
+            expression_placeholders: oxc_allocator::Vec::new_in(&allocator),
         });
 
         // Replace the Text op with the IcuPlaceholder op
@@ -261,10 +261,13 @@ fn convert_i18n_text_in_view(job: &mut ComponentCompilationJob<'_>, view_xref: X
                         target: info.i18n_xref,
                         context: context_id,
                         handle: info.i18n_handle,
-                        expression: oxc_allocator::Box::new_in(expr.clone_in(allocator), allocator),
+                        expression: oxc_allocator::Box::new_in(
+                            expr.clone_in(allocator),
+                            &allocator,
+                        ),
                         resolution_time,
                         usage: I18nExpressionFor::I18nText,
-                        name: oxc_span::Ident::from(""),
+                        name: Ident::from(""),
                         i18n_placeholder,
                         icu_placeholder: info.icu_placeholder_xref,
                     }));
@@ -305,11 +308,11 @@ fn convert_i18n_text_in_view(job: &mut ComponentCompilationJob<'_>, view_xref: X
                     handle: info.i18n_handle,
                     expression: oxc_allocator::Box::new_in(
                         interpolation.clone_in(allocator),
-                        allocator,
+                        &allocator,
                     ),
                     resolution_time,
                     usage: I18nExpressionFor::I18nText,
-                    name: oxc_span::Ident::from(""),
+                    name: Ident::from(""),
                     i18n_placeholder: None,
                     icu_placeholder: info.icu_placeholder_xref,
                 }));

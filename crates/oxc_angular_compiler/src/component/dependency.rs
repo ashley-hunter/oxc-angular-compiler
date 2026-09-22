@@ -9,7 +9,7 @@
 //! Ported from: `packages/compiler/src/render3/r3_factory.ts`
 
 use oxc_allocator::{Allocator, Box, Vec as OxcVec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use super::namespace_registry::NamespaceRegistry;
 use crate::output::ast::{
@@ -45,6 +45,12 @@ pub struct R3DependencyMetadata<'a> {
     /// `DIALOG_DATA` directly instead of `i1.DIALOG_DATA`.
     pub has_named_import: bool,
 
+    /// The module's exported name for this token, when it differs from the local
+    /// binding (i.e. an aliased import `import { Foo as Bar }` → `Some("Foo")`).
+    /// A namespace member access (`i1.X`) must use the export name, not the local
+    /// alias, or it resolves to `undefined` at runtime.
+    pub token_imported_name: Option<Ident<'a>>,
+
     /// For `@Attribute()` dependencies, the attribute name.
     /// `None` for regular dependencies.
     pub attribute_name: Option<Ident<'a>>,
@@ -60,6 +66,15 @@ pub struct R3DependencyMetadata<'a> {
 
     /// Whether `@SkipSelf()` decorator is present.
     pub skip_self: bool,
+
+    /// Whether this dependency's token came from a type-only import
+    /// (`import type { X }` or `import { type X }`).
+    ///
+    /// Such imports are erased at runtime, so the token cannot be resolved to a
+    /// value. When this flag is set on any constructor dependency, the factory
+    /// as a whole becomes `ɵɵinvalidFactory()` — matching Angular's
+    /// `ValueUnavailableKind.TYPE_ONLY_IMPORT` behaviour. See issue #288.
+    pub type_only_invalid: bool,
 }
 
 impl<'a> R3DependencyMetadata<'a> {
@@ -69,11 +84,13 @@ impl<'a> R3DependencyMetadata<'a> {
             token: Some(token),
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: None,
             host: false,
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         }
     }
 
@@ -83,11 +100,32 @@ impl<'a> R3DependencyMetadata<'a> {
             token: None,
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: None,
             host: false,
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
+        }
+    }
+
+    /// Create an invalid dependency caused by a type-only import.
+    ///
+    /// Used when a constructor parameter's type annotation resolves to a
+    /// type-only import. The whole factory must become `ɵɵinvalidFactory()`.
+    pub fn type_only_invalid() -> Self {
+        Self {
+            token: None,
+            token_source_module: None,
+            has_named_import: false,
+            token_imported_name: None,
+            attribute_name: None,
+            host: false,
+            optional: false,
+            self_: false,
+            skip_self: false,
+            type_only_invalid: true,
         }
     }
 
@@ -121,11 +159,13 @@ impl<'a> R3DependencyMetadata<'a> {
             token: Some(attribute_name.clone()),
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: Some(attribute_name),
             host: false,
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         }
     }
 
@@ -236,7 +276,7 @@ pub fn compile_inject_dependencies<'a>(
     target: FactoryTarget,
     namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> OxcVec<'a, OutputExpression<'a>> {
-    let mut args = OxcVec::with_capacity_in(deps.len(), allocator);
+    let mut args = OxcVec::with_capacity_in(deps.len(), &allocator);
 
     for (index, dep) in deps.iter().enumerate() {
         args.push(compile_inject_dependency(allocator, dep, target, index, namespace_registry));
@@ -333,7 +373,7 @@ fn create_token_expression<'a>(
             // allows using `DIALOG_DATA` directly instead of `i1.DIALOG_DATA`
             return OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: token_name.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
         }
 
@@ -344,21 +384,22 @@ fn create_token_expression<'a>(
                 receiver: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: namespace, source_span: None },
-                        allocator,
+                        &allocator,
                     )),
-                    allocator,
+                    &allocator,
                 ),
-                name: token_name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: dep.token_imported_name.clone().unwrap_or_else(|| token_name.clone()),
                 optional: false,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ))
     } else {
         // Local dependency - use bare token name
         OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: token_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ))
     }
 }
@@ -370,21 +411,21 @@ fn create_invalid_factory_dep_call<'a>(
 ) -> OutputExpression<'a> {
     let fn_expr = create_angular_fn_ref(allocator, Identifiers::INVALID_FACTORY_DEP);
 
-    let mut args = OxcVec::with_capacity_in(1, allocator);
+    let mut args = OxcVec::with_capacity_in(1, &allocator);
     args.push(OutputExpression::Literal(Box::new_in(
         LiteralExpr { value: LiteralValue::Number(index as f64), source_span: None },
-        allocator,
+        &allocator,
     )));
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(fn_expr, allocator),
+            fn_expr: Box::new_in(fn_expr, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -395,22 +436,22 @@ fn create_inject_attribute_call<'a>(
 ) -> OutputExpression<'a> {
     let fn_expr = create_angular_fn_ref(allocator, Identifiers::INJECT_ATTRIBUTE);
 
-    let mut args = OxcVec::with_capacity_in(1, allocator);
+    let mut args = OxcVec::with_capacity_in(1, &allocator);
     // Attribute name is passed as a string literal
     args.push(OutputExpression::Literal(Box::new_in(
         LiteralExpr { value: LiteralValue::String(attr_name), source_span: None },
-        allocator,
+        &allocator,
     )));
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(fn_expr, allocator),
+            fn_expr: Box::new_in(fn_expr, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -427,7 +468,7 @@ fn create_inject_call_with_expr<'a>(
     let fn_expr = create_angular_fn_ref(allocator, fn_name);
 
     let capacity = if flags.is_some() { 2 } else { 1 };
-    let mut args = OxcVec::with_capacity_in(capacity, allocator);
+    let mut args = OxcVec::with_capacity_in(capacity, &allocator);
 
     // Token expression (may be a variable reference or namespaced property access)
     args.push(token_expr);
@@ -435,19 +476,19 @@ fn create_inject_call_with_expr<'a>(
     if let Some(flags_value) = flags {
         args.push(OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(flags_value as f64), source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(fn_expr, allocator),
+            fn_expr: Box::new_in(fn_expr, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -461,15 +502,15 @@ fn create_angular_fn_ref<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(fn_name),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -506,6 +547,23 @@ mod tests {
         assert!(js.contains("ɵɵdirectiveInject"));
         assert!(js.contains("MyService"));
         assert!(!js.contains(",")); // No flags argument
+    }
+
+    #[test]
+    fn test_aliased_import_uses_exported_name() {
+        // Aliased DI token must use export name on the namespace object.
+        let allocator = Allocator::default();
+        let mut dep = R3DependencyMetadata::new(Ident::from("LocalAlias"));
+        dep.token_source_module = Some(Ident::from("@scope/pkg"));
+        dep.token_imported_name = Some(Ident::from("ExportedName"));
+        let mut registry = NamespaceRegistry::new(&allocator);
+
+        let result =
+            compile_inject_dependency(&allocator, &dep, FactoryTarget::Component, 0, &mut registry);
+        let js = JsEmitter::new().emit_expression(&result);
+
+        assert!(js.contains("ExportedName"), "should use exported name: {js}");
+        assert!(!js.contains("LocalAlias"), "must not use local alias: {js}");
     }
 
     #[test]

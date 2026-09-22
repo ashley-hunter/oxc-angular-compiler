@@ -123,6 +123,38 @@ generateHmrModule(
 ): string
 ```
 
+##### HMR + reload behavior matrix
+
+The Vite plugin's `handleHotUpdate` hook dispatches every file change
+into one of these branches, mirroring Angular CLI's official behavior
+(`@angular/build` esbuild dev server):
+
+| File                                                                 | Change                                    | Action                                    |
+| -------------------------------------------------------------------- | ----------------------------------------- | ----------------------------------------- |
+| External `.html` (templateUrl)                                       | any                                       | `angular:component-update` HMR, no reload |
+| External `.css/.scss/.sass/.less` (styleUrl)                         | any                                       | `angular:component-update` HMR, no reload |
+| Component `.ts`                                                      | inline template only                      | `angular:component-update` HMR, no reload |
+| Component `.ts`                                                      | inline `styles: [...]` only               | `angular:component-update` HMR, no reload |
+| Component `.ts`                                                      | both inline template and styles           | `angular:component-update` HMR, no reload |
+| Component `.ts`                                                      | class body / imports / decorator metadata | full reload                               |
+| Non-component `.ts` (utils, services, constants, lazy `*.routes.ts`) | any                                       | full reload                               |
+| Global stylesheet (no `styleUrl` owner)                              | any                                       | Vite default style HMR                    |
+| Anything in `node_modules/` or `*.spec.ts`                           | any                                       | ignore                                    |
+
+Set `liveReload: false` to disable both HMR and reloads — the plugin
+returns from `handleHotUpdate` without sending any event.
+
+"No reload" means no reload is requested. Vite full-reloads any changed
+`.html` whose module list is empty or holds no `js` module, so the plugin
+registers each component template in the module graph (`addWatchFile`) and
+returns it as its own HMR boundary. Without that, Vite puts a `full-reload`
+on the socket on top of every template edit. Its client usually drops that
+payload because the path does not match `location.pathname` — but in
+`middlewareMode` the path is `*`, which always reloads
+([#443](https://github.com/voidzero-dev/oxc-angular-compiler/issues/443)).
+
+`index.html` is not a component template, so it still triggers a full reload.
+
 ### Transform Options
 
 ```typescript
@@ -196,13 +228,41 @@ interface PluginOptions {
 
 For `"auto"`, the plugin uses `build.cssMinify` when it is set, otherwise it falls back to `build.minify`. In dev, `"auto"` defaults to `false`.
 
+### Library builds (`.d.ts`)
+
+For publishing an Angular library (the ng-packagr-style workflow, e.g. with
+Rolldown/tsdown), set `compilationMode: 'partial'`. This emits partial
+declarations (`ɵɵngDeclareComponent`, …) in the JavaScript output, and the
+plugin also augments the emitted `.d.ts` with Angular's Ivy type declarations
+(`static ɵfac`, `static ɵcmp`, …) so downstream consumers get full template
+type-checking against your library.
+
+```typescript
+// vite.config.ts — Angular library build
+import { angular } from '@oxc-angular/vite'
+import dts from 'rolldown-plugin-dts' // or vite-plugin-dts / tsdown
+
+export default defineConfig({
+  plugins: [angular({ compilationMode: 'partial' }), dts()],
+  build: { lib: { entry: 'src/public-api.ts', formats: ['es'] } },
+})
+```
+
+The plugin does **not** generate the base `.d.ts` itself — a declaration
+generator (`rolldown-plugin-dts`, `vite-plugin-dts`, `tsdown`, or `tsc`) must
+produce them. The Angular members are then spliced into those files during
+`generateBundle`. The injected members reference `i0` (the `@angular/core`
+namespace), and the plugin adds `import * as i0 from "@angular/core";` to any
+`.d.ts` it augments.
+
 ## Vite Plugin Architecture
 
-The Vite plugin consists of three sub-plugins:
+The Vite plugin consists of these sub-plugins:
 
 1. **Transform Plugin** - Transforms Angular TypeScript files
 2. **HMR Plugin** - Handles hot module replacement for templates and styles
 3. **Styles Plugin** - Processes and encapsulates component styles
+4. **Dts Plugin** - Augments library `.d.ts` with Ivy type declarations (partial mode)
 
 ### HMR Routes
 

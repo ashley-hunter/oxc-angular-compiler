@@ -673,6 +673,11 @@ impl Identifiers {
     /// Injectable declaration type.
     pub const INJECTABLE_DECLARATION: &'static str = "ɵɵInjectableDeclaration";
 
+    /// Define a service (Angular v22+ `@Service`). The declared static field is
+    /// still `ɵprov` and the `.d.ts` type is still `ɵɵInjectableDeclaration` —
+    /// only the initializer call changes.
+    pub const DEFINE_SERVICE: &'static str = "ɵɵdefineService";
+
     // ========================================================================
     // Resolution Instructions
     // ========================================================================
@@ -906,6 +911,9 @@ impl Identifiers {
 
     /// Validate attribute.
     pub const VALIDATE_ATTRIBUTE: &'static str = "ɵɵvalidateAttribute";
+
+    /// Validate iframe attribute.
+    pub const VALIDATE_IFRAME_ATTRIBUTE: &'static str = "ɵɵvalidateIframeAttribute";
 
     /// Sanitize resource URL.
     pub const SANITIZE_RESOURCE_URL: &'static str = "ɵɵsanitizeResourceUrl";

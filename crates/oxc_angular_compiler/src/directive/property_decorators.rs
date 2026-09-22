@@ -16,7 +16,7 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
     MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
 };
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use super::metadata::{QueryPredicate, R3InputMetadata, R3QueryMetadata};
 use crate::output::ast::OutputExpression;
@@ -103,18 +103,16 @@ fn try_unwrap_forward_ref<'a>(expr: &'a Expression<'a>) -> Option<&'a Expression
         _ => return None,
     };
 
-    // Handle expression body: () => MyClass
-    if arrow.expression {
-        // For expression body, the statement is the expression wrapped in ExpressionStatement
-        let stmt = arrow.body.statements.first()?;
-        if let oxc_ast::ast::Statement::ExpressionStatement(expr_stmt) = stmt {
-            return Some(&expr_stmt.expression);
-        }
-    } else if arrow.body.statements.len() == 1 {
-        // Handle explicit return: () => { return MyClass; }
-        let stmt = arrow.body.statements.first()?;
-        if let oxc_ast::ast::Statement::ReturnStatement(ret) = stmt {
-            return ret.argument.as_ref();
+    // Expression body: () => MyClass
+    if let Some(expr) = arrow.get_expression() {
+        return Some(expr);
+    }
+    // Block body: () => { return MyClass; }
+    if let Some(body) = arrow.get_function_body() {
+        if body.statements.len() == 1 {
+            if let oxc_ast::ast::Statement::ReturnStatement(ret) = &body.statements[0] {
+                return ret.argument.as_ref();
+            }
         }
     }
 
@@ -150,6 +148,7 @@ impl<'a> Default for InputConfig<'a> {
 fn parse_input_config<'a>(
     allocator: &'a Allocator,
     decorator: &'a Decorator<'a>,
+    source_text: Option<&'a str>,
 ) -> InputConfig<'a> {
     let Expression::CallExpression(call) = &decorator.expression else {
         return InputConfig::default();
@@ -183,7 +182,8 @@ fn parse_input_config<'a>(
                             config.required = extract_boolean_value(&prop.value).unwrap_or(false);
                         }
                         "transform" => {
-                            config.transform = convert_oxc_expression(allocator, &prop.value);
+                            config.transform =
+                                convert_oxc_expression(allocator, &prop.value, source_text);
                         }
                         _ => {}
                     }
@@ -200,12 +200,12 @@ fn parse_input_config<'a>(
 /// Metadata for a model() signal, which creates both an input and an output.
 ///
 /// Based on Angular's `ModelMapping` in `model_function.ts`.
-struct ModelMapping<'a> {
+pub(crate) struct ModelMapping<'a> {
     /// The input metadata (signal-based).
-    input: R3InputMetadata<'a>,
+    pub(crate) input: R3InputMetadata<'a>,
     /// The output metadata (class property name, binding property name).
     /// Output binding name is always `inputName + "Change"`.
-    output: (Ident<'a>, Ident<'a>),
+    pub(crate) output: (Ident<'a>, Ident<'a>),
 }
 
 /// Try to detect and parse a signal-based model from a property initializer.
@@ -221,13 +221,13 @@ struct ModelMapping<'a> {
 /// ```
 ///
 /// Based on Angular's `model_function.ts` in the compiler-cli.
-fn try_parse_signal_model<'a>(
+pub(crate) fn try_parse_signal_model<'a>(
     allocator: &'a Allocator,
     value: &Expression<'a>,
     property_name: Ident<'a>,
 ) -> Option<ModelMapping<'a>> {
-    // Check if the value is a call expression
-    let call_expr = match value {
+    // Check if the value is a call expression (unwrapping `as`/parenthesized).
+    let call_expr = match unwrap_initializer_api_expr(value) {
         Expression::CallExpression(call) => call,
         _ => return None,
     };
@@ -238,11 +238,12 @@ fn try_parse_signal_model<'a>(
         Expression::Identifier(id) if id.name == "model" => false,
         // model.required() - member expression call
         Expression::StaticMemberExpression(member) => {
-            // Check for model.required
+            // Check for model.required / core.model.required
             if member.property.name == "required" {
-                match &member.object {
-                    Expression::Identifier(id) if id.name == "model" => true,
-                    _ => return None,
+                if is_initializer_fn_reference(&member.object, "model") {
+                    true
+                } else {
+                    return None;
                 }
             } else if member.property.name == "model" {
                 // Handle namespaced calls like `core.model()`
@@ -311,68 +312,63 @@ fn try_parse_signal_model<'a>(
 
 /// Try to detect and parse a signal-based output from a property initializer.
 ///
-/// Signal-based outputs are created by calling `output()` or `output<T>()`
-/// from `@angular/core`. Unlike `model()`, they only create an output (no input).
+/// Signal-based outputs are created by calling `output()` or `output<T>()` from
+/// `@angular/core`, or `outputFromObservable()` from `@angular/core/rxjs-interop`.
+/// Unlike `model()`, they only create an output (no input).
 ///
-/// # Examples
-/// ```typescript
-/// readonly openChange = output<boolean>(); // creates output 'openChange'
-/// readonly clicked = output();             // creates output 'clicked'
-/// readonly aliased = output<string>({ alias: 'myAlias' }); // creates output 'myAlias'
-/// ```
+/// For `output()` the options object is the first argument.
+/// For `outputFromObservable(observable, options?)` the options are the second argument;
+/// the observable expression is irrelevant for metadata extraction.
 ///
 /// Based on Angular's `output_function.ts` in the compiler-cli.
-fn try_parse_signal_output<'a>(
+pub(crate) fn try_parse_signal_output<'a>(
     value: &Expression<'a>,
     property_name: Ident<'a>,
 ) -> Option<(Ident<'a>, Ident<'a>)> {
-    // Check if the value is a call expression
-    let call_expr = match value {
+    let call_expr = match unwrap_initializer_api_expr(value) {
         Expression::CallExpression(call) => call,
         _ => return None,
     };
 
-    // Check if this is output() - note that output() does NOT support .required()
-    let is_output = match &call_expr.callee {
-        // output() - simple identifier call
-        Expression::Identifier(id) if id.name == "output" => true,
-        // Handle namespaced calls like `core.output()`
+    // Detect which output initializer is called and whether options are at index 0 or 1.
+    let is_from_observable = match &call_expr.callee {
+        Expression::Identifier(id) => match id.name.as_str() {
+            "output" => false,
+            "outputFromObservable" => true,
+            _ => return None,
+        },
+        // Handle namespaced calls like `core.output()` or `rxjs.outputFromObservable()`
         Expression::StaticMemberExpression(member) => {
-            if member.property.name == "output" {
-                matches!(&member.object, Expression::Identifier(_))
-            } else {
-                false
+            if !matches!(&member.object, Expression::Identifier(_)) {
+                return None;
+            }
+            match member.property.name.as_str() {
+                "output" => false,
+                "outputFromObservable" => true,
+                _ => return None,
             }
         }
-        _ => false,
+        _ => return None,
     };
 
-    if !is_output {
-        return None;
-    }
-
-    // Parse options from the first argument (options are the first arg for output())
-    // Options can contain an alias
+    // output() → options at index 0; outputFromObservable(obs, options?) → options at index 1
+    let options_idx = if is_from_observable { 1 } else { 0 };
     let mut alias: Option<Ident<'a>> = None;
 
-    if let Some(first_arg) = call_expr.arguments.first() {
-        if let Argument::ObjectExpression(obj) = first_arg {
-            for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop {
-                    let Some(key_name) = get_property_key_name(&prop.key) else {
-                        continue;
-                    };
-
-                    if key_name.as_str() == "alias" {
-                        alias = extract_string_value(&prop.value);
-                    }
+    if let Some(Argument::ObjectExpression(obj)) = call_expr.arguments.get(options_idx) {
+        for prop in &obj.properties {
+            if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+                let Some(key_name) = get_property_key_name(&prop.key) else {
+                    continue;
+                };
+                if key_name.as_str() == "alias" {
+                    alias = extract_string_value(&prop.value);
                 }
             }
         }
     }
 
     let binding_property_name = alias.unwrap_or_else(|| property_name.clone());
-
     Some((property_name, binding_property_name))
 }
 
@@ -390,13 +386,39 @@ fn try_parse_signal_output<'a>(
 /// ```
 ///
 /// Based on Angular's `input_function.ts` in the compiler-cli.
-fn try_parse_signal_input<'a>(
+/// Unwrap `as`/`satisfies`/parenthesized wrappers around an initializer-API call
+/// expression, matching ngc's `tryParseInitializerApi` which recurses through
+/// `isAsExpression` and `isParenthesizedExpression` (e.g. `x = input(0) as any`,
+/// `x = (input(0))`).
+pub(crate) fn unwrap_initializer_api_expr<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
+    match expr {
+        Expression::TSAsExpression(e) => unwrap_initializer_api_expr(&e.expression),
+        Expression::ParenthesizedExpression(e) => unwrap_initializer_api_expr(&e.expression),
+        _ => expr,
+    }
+}
+
+/// Returns `true` when `object` is the `input`/`model`/etc. reference for a
+/// namespaced call, i.e. either a bare `<fn>` identifier or `<ns>.<fn>` member
+/// access. Used to recognize `<fn>.required()` and `core.<fn>.required()`.
+fn is_initializer_fn_reference(object: &Expression<'_>, function_name: &str) -> bool {
+    match object {
+        Expression::Identifier(id) => id.name == function_name,
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == function_name
+                && matches!(&member.object, Expression::Identifier(_))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn try_parse_signal_input<'a>(
     _allocator: &'a Allocator,
     value: &Expression<'a>,
     property_name: Ident<'a>,
 ) -> Option<R3InputMetadata<'a>> {
-    // Check if the value is a call expression
-    let call_expr = match value {
+    // Check if the value is a call expression (unwrapping `as`/parenthesized).
+    let call_expr = match unwrap_initializer_api_expr(value) {
         Expression::CallExpression(call) => call,
         _ => return None,
     };
@@ -407,11 +429,12 @@ fn try_parse_signal_input<'a>(
         Expression::Identifier(id) if id.name == "input" => false,
         // input.required() - member expression call
         Expression::StaticMemberExpression(member) => {
-            // Check for input.required
+            // Check for input.required / core.input.required
             if member.property.name == "required" {
-                match &member.object {
-                    Expression::Identifier(id) if id.name == "input" => true,
-                    _ => return None,
+                if is_initializer_fn_reference(&member.object, "input") {
+                    true
+                } else {
+                    return None;
                 }
             } else if member.property.name == "input" {
                 // Handle namespaced calls like `core.input()`
@@ -484,8 +507,9 @@ fn try_parse_signal_input<'a>(
 pub fn extract_input_metadata<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Vec<'a, R3InputMetadata<'a>> {
-    let mut inputs = Vec::new_in(allocator);
+    let mut inputs = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         match element {
@@ -496,7 +520,7 @@ pub fn extract_input_metadata<'a>(
                         continue;
                     };
 
-                    let config = parse_input_config(allocator, decorator);
+                    let config = parse_input_config(allocator, decorator, source_text);
 
                     let binding_property_name =
                         config.alias.unwrap_or_else(|| class_property_name.clone());
@@ -537,7 +561,7 @@ pub fn extract_input_metadata<'a>(
                     continue;
                 };
 
-                let config = parse_input_config(allocator, decorator);
+                let config = parse_input_config(allocator, decorator, source_text);
 
                 let binding_property_name =
                     config.alias.unwrap_or_else(|| class_property_name.clone());
@@ -561,7 +585,7 @@ pub fn extract_input_metadata<'a>(
                     continue;
                 };
 
-                let config = parse_input_config(allocator, decorator);
+                let config = parse_input_config(allocator, decorator, source_text);
 
                 let binding_property_name =
                     config.alias.unwrap_or_else(|| class_property_name.clone());
@@ -636,7 +660,7 @@ pub fn extract_output_metadata<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
 ) -> Vec<'a, (Ident<'a>, Ident<'a>)> {
-    let mut outputs = Vec::new_in(allocator);
+    let mut outputs = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         match element {
@@ -754,6 +778,7 @@ fn parse_query_config<'a>(
     allocator: &'a Allocator,
     decorator: &'a Decorator<'a>,
     decorator_name: &str,
+    source_text: Option<&'a str>,
 ) -> QueryConfig<'a> {
     let Expression::CallExpression(call) = &decorator.expression else {
         return QueryConfig::default_for(decorator_name);
@@ -769,7 +794,7 @@ fn parse_query_config<'a>(
     match first_arg {
         // @ViewChild('refName') - string selector
         Argument::StringLiteral(lit) => {
-            let mut selectors = Vec::new_in(allocator);
+            let mut selectors = Vec::new_in(&allocator);
             selectors.push(lit.value.clone().into());
             config.predicate = Some(QueryPredicate::Selectors(selectors));
         }
@@ -779,7 +804,9 @@ fn parse_query_config<'a>(
             let expr = first_arg.to_expression();
             // Unwrap forwardRef if present - Angular doesn't include forwardRef in compiled output
             let unwrapped_expr = try_unwrap_forward_ref(expr).unwrap_or(expr);
-            if let Some(output_expr) = convert_oxc_expression(allocator, unwrapped_expr) {
+            if let Some(output_expr) =
+                convert_oxc_expression(allocator, unwrapped_expr, source_text)
+            {
                 config.predicate = Some(QueryPredicate::Type(output_expr));
             }
         }
@@ -799,7 +826,8 @@ fn parse_query_config<'a>(
                             config.is_static = extract_boolean_value(&prop.value).unwrap_or(false);
                         }
                         "read" => {
-                            config.read = convert_oxc_expression(allocator, &prop.value);
+                            config.read =
+                                convert_oxc_expression(allocator, &prop.value, source_text);
                         }
                         "descendants" => {
                             // Use the decorator-specific default if not explicitly set
@@ -866,9 +894,10 @@ fn try_parse_signal_query<'a>(
     allocator: &'a Allocator,
     value: &'a Expression<'a>,
     property_name: Ident<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<(SignalQueryType, R3QueryMetadata<'a>)> {
-    // Check if the value is a call expression
-    let call_expr = match value {
+    // Check if the value is a call expression (unwrapping `as`/parenthesized).
+    let call_expr = match unwrap_initializer_api_expr(value) {
         Expression::CallExpression(call) => call,
         _ => return None,
     };
@@ -932,7 +961,7 @@ fn try_parse_signal_query<'a>(
     let predicate = match predicate_arg {
         // String selector: viewChild('myRef')
         Argument::StringLiteral(lit) => {
-            let mut selectors = oxc_allocator::Vec::new_in(allocator);
+            let mut selectors = oxc_allocator::Vec::new_in(&allocator);
             selectors.push(lit.value.clone().into());
             QueryPredicate::Selectors(selectors)
         }
@@ -941,7 +970,7 @@ fn try_parse_signal_query<'a>(
             let expr = predicate_arg.to_expression();
             // Unwrap forwardRef if present - Angular doesn't include forwardRef in compiled output
             let unwrapped_expr = try_unwrap_forward_ref(expr).unwrap_or(expr);
-            let output_expr = convert_oxc_expression(allocator, unwrapped_expr)?;
+            let output_expr = convert_oxc_expression(allocator, unwrapped_expr, source_text)?;
             QueryPredicate::Type(output_expr)
         }
     };
@@ -960,7 +989,7 @@ fn try_parse_signal_query<'a>(
 
                     match key_name.as_str() {
                         "read" => {
-                            read = convert_oxc_expression(allocator, &prop.value);
+                            read = convert_oxc_expression(allocator, &prop.value, source_text);
                         }
                         "descendants" => {
                             descendants = extract_boolean_value(&prop.value).unwrap_or(descendants);
@@ -1007,6 +1036,7 @@ fn try_parse_signal_query<'a>(
 pub fn extract_view_queries<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Vec<'a, R3QueryMetadata<'a>> {
     // Use separate vectors to match Angular's ordering approach.
     // Angular groups queries by type, maintaining declaration order within each group:
@@ -1015,9 +1045,9 @@ pub fn extract_view_queries<'a>(
     // 3. @ViewChildren decorator queries
     //
     // See: packages/compiler-cli/src/ngtsc/annotations/directive/src/shared.ts
-    let mut signal_queries = Vec::new_in(allocator);
-    let mut view_child_queries = Vec::new_in(allocator);
-    let mut view_children_queries = Vec::new_in(allocator);
+    let mut signal_queries = Vec::new_in(&allocator);
+    let mut view_child_queries = Vec::new_in(&allocator);
+    let mut view_children_queries = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         match element {
@@ -1026,7 +1056,7 @@ pub fn extract_view_queries<'a>(
                 if let Some(value) = &prop.value {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
                         if let Some((query_type, metadata)) =
-                            try_parse_signal_query(allocator, value, property_name)
+                            try_parse_signal_query(allocator, value, property_name, source_text)
                         {
                             if query_type.is_view_query() {
                                 signal_queries.push(metadata);
@@ -1039,7 +1069,8 @@ pub fn extract_view_queries<'a>(
                 // Check for decorator-based queries (@ViewChild, @ViewChildren)
                 if let Some(decorator) = find_decorator_by_name(&prop.decorators, "ViewChild") {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
-                        let config = parse_query_config(allocator, decorator, "ViewChild");
+                        let config =
+                            parse_query_config(allocator, decorator, "ViewChild", source_text);
                         if let Some(predicate) = config.predicate {
                             view_child_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1057,7 +1088,8 @@ pub fn extract_view_queries<'a>(
                     find_decorator_by_name(&prop.decorators, "ViewChildren")
                 {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
-                        let config = parse_query_config(allocator, decorator, "ViewChildren");
+                        let config =
+                            parse_query_config(allocator, decorator, "ViewChildren", source_text);
                         if let Some(predicate) = config.predicate {
                             view_children_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1079,7 +1111,8 @@ pub fn extract_view_queries<'a>(
                 // Check for decorator-based queries on setters/getters
                 if let Some(decorator) = find_decorator_by_name(&method.decorators, "ViewChild") {
                     if let Some(property_name) = get_property_key_name(&method.key) {
-                        let config = parse_query_config(allocator, decorator, "ViewChild");
+                        let config =
+                            parse_query_config(allocator, decorator, "ViewChild", source_text);
                         if let Some(predicate) = config.predicate {
                             view_child_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1097,7 +1130,8 @@ pub fn extract_view_queries<'a>(
                     find_decorator_by_name(&method.decorators, "ViewChildren")
                 {
                     if let Some(property_name) = get_property_key_name(&method.key) {
-                        let config = parse_query_config(allocator, decorator, "ViewChildren");
+                        let config =
+                            parse_query_config(allocator, decorator, "ViewChildren", source_text);
                         if let Some(predicate) = config.predicate {
                             view_children_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1118,7 +1152,7 @@ pub fn extract_view_queries<'a>(
     }
 
     // Concatenate in Angular's order: signals first, then ViewChild, then ViewChildren
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
     result.extend(signal_queries);
     result.extend(view_child_queries);
     result.extend(view_children_queries);
@@ -1145,6 +1179,7 @@ pub fn extract_view_queries<'a>(
 pub fn extract_content_queries<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Vec<'a, R3QueryMetadata<'a>> {
     // Use separate vectors to match Angular's ordering approach.
     // Angular groups queries by type, maintaining declaration order within each group:
@@ -1153,9 +1188,9 @@ pub fn extract_content_queries<'a>(
     // 3. @ContentChildren decorator queries
     //
     // See: packages/compiler-cli/src/ngtsc/annotations/directive/src/shared.ts
-    let mut signal_queries = Vec::new_in(allocator);
-    let mut content_child_queries = Vec::new_in(allocator);
-    let mut content_children_queries = Vec::new_in(allocator);
+    let mut signal_queries = Vec::new_in(&allocator);
+    let mut content_child_queries = Vec::new_in(&allocator);
+    let mut content_children_queries = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         match element {
@@ -1164,7 +1199,7 @@ pub fn extract_content_queries<'a>(
                 if let Some(value) = &prop.value {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
                         if let Some((query_type, metadata)) =
-                            try_parse_signal_query(allocator, value, property_name)
+                            try_parse_signal_query(allocator, value, property_name, source_text)
                         {
                             if !query_type.is_view_query() {
                                 signal_queries.push(metadata);
@@ -1177,7 +1212,8 @@ pub fn extract_content_queries<'a>(
                 // Check for decorator-based queries (@ContentChild, @ContentChildren)
                 if let Some(decorator) = find_decorator_by_name(&prop.decorators, "ContentChild") {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
-                        let config = parse_query_config(allocator, decorator, "ContentChild");
+                        let config =
+                            parse_query_config(allocator, decorator, "ContentChild", source_text);
                         if let Some(predicate) = config.predicate {
                             content_child_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1195,7 +1231,12 @@ pub fn extract_content_queries<'a>(
                     find_decorator_by_name(&prop.decorators, "ContentChildren")
                 {
                     if let Some(property_name) = get_property_key_name(&prop.key) {
-                        let config = parse_query_config(allocator, decorator, "ContentChildren");
+                        let config = parse_query_config(
+                            &allocator,
+                            decorator,
+                            "ContentChildren",
+                            source_text,
+                        );
                         if let Some(predicate) = config.predicate {
                             content_children_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1218,7 +1259,8 @@ pub fn extract_content_queries<'a>(
                 if let Some(decorator) = find_decorator_by_name(&method.decorators, "ContentChild")
                 {
                     if let Some(property_name) = get_property_key_name(&method.key) {
-                        let config = parse_query_config(allocator, decorator, "ContentChild");
+                        let config =
+                            parse_query_config(allocator, decorator, "ContentChild", source_text);
                         if let Some(predicate) = config.predicate {
                             content_child_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1236,7 +1278,12 @@ pub fn extract_content_queries<'a>(
                     find_decorator_by_name(&method.decorators, "ContentChildren")
                 {
                     if let Some(property_name) = get_property_key_name(&method.key) {
-                        let config = parse_query_config(allocator, decorator, "ContentChildren");
+                        let config = parse_query_config(
+                            &allocator,
+                            decorator,
+                            "ContentChildren",
+                            source_text,
+                        );
                         if let Some(predicate) = config.predicate {
                             content_children_queries.push(R3QueryMetadata {
                                 property_name,
@@ -1257,7 +1304,7 @@ pub fn extract_content_queries<'a>(
     }
 
     // Concatenate in Angular's order: signals first, then ContentChild, then ContentChildren
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
     result.extend(signal_queries);
     result.extend(content_child_queries);
     result.extend(content_children_queries);
@@ -1286,7 +1333,7 @@ pub fn extract_host_bindings<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
 ) -> Vec<'a, (Ident<'a>, Ident<'a>)> {
-    let mut bindings = Vec::new_in(allocator);
+    let mut bindings = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         let (decorators, property_name) = match element {
@@ -1358,7 +1405,7 @@ pub fn extract_host_listeners<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
 ) -> Vec<'a, (Ident<'a>, Ident<'a>, Vec<'a, Ident<'a>>)> {
-    let mut listeners = Vec::new_in(allocator);
+    let mut listeners = Vec::new_in(&allocator);
 
     for element in &class.body.body {
         // Handle both MethodDefinition and PropertyDefinition (for arrow function handlers)
@@ -1399,7 +1446,7 @@ fn parse_host_listener_config<'a>(
     allocator: &'a Allocator,
     decorator: &'a Decorator<'a>,
 ) -> (Option<Ident<'a>>, Vec<'a, Ident<'a>>) {
-    let mut args = Vec::new_in(allocator);
+    let mut args = Vec::new_in(&allocator);
 
     let Expression::CallExpression(call) = &decorator.expression else {
         return (None, args);
@@ -1462,8 +1509,8 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -1493,7 +1540,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "value");
@@ -1514,7 +1561,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "inputAlias");
@@ -1532,7 +1579,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "myAlias");
@@ -1551,7 +1598,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "value");
@@ -1570,7 +1617,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "disabled");
         assert!(inputs[0].transform_function.is_some());
@@ -1591,7 +1638,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 3);
 
         assert_eq!(inputs[0].class_property_name.as_str(), "name");
@@ -1619,7 +1666,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
     }
@@ -1640,7 +1687,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "formGroup");
         assert_eq!(inputs[0].binding_property_name.as_str(), "formGroup");
@@ -1661,7 +1708,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "count");
         assert_eq!(inputs[0].binding_property_name.as_str(), "count");
@@ -1681,7 +1728,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "name");
         assert_eq!(inputs[0].binding_property_name.as_str(), "name");
@@ -1701,7 +1748,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "myAlias");
@@ -1721,7 +1768,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "requiredAlias");
@@ -1744,7 +1791,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 3);
 
         // Decorator input
@@ -1776,7 +1823,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "realInput");
         assert!(inputs[0].is_signal);
@@ -1799,7 +1846,7 @@ mod tests {
         assert!(class.is_some());
 
         // Check inputs
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "open");
         assert_eq!(inputs[0].binding_property_name.as_str(), "open");
@@ -1826,7 +1873,7 @@ mod tests {
         assert!(class.is_some());
 
         // Check inputs
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "count");
         assert_eq!(inputs[0].binding_property_name.as_str(), "count");
@@ -1853,7 +1900,7 @@ mod tests {
         assert!(class.is_some());
 
         // Check inputs - binding name should be alias
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "myAlias");
@@ -1880,7 +1927,7 @@ mod tests {
         assert!(class.is_some());
 
         // Check inputs
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "value");
         assert_eq!(inputs[0].binding_property_name.as_str(), "requiredAlias");
@@ -1911,7 +1958,7 @@ mod tests {
         assert!(class.is_some());
 
         // Check inputs - should have all 4 inputs
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 4);
 
         // Decorator input
@@ -1957,7 +2004,7 @@ mod tests {
         assert!(class.is_some());
 
         // Only realModel should be detected as input
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].class_property_name.as_str(), "realModel");
         assert!(inputs[0].is_signal);
@@ -2158,7 +2205,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         let outputs = extract_output_metadata(&allocator, class.as_ref().unwrap());
 
         assert_eq!(inputs.len(), 1);
@@ -2178,7 +2225,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         let outputs = extract_output_metadata(&allocator, class.as_ref().unwrap());
 
         assert_eq!(inputs.len(), 0);
@@ -2201,7 +2248,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "child");
         assert!(queries[0].first);
@@ -2223,7 +2270,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "child");
         assert!(queries[0].first);
@@ -2247,7 +2294,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "child");
         assert!(queries[0].first);
@@ -2267,7 +2314,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "items");
         assert!(!queries[0].first); // ViewChildren returns multiple
@@ -2290,7 +2337,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "panel");
         assert!(queries[0].first);
@@ -2310,7 +2357,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "header");
         assert!(queries[0].first);
@@ -2334,7 +2381,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "item");
         assert!(!queries[0].descendants);
@@ -2352,7 +2399,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "tabs");
         assert!(!queries[0].first); // ContentChildren returns multiple
@@ -2373,8 +2420,9 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
 
         assert_eq!(view_queries.len(), 2);
         assert_eq!(content_queries.len(), 2);
@@ -2647,10 +2695,11 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         let outputs = extract_output_metadata(&allocator, class.as_ref().unwrap());
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         let host_bindings = extract_host_bindings(&allocator, class.as_ref().unwrap());
         let host_listeners = extract_host_listeners(&allocator, class.as_ref().unwrap());
 
@@ -2678,7 +2727,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "content");
         assert!(queries[0].first); // viewChild returns single
@@ -2700,7 +2749,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "myRef");
         assert!(queries[0].first);
@@ -2725,7 +2774,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "child");
         assert!(queries[0].first);
@@ -2745,7 +2794,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "items");
         assert!(!queries[0].first); // viewChildren returns multiple
@@ -2765,7 +2814,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "panel");
         assert!(queries[0].first); // contentChild returns single
@@ -2785,7 +2834,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "header");
         assert!(queries[0].first);
@@ -2810,7 +2859,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "tabs");
         assert!(!queries[0].first); // contentChildren returns multiple
@@ -2831,7 +2880,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert!(queries[0].descendants); // Explicitly set to true
     }
@@ -2848,7 +2897,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "portal");
         assert!(queries[0].first); // viewChild returns single
@@ -2868,7 +2917,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "myRef");
         assert!(queries[0].first);
@@ -2893,7 +2942,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].property_name.as_str(), "content");
         assert!(queries[0].first); // contentChild returns single
@@ -2914,7 +2963,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let queries = extract_view_queries(&allocator, class.as_ref().unwrap());
+        let queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(queries.len(), 2);
         assert_eq!(queries[0].property_name.as_str(), "portal");
         assert!(queries[0].is_signal);
@@ -2940,8 +2989,9 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
 
         assert_eq!(view_queries.len(), 2);
         // Signal queries come first (Angular's ordering)
@@ -2984,7 +3034,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 2);
 
         // counter: input(0) - optional signal input with default value
@@ -3027,7 +3077,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 6);
 
         // Signal inputs first (in declaration order)
@@ -3092,7 +3142,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 1);
 
         // Signal input transforms are NOT captured (transformFunction: null in Angular's output)
@@ -3127,7 +3177,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         assert_eq!(inputs.len(), 4);
 
         // All should be required signal inputs with NO transform captured
@@ -3176,8 +3226,9 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
 
         // View queries: query1, query2, query5, query6, query7
         assert_eq!(view_queries.len(), 5);
@@ -3259,8 +3310,9 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
 
         // Angular ordering: signal queries FIRST, then decorator queries
         // viewQueries: [signalViewChild, decoratorViewChild]
@@ -3390,7 +3442,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         let outputs = extract_output_metadata(&allocator, class.as_ref().unwrap());
 
         // Model creates inputs
@@ -3443,7 +3495,7 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap());
+        let inputs = extract_input_metadata(&allocator, class.as_ref().unwrap(), Some(code));
         let outputs = extract_output_metadata(&allocator, class.as_ref().unwrap());
 
         // Inputs: 2 from model + 2 from @Input = 4
@@ -3502,8 +3554,9 @@ mod tests {
         let class = parse_class(&allocator, code);
         assert!(class.is_some());
 
-        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap());
-        let content_queries = extract_content_queries(&allocator, class.as_ref().unwrap());
+        let view_queries = extract_view_queries(&allocator, class.as_ref().unwrap(), Some(code));
+        let content_queries =
+            extract_content_queries(&allocator, class.as_ref().unwrap(), Some(code));
 
         // viewChild.required() creates a required signal query
         assert_eq!(view_queries.len(), 1);

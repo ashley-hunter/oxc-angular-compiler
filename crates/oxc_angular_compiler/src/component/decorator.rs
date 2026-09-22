@@ -8,7 +8,8 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
     MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
 };
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use super::dependency::R3DependencyMetadata;
 use super::metadata::{
@@ -17,7 +18,8 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    extract_host_bindings, extract_host_listeners, extract_input_metadata, extract_output_metadata,
+    StringConsts, extract_host_bindings, extract_host_listeners, extract_input_metadata,
+    extract_output_metadata,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 
@@ -50,6 +52,8 @@ pub fn extract_component_metadata<'a>(
     class: &'a Class<'a>,
     implicit_standalone: bool,
     import_map: &ImportMap<'a>,
+    source_text: Option<&'a str>,
+    consts: &StringConsts<'a>,
 ) -> Option<ComponentMetadata<'a>> {
     // Get the class name
     let class_name: Ident<'a> = class.id.as_ref()?.name.clone().into();
@@ -83,30 +87,37 @@ pub fn extract_component_metadata<'a>(
     // Parse each property in the config object
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
-            let key_name = get_property_key_name(&prop.key)?;
+            let key_name = get_property_key_name(&prop.key, consts)?;
 
             match key_name.as_str() {
                 "selector" => {
-                    metadata.selector = extract_string_value(&prop.value);
+                    metadata.selector =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "template" => {
-                    metadata.template = extract_string_value(&prop.value);
+                    metadata.template =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "templateUrl" => {
-                    metadata.template_url = extract_string_value(&prop.value);
+                    metadata.template_url =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "styles" => {
-                    if let Some(styles) = extract_string_array(allocator, &prop.value) {
+                    if let Some(styles) = extract_string_array(allocator, &prop.value, consts) {
                         metadata.styles = styles;
-                    } else if let Some(style) = extract_string_value(&prop.value) {
+                    } else if let Some(style) =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts)
+                    {
                         // Single style string (legacy support)
                         metadata.styles.push(style);
                     }
                 }
                 "styleUrls" | "styleUrl" => {
-                    if let Some(urls) = extract_string_array(allocator, &prop.value) {
+                    if let Some(urls) = extract_string_array(allocator, &prop.value, consts) {
                         metadata.style_urls = urls;
-                    } else if let Some(url) = extract_string_value(&prop.value) {
+                    } else if let Some(url) =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts)
+                    {
                         metadata.style_urls.push(url);
                     }
                 }
@@ -120,21 +131,33 @@ pub fn extract_component_metadata<'a>(
                     metadata.encapsulation = extract_encapsulation(&prop.value);
                 }
                 "changeDetection" => {
-                    metadata.change_detection = extract_change_detection(&prop.value);
+                    metadata.change_detection = Some(extract_change_detection(&prop.value));
                 }
                 "host" => {
-                    metadata.host = extract_host_metadata(allocator, &prop.value);
+                    metadata.host = extract_host_metadata(allocator, &prop.value, consts);
                 }
                 "imports" => {
                     // For standalone components, we need:
                     // 1. The identifier list for local analysis
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
                     // 2. The raw expression to pass to ɵɵgetComponentDepsFactory in RuntimeResolved mode
-                    metadata.raw_imports = convert_oxc_expression(allocator, &prop.value);
+                    metadata.raw_imports =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
+                }
+                "deferredImports" => {
+                    // Symbols explicitly opted into lazy loading via `@defer`.
+                    // Mirrors Angular's `@Component.deferredImports` field; in
+                    // local compilation this is the only source of deferrable
+                    // dependencies (full compilation additionally derives them
+                    // from template usage of `imports: [...]`, which requires
+                    // cross-file selector info OXC doesn't have).
+                    metadata.deferred_imports = extract_identifier_array(allocator, &prop.value);
                 }
                 "exportAs" => {
                     // exportAs can be comma-separated: "foo, bar"
-                    if let Some(export_as) = extract_string_value(&prop.value) {
+                    if let Some(export_as) =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts)
+                    {
                         for part in export_as.as_str().split(',') {
                             let trimmed = part.trim();
                             if !trimmed.is_empty() {
@@ -150,7 +173,8 @@ pub fn extract_component_metadata<'a>(
                 "animations" => {
                     // Extract animations expression as full OutputExpression
                     // Handles both identifier references and complex array expressions
-                    metadata.animations = convert_oxc_expression(allocator, &prop.value);
+                    metadata.animations =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "schemas" => {
                     // Extract schemas identifiers (e.g., [CUSTOM_ELEMENTS_SCHEMA, NO_ERRORS_SCHEMA])
@@ -159,17 +183,19 @@ pub fn extract_component_metadata<'a>(
                 "providers" => {
                     // Extract providers as full OutputExpression
                     // Handles complex expressions like [{provide: TOKEN, useFactory: Factory}]
-                    metadata.providers = convert_oxc_expression(allocator, &prop.value);
+                    metadata.providers =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "viewProviders" => {
                     // Extract view providers as full OutputExpression
-                    metadata.view_providers = convert_oxc_expression(allocator, &prop.value);
+                    metadata.view_providers =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "hostDirectives" => {
                     // Extract host directives array
                     // Handles both simple identifiers and complex objects with inputs/outputs
                     metadata.host_directives =
-                        extract_host_directives(allocator, &prop.value, import_map);
+                        extract_host_directives(allocator, &prop.value, import_map, consts);
                 }
                 "signals" => {
                     // Extract signals flag (true if component uses signal-based inputs)
@@ -227,7 +253,7 @@ pub fn extract_component_metadata<'a>(
     // See: packages/compiler-cli/src/ngtsc/annotations/directive/src/shared.ts:393
     // NOTE: This must be set BEFORE extract_constructor_deps because that function
     // uses this information to determine whether to use inherited factory pattern.
-    let has_superclass = class.super_class.is_some();
+    let has_superclass = class.heritage.is_some();
     metadata.uses_inheritance = has_superclass;
 
     // Extract constructor dependencies for factory generation
@@ -236,7 +262,7 @@ pub fn extract_component_metadata<'a>(
         extract_constructor_deps(allocator, class, import_map, has_superclass);
 
     // Extract inputs from @Input decorators on class members
-    metadata.inputs = extract_input_metadata(allocator, class);
+    metadata.inputs = extract_input_metadata(allocator, class, source_text);
 
     // Extract outputs from @Output decorators on class members
     metadata.outputs = extract_output_metadata(allocator, class);
@@ -289,7 +315,7 @@ fn populate_declarations_from_imports<'a>(
         // A more sophisticated implementation would analyze the template to determine
         // the actual dependency type (directive, component, pipe, or NgModule)
         let mut dep = TemplateDependency::directive(
-            allocator,
+            &allocator,
             import_name.clone(),
             // Use a placeholder selector - the actual selector isn't used for dependencies array
             Ident::from("*"),
@@ -335,24 +361,18 @@ fn is_component_call(callee: &Expression<'_>) -> bool {
 }
 
 /// Get the name of a property key as a string.
-fn get_property_key_name<'a>(key: &PropertyKey<'a>) -> Option<Ident<'a>> {
+///
+/// Resolves same-file `const` identifiers in computed keys (`[FOO]: bar`) so the
+/// emitted component metadata matches the official Angular compiler's output.
+fn get_property_key_name<'a>(
+    key: &PropertyKey<'a>,
+    consts: &StringConsts<'a>,
+) -> Option<Ident<'a>> {
     match key {
         PropertyKey::StaticIdentifier(id) => Some(id.name.clone().into()),
         PropertyKey::StringLiteral(lit) => Some(lit.value.clone().into()),
-        _ => None,
-    }
-}
-
-/// Extract a string value from an expression.
-fn extract_string_value<'a>(expr: &Expression<'a>) -> Option<Ident<'a>> {
-    match expr {
-        Expression::StringLiteral(lit) => Some(lit.value.clone().into()),
-        Expression::TemplateLiteral(tpl) if tpl.expressions.is_empty() => {
-            // Simple template literal with no expressions: `template string`
-            // Use cooked value to properly interpret escape sequences (\n -> newline)
-            // Angular evaluates template literals, so we need cooked, not raw
-            tpl.quasis.first().and_then(|q| q.value.cooked.clone().map(Into::into))
-        }
+        // Computed identifier reference: `[FOO]: bar` — resolve against same-file consts.
+        PropertyKey::Identifier(id) => consts.get(id.name.as_str()).cloned(),
         _ => None,
     }
 }
@@ -365,27 +385,28 @@ fn extract_boolean_value(expr: &Expression<'_>) -> Option<bool> {
     }
 }
 /// Extract an array of strings from an expression.
+///
+/// `${...}` interpolations inside individual template-literal elements are
+/// folded against `consts` (e.g. `` styles: [`:host { color: ${COLOR}; }`] ``)
+/// to match Angular's partial evaluator. Identifier elements (`[STYLE_CONST]`)
+/// are likewise resolved.
 fn extract_string_array<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
+    consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, Ident<'a>>> {
     let Expression::ArrayExpression(arr) = expr else {
         return None;
     };
 
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
     for element in &arr.elements {
-        if let ArrayExpressionElement::StringLiteral(lit) = element {
-            result.push(lit.value.clone().into());
-        } else if let ArrayExpressionElement::TemplateLiteral(tpl) = element {
-            if tpl.expressions.is_empty() {
-                // Use cooked value to properly interpret escape sequences
-                if let Some(quasi) = tpl.quasis.first() {
-                    if let Some(cooked) = &quasi.value.cooked {
-                        result.push(cooked.clone().into());
-                    }
-                }
-            }
+        // ArrayExpressionElement variants that can hold a value expression all
+        // carry one — funnel them through `as_expression()` and let the shared
+        // resolver decide which shapes fold.
+        let Some(elem_expr) = element.as_expression() else { continue };
+        if let Some(value) = crate::directive::extract_string_value(allocator, elem_expr, consts) {
+            result.push(value);
         }
     }
 
@@ -397,7 +418,7 @@ fn extract_identifier_array<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
 ) -> Vec<'a, Ident<'a>> {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
 
     let Expression::ArrayExpression(arr) = expr else {
         return result;
@@ -448,13 +469,18 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
     match expr {
         Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
             "OnPush" => ChangeDetectionStrategy::OnPush,
+            "Eager" => ChangeDetectionStrategy::Eager,
+            // `Default` (value 1) is the pre-v22 spelling of `Eager`. Keep it
+            // distinct so partial emit can preserve the author's exact member
+            // for older Angular targets that lack `Eager`.
             "Default" => ChangeDetectionStrategy::Default,
             _ => ChangeDetectionStrategy::default(),
         },
         Expression::NumericLiteral(num) => {
-            // Angular's numeric values: Default = 0, OnPush = 1
+            // Angular v22 numeric values: OnPush = 0, Eager = 1 (Default = 1).
             match num.value as i32 {
-                1 => ChangeDetectionStrategy::OnPush,
+                0 => ChangeDetectionStrategy::OnPush,
+                1 => ChangeDetectionStrategy::Eager,
                 _ => ChangeDetectionStrategy::default(),
             }
         }
@@ -468,25 +494,28 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
+    consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
     let Expression::ObjectExpression(obj) = expr else {
         return None;
     };
 
     let mut host = HostMetadata {
-        properties: Vec::new_in(allocator),
-        attributes: Vec::new_in(allocator),
-        listeners: Vec::new_in(allocator),
+        properties: Vec::new_in(&allocator),
+        attributes: Vec::new_in(&allocator),
+        listeners: Vec::new_in(&allocator),
         class_attr: None,
         style_attr: None,
     };
 
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
-            let Some(key_name) = get_property_key_name(&prop.key) else {
+            let Some(key_name) = get_property_key_name(&prop.key, consts) else {
                 continue;
             };
-            let Some(value) = extract_string_value(&prop.value) else {
+            let Some(value) =
+                crate::directive::extract_string_value(allocator, &prop.value, consts)
+            else {
                 continue;
             };
 
@@ -533,15 +562,16 @@ fn extract_host_directives<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
     import_map: &ImportMap<'a>,
+    consts: &StringConsts<'a>,
 ) -> Vec<'a, HostDirectiveMetadata<'a>> {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
 
     let Expression::ArrayExpression(arr) = expr else {
         return result;
     };
 
     for element in &arr.elements {
-        if let Some(meta) = extract_single_host_directive(allocator, element, import_map) {
+        if let Some(meta) = extract_single_host_directive(allocator, element, import_map, consts) {
             result.push(meta);
         }
     }
@@ -559,6 +589,7 @@ fn extract_single_host_directive<'a>(
     allocator: &'a Allocator,
     element: &ArrayExpressionElement<'a>,
     import_map: &ImportMap<'a>,
+    consts: &StringConsts<'a>,
 ) -> Option<HostDirectiveMetadata<'a>> {
     match element {
         // Simple identifier: TooltipDirective
@@ -575,13 +606,13 @@ fn extract_single_host_directive<'a>(
         // Object expression: { directive: ColorDirective, inputs: [...], outputs: [...] }
         ArrayExpressionElement::ObjectExpression(obj) => {
             let mut directive_name: Option<Ident<'a>> = None;
-            let mut inputs = Vec::new_in(allocator);
-            let mut outputs = Vec::new_in(allocator);
+            let mut inputs = Vec::new_in(&allocator);
+            let mut outputs = Vec::new_in(&allocator);
             let mut is_forward_reference = false;
 
             for prop in &obj.properties {
                 if let ObjectPropertyKind::ObjectProperty(prop) = prop {
-                    let Some(key_name) = get_property_key_name(&prop.key) else {
+                    let Some(key_name) = get_property_key_name(&prop.key, consts) else {
                         continue;
                     };
 
@@ -678,23 +709,18 @@ fn extract_forward_ref_directive_name<'a>(arg: Option<&Argument<'a>>) -> Option<
     match arg {
         // forwardRef(() => MyDirective)
         Argument::ArrowFunctionExpression(arrow) => {
-            // The body should be an identifier (the directive class)
-            let body = &arrow.body;
-
-            // Check if it's an expression body (single return expression)
-            // Arrow functions with expression body have their expression
-            // wrapped in the body. For `() => Directive`, the expression
-            // is the directive identifier.
-            if body.statements.is_empty() {
-                return None;
+            // Expression body: () => MyDirective
+            if let Some(Expression::Identifier(id)) = arrow.get_expression() {
+                return Some(id.name.clone().into());
             }
-            // For expression arrow functions, the parser puts it in
-            // an ExpressionStatement
-            if let Some(oxc_ast::ast::Statement::ExpressionStatement(stmt)) =
-                body.statements.first()
-            {
-                if let Expression::Identifier(id) = &stmt.expression {
-                    return Some(id.name.clone().into());
+            // Block body with single ExpressionStatement (parity with pre-0.144)
+            if let Some(body) = arrow.get_function_body() {
+                if let Some(oxc_ast::ast::Statement::ExpressionStatement(stmt)) =
+                    body.statements.first()
+                {
+                    if let Expression::Identifier(id) = &stmt.expression {
+                        return Some(id.name.clone().into());
+                    }
                 }
             }
             None
@@ -714,7 +740,7 @@ fn extract_io_mappings<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
 ) -> Vec<'a, (Ident<'a>, Ident<'a>)> {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
 
     let Expression::ArrayExpression(arr) = expr else {
         return result;
@@ -870,7 +896,7 @@ fn extract_constructor_deps<'a>(
     match constructor {
         Some(ctor) => {
             // Constructor found - extract parameters (may be empty)
-            let mut deps = Vec::new_in(allocator);
+            let mut deps = Vec::new_in(&allocator);
             let params = &ctor.value.params;
 
             for param in &params.items {
@@ -885,7 +911,7 @@ fn extract_constructor_deps<'a>(
             // If class has a superclass, use inherited factory pattern (return None)
             // If class has no superclass, use simple factory with empty deps (return Some([]))
             // See: packages/compiler-cli/src/ngtsc/annotations/common/src/di.ts:47-52
-            if has_superclass { None } else { Some(Vec::new_in(allocator)) }
+            if has_superclass { None } else { Some(Vec::new_in(&allocator)) }
         }
     }
 }
@@ -947,16 +973,29 @@ fn extract_param_dependency<'a>(
     // Build the dependency metadata
     let mut dep = match &token {
         Some(token_name) => {
-            let mut d = R3DependencyMetadata::new(token_name.clone());
             // Look up the token in the import map to find its source module and import type
             if let Some(import_info) = import_map.get(token_name) {
-                d.token_source_module = Some(import_info.source_module.clone());
-                // Always use namespace imports for DI tokens (has_named_import = false).
-                // Import elision removes @Inject(TOKEN) argument imports since they're
-                // only used in decorator positions that get compiled away.
-                // Using bare TOKEN would fail at runtime because the import is gone.
+                if import_info.is_type_only {
+                    // Type-only imports (`import type { X }` / `import { type X }`)
+                    // are erased at runtime and cannot be used as DI tokens. The whole
+                    // factory must collapse to `ɵɵinvalidFactory()` — matching Angular's
+                    // `ValueUnavailableKind.TYPE_ONLY_IMPORT`. See issue #288.
+                    R3DependencyMetadata::type_only_invalid()
+                } else {
+                    let mut d = R3DependencyMetadata::new(token_name.clone());
+                    d.token_source_module = Some(import_info.source_module.clone());
+                    // Carry the exported name so namespaced refs (`i1.X`) use the export
+                    // name, not the local alias, for aliased imports.
+                    d.token_imported_name = import_info.imported_name.clone();
+                    // Always use namespace imports for DI tokens (has_named_import = false).
+                    // Import elision removes @Inject(TOKEN) argument imports since they're
+                    // only used in decorator positions that get compiled away.
+                    // Using bare TOKEN would fail at runtime because the import is gone.
+                    d
+                }
+            } else {
+                R3DependencyMetadata::new(token_name.clone())
             }
-            d
         }
         None => R3DependencyMetadata::invalid(),
     };
@@ -1005,7 +1044,8 @@ fn extract_inject_token<'a>(arg: &'a Argument<'a>) -> Option<Ident<'a>> {
 fn extract_param_token<'a>(param: &'a oxc_ast::ast::FormalParameter<'a>) -> Option<Ident<'a>> {
     // Get the type annotation (directly on FormalParameter)
     let type_annotation = param.type_annotation.as_ref()?;
-    let ts_type = &type_annotation.type_annotation;
+    // Narrow `T | null` unions to `T` to match the reference compiler.
+    let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
     // Handle TSTypeReference: SomeClass, SomeModule, etc.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
@@ -1094,6 +1134,33 @@ pub fn collect_member_decorator_spans(class: &Class<'_>, spans: &mut std::vec::V
     }
 }
 
+/// Collect ALL decorator spans from class members (properties, methods, accessors),
+/// regardless of whether they are Angular-specific or not.
+///
+/// This is used when lowering a class that has Angular decorators: since the class
+/// declaration is converted to a class expression, ALL member decorators must be
+/// removed (decorators are not valid on class expressions in TypeScript).
+pub fn collect_all_member_decorator_spans(class: &Class<'_>, spans: &mut std::vec::Vec<Span>) {
+    for element in &class.body.body {
+        let decorators = match element {
+            ClassElement::PropertyDefinition(prop) => &prop.decorators,
+            ClassElement::MethodDefinition(method) => {
+                // Skip constructor - it's handled separately
+                if method.kind == MethodDefinitionKind::Constructor {
+                    continue;
+                }
+                &method.decorators
+            }
+            ClassElement::AccessorProperty(accessor) => &accessor.decorators,
+            _ => continue,
+        };
+
+        for decorator in decorators {
+            spans.push(decorator.span);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1183,7 @@ mod tests {
 
         // Build import map from the program body
         let import_map = build_import_map(&allocator, &parser_ret.program.body, None);
+        let consts = crate::directive::collect_string_consts(&allocator, &parser_ret.program);
 
         // Find the first class declaration (handles plain, export default, and export named)
         let mut found_metadata = None;
@@ -1126,17 +1194,22 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,
             };
 
             if let Some(class) = class {
-                if let Some(metadata) =
-                    extract_component_metadata(&allocator, class, implicit_standalone, &import_map)
-                {
+                if let Some(metadata) = extract_component_metadata(
+                    &allocator,
+                    class,
+                    implicit_standalone,
+                    &import_map,
+                    Some(code),
+                    &consts,
+                ) {
                     found_metadata = Some(metadata);
                     break;
                 }
@@ -1432,12 +1505,14 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert_eq!(meta.change_detection, ChangeDetectionStrategy::OnPush);
+            assert_eq!(meta.change_detection, Some(ChangeDetectionStrategy::OnPush));
         });
     }
 
     #[test]
-    fn test_extract_change_detection_default() {
+    fn test_extract_change_detection_default_is_distinct() {
+        // `Default` (value 1) is the pre-v22 spelling of `Eager`. It is kept as
+        // a distinct variant so partial emit can preserve the author's member.
         let code = r#"
             @Component({
                 selector: 'app-test',
@@ -1447,13 +1522,13 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert_eq!(meta.change_detection, ChangeDetectionStrategy::Default);
+            assert_eq!(meta.change_detection, Some(ChangeDetectionStrategy::Default));
         });
     }
 
     #[test]
-    fn test_extract_change_detection_numeric_on_push() {
-        // Angular uses: Default=0, OnPush=1
+    fn test_extract_change_detection_numeric_eager() {
+        // Angular v22 numeric values: OnPush = 0, Eager = 1.
         let code = r#"
             @Component({
                 selector: 'app-test',
@@ -1463,12 +1538,15 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert_eq!(meta.change_detection, ChangeDetectionStrategy::OnPush);
+            assert_eq!(meta.change_detection, Some(ChangeDetectionStrategy::Eager));
         });
     }
 
     #[test]
-    fn test_change_detection_defaults_to_default() {
+    fn test_change_detection_unspecified_is_none() {
+        // When the decorator omits `changeDetection`, the metadata leaves it
+        // `None` so the emitter applies the target version's default (OnPush in
+        // v22+, Default/Eager before).
         let code = r#"
             @Component({
                 selector: 'app-test',
@@ -1477,7 +1555,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert_eq!(meta.change_detection, ChangeDetectionStrategy::Default);
+            assert_eq!(meta.change_detection, None);
         });
     }
 
@@ -1868,7 +1946,7 @@ mod tests {
             assert_eq!(meta.styles.len(), 1);
             assert!(meta.standalone);
             assert_eq!(meta.encapsulation, ViewEncapsulation::None);
-            assert_eq!(meta.change_detection, ChangeDetectionStrategy::OnPush);
+            assert_eq!(meta.change_detection, Some(ChangeDetectionStrategy::OnPush));
             assert!(meta.host.is_some());
             let host = meta.host.as_ref().unwrap();
             assert_eq!(host.class_attr.as_ref().unwrap().as_str(), "app-complete");
@@ -2579,6 +2657,136 @@ mod tests {
     }
 
     #[test]
+    fn test_component_optional_with_nullable_type() {
+        // Regression test for issue #285:
+        // `@Optional() svc: MyService | null` is the canonical optional-DI pattern,
+        // but the union with `null` previously caused token extraction to fail and
+        // emit `ɵɵinvalidFactoryDep`, which throws at runtime.
+        //
+        // Angular's reference compiler filters out `null` literal type nodes from
+        // the union; when exactly one type remains it becomes the token.
+        let code = r#"
+            @Component({
+                selector: 'app-test',
+                template: ''
+            })
+            class TestComponent {
+                constructor(
+                    @Optional() private svc: MyService | null,
+                ) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.constructor_deps.as_ref().unwrap();
+            assert_eq!(deps.len(), 1);
+            let dep = &deps[0];
+            assert!(dep.optional, "Should have optional flag");
+            assert_eq!(
+                dep.token.as_ref().expect("token should resolve to MyService").as_str(),
+                "MyService",
+                "null should be filtered from the union, leaving MyService as the token",
+            );
+        });
+    }
+
+    #[test]
+    fn test_component_nullable_type_without_decorator() {
+        // Bare `svc: MyService | null` (no `@Optional()`) should also have its
+        // token resolved to `MyService`. Token resolution is independent of
+        // optionality — `@Optional()` only controls the inject flag.
+        let code = r#"
+            @Component({
+                selector: 'app-test',
+                template: ''
+            })
+            class TestComponent {
+                constructor(
+                    private svc: MyService | null,
+                ) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.constructor_deps.as_ref().unwrap();
+            assert_eq!(deps.len(), 1);
+            let dep = &deps[0];
+            assert!(!dep.optional, "Should not have optional flag");
+            assert_eq!(
+                dep.token.as_ref().expect("token should resolve to MyService").as_str(),
+                "MyService",
+            );
+        });
+    }
+
+    #[test]
+    fn test_component_nullable_type_null_first() {
+        // `null` can appear in either position of the union — both must be filtered.
+        let code = r#"
+            @Component({
+                selector: 'app-test',
+                template: ''
+            })
+            class TestComponent {
+                constructor(
+                    @Optional() private svc: null | MyService,
+                ) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.constructor_deps.as_ref().unwrap();
+            let dep = &deps[0];
+            assert_eq!(dep.token.as_ref().unwrap().as_str(), "MyService");
+        });
+    }
+
+    #[test]
+    fn test_component_parenthesized_nullable_type() {
+        // Parenthesized nullable union: `(MyService | null)`.
+        // oxc preserves `TSParenthesizedType` in the AST, so the resolver must
+        // unwrap it before checking for unions, or the dependency falls through
+        // to `ɵɵinvalidFactoryDep` (issue #285 follow-up).
+        let code = r#"
+            @Component({
+                selector: 'app-test',
+                template: ''
+            })
+            class TestComponent {
+                constructor(
+                    @Optional() private svc: (MyService | null),
+                ) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.constructor_deps.as_ref().unwrap();
+            let dep = &deps[0];
+            assert_eq!(
+                dep.token.as_ref().expect("token should resolve to MyService").as_str(),
+                "MyService",
+            );
+        });
+    }
+
+    #[test]
+    fn test_component_paren_around_inner_type_in_union() {
+        // Parens around just the non-null side: `(MyService) | null`.
+        let code = r#"
+            @Component({
+                selector: 'app-test',
+                template: ''
+            })
+            class TestComponent {
+                constructor(
+                    @Optional() private svc: (MyService) | null,
+                ) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.constructor_deps.as_ref().unwrap();
+            let dep = &deps[0];
+            assert_eq!(dep.token.as_ref().unwrap().as_str(), "MyService");
+        });
+    }
+
+    #[test]
     fn test_component_with_skip_self_decorator() {
         let code = r#"
             @Component({
@@ -2995,8 +3203,8 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,

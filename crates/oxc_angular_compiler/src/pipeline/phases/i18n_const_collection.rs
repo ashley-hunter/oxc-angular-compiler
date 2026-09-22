@@ -8,7 +8,7 @@
 use std::ptr::NonNull;
 
 use oxc_allocator::Vec as ArenaVec;
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::i18n::serializer::format_i18n_placeholder_name;
@@ -190,7 +190,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
 
         // Collect messages recursively and generate statements
         let (main_var_name, statements) = collect_message(
-            allocator,
+            &allocator,
             &messages,
             &params_by_context,
             &postprocessing_params_by_context,
@@ -206,7 +206,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
             let var_name_str = allocator.alloc_str(&main_var_name);
             let main_var = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                 ReadVarExpr { name: Ident::from(var_name_str), source_span: None },
-                allocator,
+                &allocator,
             ));
             let const_index =
                 job.add_const_with_initializers(ConstValue::Expression(main_var), statements);
@@ -241,13 +241,13 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                                                 name: var_name_atom.clone(),
                                                 source_span: None,
                                             },
-                                            allocator,
+                                            &allocator,
                                         ));
                                     attr_op.value = Some(oxc_allocator::Box::new_in(
                                         crate::ir::expression::IrExpression::OutputExpr(
-                                            oxc_allocator::Box::new_in(var_expr, allocator),
+                                            oxc_allocator::Box::new_in(var_expr, &allocator),
                                         ),
-                                        allocator,
+                                        &allocator,
                                     ));
                                 }
                             }
@@ -344,13 +344,13 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                         value: LiteralValue::String(Ident::from(name_str)),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 ));
 
                 // Add i18n variable reference
                 let i18n_var = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                     ReadVarExpr { name: i18n_var_name.clone(), source_span: None },
-                    allocator,
+                    &allocator,
                 ));
 
                 Some(vec![name_literal, i18n_var])
@@ -360,7 +360,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
 
         if !i18n_attribute_config.is_empty() {
             // Create array expression and add to consts
-            let mut config_elements = ArenaVec::new_in(allocator);
+            let mut config_elements = ArenaVec::new_in(&allocator);
             config_elements.extend(i18n_attribute_config);
 
             let config_array = OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
@@ -368,7 +368,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                     entries: config_elements,
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
             let const_index = job.add_const(ConstValue::Expression(config_array));
             i18n_attrs_configs.insert(config.elem_xref, const_index);
@@ -473,7 +473,7 @@ fn collect_message<'a>(
     use_external_ids: bool,
     counter: &mut usize,
 ) -> (String, ArenaVec<'a, OutputStatement<'a>>) {
-    let mut all_statements = ArenaVec::new_in(allocator);
+    let mut all_statements = ArenaVec::new_in(&allocator);
 
     // Recursively collect sub-messages first
     let mut sub_message_placeholders: FxHashMap<String, Vec<String>> = FxHashMap::default();
@@ -482,7 +482,7 @@ fn collect_message<'a>(
     for &sub_msg_xref in &msg_info.sub_messages {
         if let Some(sub_msg) = messages.get(&sub_msg_xref) {
             let (sub_var_name, sub_statements) = collect_message(
-                allocator,
+                &allocator,
                 messages,
                 params_by_context,
                 postprocessing_params_by_context,
@@ -574,7 +574,7 @@ fn collect_message<'a>(
     let closure_var_atom = Ident::from(allocator.alloc_str(&closure_var_name));
 
     let statements = create_translation_declaration(
-        allocator,
+        &allocator,
         i18n_var_atom,
         closure_var_atom,
         &message_for_closure,
@@ -591,22 +591,22 @@ fn collect_message<'a>(
         let read_var = || {
             OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                 ReadVarExpr { name: i18n_var_atom, source_span: None },
-                allocator,
+                &allocator,
             ))
         };
         let postprocess = wrap_with_postprocess(allocator, read_var(), &postprocessing_params);
         let assignment = OutputExpression::BinaryOperator(oxc_allocator::Box::new_in(
             crate::output::ast::BinaryOperatorExpr {
                 operator: crate::output::ast::BinaryOperator::Assign,
-                lhs: oxc_allocator::Box::new_in(read_var(), allocator),
-                rhs: oxc_allocator::Box::new_in(postprocess, allocator),
+                lhs: oxc_allocator::Box::new_in(read_var(), &allocator),
+                rhs: oxc_allocator::Box::new_in(postprocess, &allocator),
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
         all_statements.push(OutputStatement::Expression(oxc_allocator::Box::new_in(
             crate::output::ast::ExpressionStatement { expr: assignment, source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -701,10 +701,10 @@ fn create_localize_expression<'a>(
     // Parse message_string to extract text parts and placeholder names in order
     let (text_parts, placeholder_order) = parse_message_string(message_string);
 
-    let mut message_parts = ArenaVec::new_in(allocator);
-    let mut raw_message_parts = ArenaVec::new_in(allocator);
-    let mut placeholder_names = ArenaVec::new_in(allocator);
-    let mut expressions = ArenaVec::new_in(allocator);
+    let mut message_parts = ArenaVec::new_in(&allocator);
+    let mut raw_message_parts = ArenaVec::new_in(&allocator);
+    let mut placeholder_names = ArenaVec::new_in(&allocator);
+    let mut expressions = ArenaVec::new_in(&allocator);
     let mut push_part = |(cooked, raw): (String, String)| {
         message_parts.push(Ident::from(allocator.alloc_str(&cooked)));
         raw_message_parts.push(Ident::from(allocator.alloc_str(&raw)));
@@ -769,7 +769,7 @@ fn create_localize_expression<'a>(
             expressions,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -888,49 +888,49 @@ fn wrap_with_postprocess<'a>(
             receiver: oxc_allocator::Box::new_in(
                 OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::I18N_POSTPROCESS),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create args array with the localized expression
-    let mut args = ArenaVec::new_in(allocator);
+    let mut args = ArenaVec::new_in(&allocator);
     args.push(expr);
 
     // Add postprocessing params if any
     if !postprocessing_params.is_empty() {
-        let mut entries = ArenaVec::new_in(allocator);
+        let mut entries = ArenaVec::new_in(&allocator);
         for (placeholder, value) in postprocessing_params {
             let formatted_name = format_i18n_placeholder_name(placeholder, false);
-            entries.push(LiteralMapEntry {
-                key: Ident::from(allocator.alloc_str(&formatted_name)),
-                value: value.to_expr(allocator),
-                quoted: true,
-            });
+            entries.push(LiteralMapEntry::new(
+                Ident::from(allocator.alloc_str(&formatted_name)),
+                value.to_expr(allocator),
+                true,
+            ));
         }
 
         args.push(OutputExpression::LiteralMap(oxc_allocator::Box::new_in(
             LiteralMapExpr { entries, source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
     // Create the function call: ɵɵi18nPostprocess(localizedExpr, params?)
     OutputExpression::InvokeFunction(oxc_allocator::Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: oxc_allocator::Box::new_in(fn_var, allocator),
+            fn_expr: oxc_allocator::Box::new_in(fn_var, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -940,7 +940,7 @@ mod tests {
     use crate::output::ast::{LiteralExpr, OutputExpression, ReadVarExpr};
     use crate::output::emitter::JsEmitter;
     use oxc_allocator::Allocator;
-    use oxc_span::Ident;
+    use oxc_str::Ident;
 
     #[test]
     fn test_wrap_with_postprocess_uses_namespace_prefix() {
@@ -958,7 +958,7 @@ mod tests {
                 value: LiteralValue::String(Ident::from("test message")),
                 source_span: None,
             },
-            &allocator,
+            &&allocator,
         ));
 
         // Call wrap_with_postprocess with no extra params
@@ -984,7 +984,7 @@ mod tests {
 
         let input_expr = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
             ReadVarExpr { name: Ident::from("i18n_0"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let params = vec![(

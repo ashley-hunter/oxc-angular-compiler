@@ -18,6 +18,11 @@ static ɵfac = function HostDir_Factory(__ngFactoryType__) {
 static ɵdir = /*@__PURE__*/ i0.ɵɵdefineDirective({type:HostDir,inputs:{value:"value",color:"color"},
     outputs:{opened:"opened",closed:"closed"}});
 }
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(HostDir,
+      [{type:Directive,args:[{}]}],null,{value:[{type:Input}],color:[{type:Input}],
+          opened:[{type:Output}],closed:[{type:Output}]}));
+})();
 
 export class MyComponent {
 
@@ -33,4 +38,10 @@ static ɵcmp = /*@__PURE__*/ i0.ɵɵdefineComponent({type:MyComponent,selectors:
 (() =>{
   (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(MyComponent,
       {className:"MyComponent",filePath:"test.component.ts",lineNumber:22}));
+})();
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(MyComponent,
+      [{type:Component,args:[{selector:"my-component",template:"",hostDirectives:[{directive:HostDir,
+          inputs:["value","color: colorAlias"],outputs:["opened","closed: closedAlias"]}],
+          standalone:false}]}],null,null));
 })();

@@ -11,7 +11,8 @@
 //! - No bitwise operators
 
 use oxc_allocator::{Allocator, Box, Vec};
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 /// A span within the expression source.
 #[derive(Debug, Clone, Copy)]
@@ -192,24 +193,24 @@ impl<'a> AngularExpression<'a> {
         match self {
             Self::Empty(e) => Self::Empty(Box::new_in(
                 EmptyExpr { span: e.span, source_span: e.source_span },
-                alloc,
+                &alloc,
             )),
             Self::ImplicitReceiver(e) => Self::ImplicitReceiver(Box::new_in(
                 ImplicitReceiver { span: e.span, source_span: e.source_span },
-                alloc,
+                &alloc,
             )),
             Self::ThisReceiver(e) => Self::ThisReceiver(Box::new_in(
                 ThisReceiver { span: e.span, source_span: e.source_span },
-                alloc,
+                &alloc,
             )),
             Self::Chain(e) => {
-                let mut expressions = Vec::new_in(alloc);
+                let mut expressions = Vec::new_in(&alloc);
                 for expr in e.expressions.iter() {
                     expressions.push(expr.clone_in(alloc));
                 }
                 Self::Chain(Box::new_in(
                     Chain { span: e.span, source_span: e.source_span, expressions },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::Conditional(e) => Self::Conditional(Box::new_in(
@@ -220,7 +221,7 @@ impl<'a> AngularExpression<'a> {
                     true_exp: e.true_exp.clone_in(alloc),
                     false_exp: e.false_exp.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::PropertyRead(e) => Self::PropertyRead(Box::new_in(
                 PropertyRead {
@@ -230,7 +231,7 @@ impl<'a> AngularExpression<'a> {
                     receiver: e.receiver.clone_in(alloc),
                     name: e.name.clone(),
                 },
-                alloc,
+                &alloc,
             )),
             Self::SafePropertyRead(e) => Self::SafePropertyRead(Box::new_in(
                 SafePropertyRead {
@@ -240,7 +241,7 @@ impl<'a> AngularExpression<'a> {
                     receiver: e.receiver.clone_in(alloc),
                     name: e.name.clone(),
                 },
-                alloc,
+                &alloc,
             )),
             Self::KeyedRead(e) => Self::KeyedRead(Box::new_in(
                 KeyedRead {
@@ -249,7 +250,7 @@ impl<'a> AngularExpression<'a> {
                     receiver: e.receiver.clone_in(alloc),
                     key: e.key.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::SafeKeyedRead(e) => Self::SafeKeyedRead(Box::new_in(
                 SafeKeyedRead {
@@ -258,10 +259,10 @@ impl<'a> AngularExpression<'a> {
                     receiver: e.receiver.clone_in(alloc),
                     key: e.key.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::BindingPipe(e) => {
-                let mut args = Vec::new_in(alloc);
+                let mut args = Vec::new_in(&alloc);
                 for arg in e.args.iter() {
                     args.push(arg.clone_in(alloc));
                 }
@@ -275,7 +276,7 @@ impl<'a> AngularExpression<'a> {
                         args,
                         pipe_type: e.pipe_type,
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::LiteralPrimitive(e) => Self::LiteralPrimitive(Box::new_in(
@@ -284,20 +285,20 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     value: e.value.clone(),
                 },
-                alloc,
+                &alloc,
             )),
             Self::LiteralArray(e) => {
-                let mut expressions = Vec::new_in(alloc);
+                let mut expressions = Vec::new_in(&alloc);
                 for expr in e.expressions.iter() {
                     expressions.push(expr.clone_in(alloc));
                 }
                 Self::LiteralArray(Box::new_in(
                     LiteralArray { span: e.span, source_span: e.source_span, expressions },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::LiteralMap(e) => {
-                let mut keys = Vec::new_in(alloc);
+                let mut keys = Vec::new_in(&alloc);
                 for key in e.keys.iter() {
                     keys.push(match key {
                         LiteralMapKey::Property(prop) => {
@@ -315,21 +316,21 @@ impl<'a> AngularExpression<'a> {
                         }
                     });
                 }
-                let mut values = Vec::new_in(alloc);
+                let mut values = Vec::new_in(&alloc);
                 for val in e.values.iter() {
                     values.push(val.clone_in(alloc));
                 }
                 Self::LiteralMap(Box::new_in(
                     LiteralMap { span: e.span, source_span: e.source_span, keys, values },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::Interpolation(e) => {
-                let mut strings = Vec::new_in(alloc);
+                let mut strings = Vec::new_in(&alloc);
                 for s in e.strings.iter() {
                     strings.push(s.clone());
                 }
-                let mut expressions = Vec::new_in(alloc);
+                let mut expressions = Vec::new_in(&alloc);
                 for expr in e.expressions.iter() {
                     expressions.push(expr.clone_in(alloc));
                 }
@@ -340,7 +341,7 @@ impl<'a> AngularExpression<'a> {
                         strings,
                         expressions,
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::Binary(e) => Self::Binary(Box::new_in(
@@ -351,7 +352,7 @@ impl<'a> AngularExpression<'a> {
                     left: e.left.clone_in(alloc),
                     right: e.right.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::Unary(e) => Self::Unary(Box::new_in(
                 Unary {
@@ -360,7 +361,7 @@ impl<'a> AngularExpression<'a> {
                     operator: e.operator.clone(),
                     expr: e.expr.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::PrefixNot(e) => Self::PrefixNot(Box::new_in(
                 PrefixNot {
@@ -368,7 +369,7 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::TypeofExpression(e) => Self::TypeofExpression(Box::new_in(
                 TypeofExpression {
@@ -376,7 +377,7 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::VoidExpression(e) => Self::VoidExpression(Box::new_in(
                 VoidExpression {
@@ -384,7 +385,7 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::NonNullAssert(e) => Self::NonNullAssert(Box::new_in(
                 NonNullAssert {
@@ -392,10 +393,10 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::Call(e) => {
-                let mut args = Vec::new_in(alloc);
+                let mut args = Vec::new_in(&alloc);
                 for arg in e.args.iter() {
                     args.push(arg.clone_in(alloc));
                 }
@@ -407,11 +408,11 @@ impl<'a> AngularExpression<'a> {
                         args,
                         argument_span: e.argument_span,
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::SafeCall(e) => {
-                let mut args = Vec::new_in(alloc);
+                let mut args = Vec::new_in(&alloc);
                 for arg in e.args.iter() {
                     args.push(arg.clone_in(alloc));
                 }
@@ -423,11 +424,11 @@ impl<'a> AngularExpression<'a> {
                         args,
                         argument_span: e.argument_span,
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::TaggedTemplateLiteral(e) => {
-                let mut elements = Vec::new_in(alloc);
+                let mut elements = Vec::new_in(&alloc);
                 for el in e.template.elements.iter() {
                     elements.push(TemplateLiteralElement {
                         span: el.span,
@@ -435,7 +436,7 @@ impl<'a> AngularExpression<'a> {
                         text: el.text.clone(),
                     });
                 }
-                let mut expressions = Vec::new_in(alloc);
+                let mut expressions = Vec::new_in(&alloc);
                 for expr in e.template.expressions.iter() {
                     expressions.push(expr.clone_in(alloc));
                 }
@@ -451,11 +452,11 @@ impl<'a> AngularExpression<'a> {
                             expressions,
                         },
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::TemplateLiteral(e) => {
-                let mut elements = Vec::new_in(alloc);
+                let mut elements = Vec::new_in(&alloc);
                 for el in e.elements.iter() {
                     elements.push(TemplateLiteralElement {
                         span: el.span,
@@ -463,7 +464,7 @@ impl<'a> AngularExpression<'a> {
                         text: el.text.clone(),
                     });
                 }
-                let mut expressions = Vec::new_in(alloc);
+                let mut expressions = Vec::new_in(&alloc);
                 for expr in e.expressions.iter() {
                     expressions.push(expr.clone_in(alloc));
                 }
@@ -474,7 +475,7 @@ impl<'a> AngularExpression<'a> {
                         elements,
                         expressions,
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
             Self::ParenthesizedExpression(e) => Self::ParenthesizedExpression(Box::new_in(
@@ -483,7 +484,7 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::RegularExpressionLiteral(e) => Self::RegularExpressionLiteral(Box::new_in(
                 RegularExpressionLiteral {
@@ -492,7 +493,7 @@ impl<'a> AngularExpression<'a> {
                     body: e.body.clone(),
                     flags: e.flags.clone(),
                 },
-                alloc,
+                &alloc,
             )),
             Self::SpreadElement(e) => Self::SpreadElement(Box::new_in(
                 SpreadElement {
@@ -500,10 +501,10 @@ impl<'a> AngularExpression<'a> {
                     source_span: e.source_span,
                     expression: e.expression.clone_in(alloc),
                 },
-                alloc,
+                &alloc,
             )),
             Self::ArrowFunction(e) => {
-                let mut parameters = Vec::new_in(alloc);
+                let mut parameters = Vec::new_in(&alloc);
                 for param in e.parameters.iter() {
                     parameters.push(ArrowFunctionParameter {
                         name: param.name.clone(),
@@ -518,7 +519,7 @@ impl<'a> AngularExpression<'a> {
                         parameters,
                         body: e.body.clone_in(alloc),
                     },
-                    alloc,
+                    &alloc,
                 ))
             }
         }

@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use oxc_diagnostics::OxcDiagnostic;
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use super::ast::{
     ArrowFunctionBody, BinaryOperator, DeclareVarStmt, DynamicImportUrl, FnParam, LeadingComment,
@@ -228,7 +229,10 @@ impl EmitterContext {
     /// Returns `None` if no source file information was provided or no mappings exist.
     ///
     /// See: `packages/compiler/src/output/abstract_emitter.ts:126-184`
-    pub fn to_source_map(&self, generated_file: Option<&str>) -> Option<oxc_sourcemap::SourceMap> {
+    pub fn to_source_map(
+        &self,
+        generated_file: Option<&str>,
+    ) -> Option<oxc_sourcemap::OwnedSourceMap> {
         // Need source file to generate a source map
         let source_file = self.source_file.as_ref()?;
         let source_url = &source_file.url;
@@ -296,7 +300,7 @@ impl EmitterContext {
             }
         }
 
-        if has_mappings { Some(builder.into_sourcemap()) } else { None }
+        if has_mappings { Some(builder.into_owned_sourcemap()) } else { None }
     }
 
     /// Generate source and source map together.
@@ -306,7 +310,7 @@ impl EmitterContext {
     pub fn to_source_with_map(
         &self,
         generated_file: Option<&str>,
-    ) -> (String, Option<oxc_sourcemap::SourceMap>) {
+    ) -> (String, Option<oxc_sourcemap::OwnedSourceMap>) {
         (self.to_source(), self.to_source_map(generated_file))
     }
 }
@@ -355,6 +359,7 @@ fn get_source_span(expr: &OutputExpression<'_>) -> Option<Span> {
         OutputExpression::WrappedNode(e) => e.source_span,
         OutputExpression::WrappedIrNode(e) => e.source_span,
         OutputExpression::SpreadElement(e) => e.source_span,
+        OutputExpression::RawSource(e) => e.source_span,
     }
 }
 
@@ -406,7 +411,7 @@ impl JsEmitter {
         expr: &OutputExpression<'a>,
         source_file: Arc<ParseSourceFile>,
         generated_file: Option<&str>,
-    ) -> (String, Option<oxc_sourcemap::SourceMap>) {
+    ) -> (String, Option<oxc_sourcemap::OwnedSourceMap>) {
         let mut ctx = EmitterContext::with_source_file(source_file);
         self.visit_expression(expr, &mut ctx);
         ctx.to_source_with_map(generated_file)
@@ -421,7 +426,7 @@ impl JsEmitter {
         stmts: &[OutputStatement<'a>],
         source_file: Arc<ParseSourceFile>,
         generated_file: Option<&str>,
-    ) -> (String, Option<oxc_sourcemap::SourceMap>) {
+    ) -> (String, Option<oxc_sourcemap::OwnedSourceMap>) {
         let mut ctx = EmitterContext::with_source_file(source_file);
         self.visit_all_statements(stmts, &mut ctx);
         ctx.to_source_with_map(generated_file)
@@ -875,6 +880,9 @@ impl JsEmitter {
                 ctx.print("...");
                 self.visit_expression(&e.expr, ctx);
             }
+            OutputExpression::RawSource(e) => {
+                ctx.print(&e.source);
+            }
         }
     }
 
@@ -948,10 +956,16 @@ impl JsEmitter {
                     ctx.print(",");
                 }
             }
-            let key = escape_identifier(&entry.key, self.escape_dollar_in_strings, entry.quoted);
-            ctx.print(&key);
-            ctx.print(":");
-            self.visit_expression(&entry.value, ctx);
+            if entry.is_spread {
+                ctx.print("...");
+                self.visit_expression(&entry.value, ctx);
+            } else {
+                let key =
+                    escape_identifier(&entry.key, self.escape_dollar_in_strings, entry.quoted);
+                ctx.print(&key);
+                ctx.print(":");
+                self.visit_expression(&entry.value, ctx);
+            }
         }
         if incremented_indent {
             ctx.dec_indent();
@@ -1393,7 +1407,7 @@ mod tests {
     use super::*;
     use crate::output::ast::{LiteralExpr, LiteralValue, ReadVarExpr};
     use oxc_allocator::{Allocator, Box};
-    use oxc_span::Ident;
+    use oxc_str::Ident;
 
     #[test]
     fn test_emit_literal_null() {
@@ -1401,7 +1415,7 @@ mod tests {
         let alloc = Allocator::default();
         let expr = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Null, source_span: None },
-            &alloc,
+            &&alloc,
         ));
         assert_eq!(emitter.emit_expression(&expr), "null");
     }
@@ -1412,7 +1426,7 @@ mod tests {
         let alloc = Allocator::default();
         let expr = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Boolean(true), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         assert_eq!(emitter.emit_expression(&expr), "true");
     }
@@ -1423,7 +1437,7 @@ mod tests {
         let alloc = Allocator::default();
         let expr = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(42.5), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         assert_eq!(emitter.emit_expression(&expr), "42.5");
     }
@@ -1479,7 +1493,7 @@ mod tests {
         let alloc = Allocator::default();
         let expr = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::String(Ident::from("hello")), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         // Uses double quotes to match Angular's output style
         assert_eq!(emitter.emit_expression(&expr), "\"hello\"");
@@ -1491,7 +1505,7 @@ mod tests {
         let alloc = Allocator::default();
         let expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("myVar"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         assert_eq!(emitter.emit_expression(&expr), "myVar");
     }
@@ -1629,7 +1643,7 @@ mod tests {
         let map = ctx.to_source_map(Some("test.js")).expect("should generate source map");
 
         // Verify the source map has the expected structure
-        assert!(map.get_sources().any(|s| s.as_ref() == "test.ts"));
+        assert!(map.get_sources().any(|s| s == "test.ts"));
         assert!(map.get_tokens().count() > 0);
     }
 
@@ -1764,7 +1778,7 @@ mod tests {
     #[test]
     fn test_emit_jsdoc_comment() {
         use super::super::ast::{DeclareVarStmt, JsDocComment, LeadingComment, StmtModifier};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
 
@@ -1782,7 +1796,7 @@ mod tests {
         };
 
         let output = emitter.emit_statement(&crate::output::ast::OutputStatement::DeclareVar(
-            oxc_allocator::Box::new_in(stmt, &oxc_allocator::Allocator::default()),
+            oxc_allocator::Box::new_in(stmt, &&oxc_allocator::Allocator::default()),
         ));
 
         assert!(output.contains("/** @desc Hello world @meaning greeting */"));
@@ -1792,7 +1806,7 @@ mod tests {
     #[test]
     fn test_emit_jsdoc_with_suppress() {
         use super::super::ast::{DeclareVarStmt, JsDocComment, LeadingComment, StmtModifier};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
 
@@ -1810,7 +1824,7 @@ mod tests {
         };
 
         let output = emitter.emit_statement(&crate::output::ast::OutputStatement::DeclareVar(
-            oxc_allocator::Box::new_in(stmt, &oxc_allocator::Allocator::default()),
+            oxc_allocator::Box::new_in(stmt, &&oxc_allocator::Allocator::default()),
         ));
 
         assert!(output.contains("/** @suppress {msgDescriptions} */"));
@@ -1820,7 +1834,7 @@ mod tests {
     #[test]
     fn test_emit_single_line_comment() {
         use super::super::ast::{DeclareVarStmt, LeadingComment, StmtModifier};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
 
@@ -1833,7 +1847,7 @@ mod tests {
         };
 
         let output = emitter.emit_statement(&crate::output::ast::OutputStatement::DeclareVar(
-            oxc_allocator::Box::new_in(stmt, &oxc_allocator::Allocator::default()),
+            oxc_allocator::Box::new_in(stmt, &&oxc_allocator::Allocator::default()),
         ));
 
         assert!(output.contains("// test comment"));
@@ -1843,7 +1857,7 @@ mod tests {
     #[test]
     fn test_emit_multi_line_comment() {
         use super::super::ast::{DeclareVarStmt, LeadingComment, StmtModifier};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
 
@@ -1856,7 +1870,7 @@ mod tests {
         };
 
         let output = emitter.emit_statement(&crate::output::ast::OutputStatement::DeclareVar(
-            oxc_allocator::Box::new_in(stmt, &oxc_allocator::Allocator::default()),
+            oxc_allocator::Box::new_in(stmt, &&oxc_allocator::Allocator::default()),
         ));
 
         // Multi-line comments get " * " prefix on continuation lines
@@ -1867,7 +1881,7 @@ mod tests {
     #[test]
     fn test_emit_multi_line_comment_with_asterisk() {
         use super::super::ast::{DeclareVarStmt, LeadingComment, StmtModifier};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
 
@@ -1883,7 +1897,7 @@ mod tests {
         };
 
         let output = emitter.emit_statement(&crate::output::ast::OutputStatement::DeclareVar(
-            oxc_allocator::Box::new_in(stmt, &oxc_allocator::Allocator::default()),
+            oxc_allocator::Box::new_in(stmt, &&oxc_allocator::Allocator::default()),
         ));
 
         // Should have space before * on each continuation line
@@ -1896,7 +1910,7 @@ mod tests {
     fn test_emit_conditional_expression() {
         use super::super::ast::{ConditionalExpr, LiteralExpr, LiteralValue, ReadVarExpr};
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -1904,25 +1918,25 @@ mod tests {
         // Build: (condition? true: false)
         let condition = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("condition"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let true_case = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(2.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let false_case = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(-1.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         let expr = OutputExpression::Conditional(Box::new_in(
             ConditionalExpr {
-                condition: Box::new_in(condition, &alloc),
-                true_case: Box::new_in(true_case, &alloc),
-                false_case: Some(Box::new_in(false_case, &alloc)),
+                condition: Box::new_in(condition, &&alloc),
+                true_case: Box::new_in(true_case, &&alloc),
+                false_case: Some(Box::new_in(false_case, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -1936,7 +1950,7 @@ mod tests {
             BinaryOperatorExpr, ConditionalExpr, LiteralExpr, LiteralValue, ReadVarExpr,
         };
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -1949,9 +1963,9 @@ mod tests {
                 lhs: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: Ident::from("tmp"), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 rhs: Box::new_in(
                     OutputExpression::Literal(Box::new_in(
@@ -1959,35 +1973,35 @@ mod tests {
                             value: LiteralValue::String(Ident::from("year")),
                             source_span: None,
                         },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let inner_cond_expr = OutputExpression::Conditional(Box::new_in(
             ConditionalExpr {
-                condition: Box::new_in(inner_condition, &alloc),
+                condition: Box::new_in(inner_condition, &&alloc),
                 true_case: Box::new_in(
                     OutputExpression::Literal(Box::new_in(
                         LiteralExpr { value: LiteralValue::Number(3.0), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 false_case: Some(Box::new_in(
                     OutputExpression::Literal(Box::new_in(
                         LiteralExpr { value: LiteralValue::Number(-1.0), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 )),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         // Outer conditional: (tmp === "month")? 2: inner
@@ -1997,9 +2011,9 @@ mod tests {
                 lhs: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: Ident::from("tmp"), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 rhs: Box::new_in(
                     OutputExpression::Literal(Box::new_in(
@@ -2007,29 +2021,29 @@ mod tests {
                             value: LiteralValue::String(Ident::from("month")),
                             source_span: None,
                         },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let expr = OutputExpression::Conditional(Box::new_in(
             ConditionalExpr {
-                condition: Box::new_in(outer_condition, &alloc),
+                condition: Box::new_in(outer_condition, &&alloc),
                 true_case: Box::new_in(
                     OutputExpression::Literal(Box::new_in(
                         LiteralExpr { value: LiteralValue::Number(2.0), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
-                false_case: Some(Box::new_in(inner_cond_expr, &alloc)),
+                false_case: Some(Box::new_in(inner_cond_expr, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2047,29 +2061,29 @@ mod tests {
         // Build: [...arr, 1, 2]
         let arr_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("arr"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let spread_expr = OutputExpression::SpreadElement(Box::new_in(
-            SpreadElementExpr { expr: Box::new_in(arr_var, &alloc), source_span: None },
-            &alloc,
+            SpreadElementExpr { expr: Box::new_in(arr_var, &&alloc), source_span: None },
+            &&alloc,
         ));
         let one = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(1.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let two = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(2.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
-        let mut entries = oxc_allocator::Vec::new_in(&alloc);
+        let mut entries = oxc_allocator::Vec::new_in(&&alloc);
         entries.push(spread_expr);
         entries.push(one);
         entries.push(two);
 
         let array_expr = OutputExpression::LiteralArray(Box::new_in(
             LiteralArrayExpr { entries, source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&array_expr);
@@ -2086,28 +2100,28 @@ mod tests {
         // Build: [...a, ...b]
         let a_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("a"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let b_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("b"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let spread_a = OutputExpression::SpreadElement(Box::new_in(
-            SpreadElementExpr { expr: Box::new_in(a_var, &alloc), source_span: None },
-            &alloc,
+            SpreadElementExpr { expr: Box::new_in(a_var, &&alloc), source_span: None },
+            &&alloc,
         ));
         let spread_b = OutputExpression::SpreadElement(Box::new_in(
-            SpreadElementExpr { expr: Box::new_in(b_var, &alloc), source_span: None },
-            &alloc,
+            SpreadElementExpr { expr: Box::new_in(b_var, &&alloc), source_span: None },
+            &&alloc,
         ));
 
-        let mut entries = oxc_allocator::Vec::new_in(&alloc);
+        let mut entries = oxc_allocator::Vec::new_in(&&alloc);
         entries.push(spread_a);
         entries.push(spread_b);
 
         let array_expr = OutputExpression::LiteralArray(Box::new_in(
             LiteralArrayExpr { entries, source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&array_expr);
@@ -2122,7 +2136,7 @@ mod tests {
     fn test_emit_nullish_coalescing_with_logical_and_on_left() {
         use super::super::ast::BinaryOperatorExpr;
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -2130,37 +2144,37 @@ mod tests {
         // Build: (a && b) ?? c
         let a = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("a"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let b = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("b"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let c = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("c"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         // a && b
         let and_expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::And,
-                lhs: Box::new_in(a, &alloc),
-                rhs: Box::new_in(b, &alloc),
+                lhs: Box::new_in(a, &&alloc),
+                rhs: Box::new_in(b, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         // (a && b) ?? c
         let expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::NullishCoalesce,
-                lhs: Box::new_in(and_expr, &alloc),
-                rhs: Box::new_in(c, &alloc),
+                lhs: Box::new_in(and_expr, &&alloc),
+                rhs: Box::new_in(c, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2172,7 +2186,7 @@ mod tests {
     fn test_emit_nullish_coalescing_with_logical_or_on_right() {
         use super::super::ast::BinaryOperatorExpr;
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -2180,37 +2194,37 @@ mod tests {
         // Build: a ?? (b || c)
         let a = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("a"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let b = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("b"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let c = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("c"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         // b || c
         let or_expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::Or,
-                lhs: Box::new_in(b, &alloc),
-                rhs: Box::new_in(c, &alloc),
+                lhs: Box::new_in(b, &&alloc),
+                rhs: Box::new_in(c, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         // a ?? (b || c)
         let expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::NullishCoalesce,
-                lhs: Box::new_in(a, &alloc),
-                rhs: Box::new_in(or_expr, &alloc),
+                lhs: Box::new_in(a, &&alloc),
+                rhs: Box::new_in(or_expr, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2222,7 +2236,7 @@ mod tests {
     fn test_emit_logical_and_with_nullish_coalescing_on_left() {
         use super::super::ast::BinaryOperatorExpr;
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -2230,37 +2244,37 @@ mod tests {
         // Build: (a ?? b) && c
         let a = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("a"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let b = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("b"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let c = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("c"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         // a ?? b
         let nullish_expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::NullishCoalesce,
-                lhs: Box::new_in(a, &alloc),
-                rhs: Box::new_in(b, &alloc),
+                lhs: Box::new_in(a, &&alloc),
+                rhs: Box::new_in(b, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         // (a ?? b) && c
         let expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::And,
-                lhs: Box::new_in(nullish_expr, &alloc),
-                rhs: Box::new_in(c, &alloc),
+                lhs: Box::new_in(nullish_expr, &&alloc),
+                rhs: Box::new_in(c, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2272,7 +2286,7 @@ mod tests {
     fn test_emit_nullish_coalescing_with_conditional_on_left() {
         use super::super::ast::{BinaryOperatorExpr, ConditionalExpr};
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -2280,41 +2294,41 @@ mod tests {
         // Build: (a ? b : c) ?? d
         let a = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("a"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let b = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("b"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let c = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("c"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let d = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("d"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         // a ? b : c
         let cond_expr = OutputExpression::Conditional(Box::new_in(
             ConditionalExpr {
-                condition: Box::new_in(a, &alloc),
-                true_case: Box::new_in(b, &alloc),
-                false_case: Some(Box::new_in(c, &alloc)),
+                condition: Box::new_in(a, &&alloc),
+                true_case: Box::new_in(b, &&alloc),
+                false_case: Some(Box::new_in(c, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         // (a ? b : c) ?? d
         let expr = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::NullishCoalesce,
-                lhs: Box::new_in(cond_expr, &alloc),
-                rhs: Box::new_in(d, &alloc),
+                lhs: Box::new_in(cond_expr, &&alloc),
+                rhs: Box::new_in(d, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2338,32 +2352,32 @@ mod tests {
         // Build: (x) =>(x + 1)
         let x_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("x"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let one = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(1.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let body = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::Plus,
-                lhs: Box::new_in(x_var, &alloc),
-                rhs: Box::new_in(one, &alloc),
+                lhs: Box::new_in(x_var, &&alloc),
+                rhs: Box::new_in(one, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
-        let mut params = oxc_allocator::Vec::new_in(&alloc);
+        let mut params = oxc_allocator::Vec::new_in(&&alloc);
         params.push(FnParam { name: Ident::from("x") });
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
                 params,
-                body: ArrowFunctionBody::Expression(Box::new_in(body, &alloc)),
+                body: ArrowFunctionBody::Expression(Box::new_in(body, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2383,33 +2397,33 @@ mod tests {
         // Build: (x, y) =>(x + y)
         let x_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("x"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let y_var = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("y"), source_span: None },
-            &alloc,
+            &&alloc,
         ));
         let body = OutputExpression::BinaryOperator(Box::new_in(
             BinaryOperatorExpr {
                 operator: super::super::ast::BinaryOperator::Plus,
-                lhs: Box::new_in(x_var, &alloc),
-                rhs: Box::new_in(y_var, &alloc),
+                lhs: Box::new_in(x_var, &&alloc),
+                rhs: Box::new_in(y_var, &&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
-        let mut params = oxc_allocator::Vec::new_in(&alloc);
+        let mut params = oxc_allocator::Vec::new_in(&&alloc);
         params.push(FnParam { name: Ident::from("x") });
         params.push(FnParam { name: Ident::from("y") });
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
                 params,
-                body: ArrowFunctionBody::Expression(Box::new_in(body, &alloc)),
+                body: ArrowFunctionBody::Expression(Box::new_in(body, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2427,18 +2441,18 @@ mod tests {
         // Build: () =>42
         let body = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Number(42.0), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
-        let params = oxc_allocator::Vec::new_in(&alloc);
+        let params = oxc_allocator::Vec::new_in(&&alloc);
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
                 params,
-                body: ArrowFunctionBody::Expression(Box::new_in(body, &alloc)),
+                body: ArrowFunctionBody::Expression(Box::new_in(body, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2454,11 +2468,11 @@ mod tests {
         let alloc = Allocator::default();
 
         // Simple $localize with a single message part and no expressions
-        let mut message_parts = oxc_allocator::Vec::new_in(&alloc);
+        let mut message_parts = oxc_allocator::Vec::new_in(&&alloc);
         message_parts.push(Ident::from("Hello"));
 
-        let placeholder_names = oxc_allocator::Vec::new_in(&alloc);
-        let expressions = oxc_allocator::Vec::new_in(&alloc);
+        let placeholder_names = oxc_allocator::Vec::new_in(&&alloc);
+        let expressions = oxc_allocator::Vec::new_in(&&alloc);
 
         let expr = OutputExpression::LocalizedString(Box::new_in(
             LocalizedStringExpr {
@@ -2466,7 +2480,7 @@ mod tests {
                 meaning: None,
                 custom_id: None,
                 raw_message_parts: {
-                    let mut raw = oxc_allocator::Vec::new_in(&alloc);
+                    let mut raw = oxc_allocator::Vec::new_in(&&alloc);
                     raw.extend(message_parts.iter().copied());
                     raw
                 },
@@ -2475,7 +2489,7 @@ mod tests {
                 expressions,
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2491,17 +2505,17 @@ mod tests {
         let alloc = Allocator::default();
 
         // $localize with interpolation: "Hello {$name}!"
-        let mut message_parts = oxc_allocator::Vec::new_in(&alloc);
+        let mut message_parts = oxc_allocator::Vec::new_in(&&alloc);
         message_parts.push(Ident::from("Hello "));
         message_parts.push(Ident::from("!"));
 
-        let mut placeholder_names = oxc_allocator::Vec::new_in(&alloc);
+        let mut placeholder_names = oxc_allocator::Vec::new_in(&&alloc);
         placeholder_names.push(Ident::from("name"));
 
-        let mut expressions = oxc_allocator::Vec::new_in(&alloc);
+        let mut expressions = oxc_allocator::Vec::new_in(&&alloc);
         expressions.push(OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("name"), source_span: None },
-            &alloc,
+            &&alloc,
         )));
 
         let expr = OutputExpression::LocalizedString(Box::new_in(
@@ -2510,7 +2524,7 @@ mod tests {
                 meaning: None,
                 custom_id: None,
                 raw_message_parts: {
-                    let mut raw = oxc_allocator::Vec::new_in(&alloc);
+                    let mut raw = oxc_allocator::Vec::new_in(&&alloc);
                     raw.extend(message_parts.iter().copied());
                     raw
                 },
@@ -2519,7 +2533,7 @@ mod tests {
                 expressions,
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2543,11 +2557,11 @@ mod tests {
         let expr = OutputExpression::Function(Box::new_in(
             FunctionExpr {
                 name: None,
-                params: oxc_allocator::Vec::new_in(&alloc),
-                statements: oxc_allocator::Vec::new_in(&alloc),
+                params: oxc_allocator::Vec::new_in(&&alloc),
+                statements: oxc_allocator::Vec::new_in(&&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2564,11 +2578,11 @@ mod tests {
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
-                params: oxc_allocator::Vec::new_in(&alloc),
-                body: ArrowFunctionBody::Statements(oxc_allocator::Vec::new_in(&alloc)),
+                params: oxc_allocator::Vec::new_in(&&alloc),
+                body: ArrowFunctionBody::Statements(oxc_allocator::Vec::new_in(&&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2585,17 +2599,17 @@ mod tests {
 
         let condition = OutputExpression::Literal(Box::new_in(
             LiteralExpr { value: LiteralValue::Boolean(true), source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         let stmt = OutputStatement::If(Box::new_in(
             IfStmt {
                 condition,
-                true_case: oxc_allocator::Vec::new_in(&alloc),
-                false_case: oxc_allocator::Vec::new_in(&alloc),
+                true_case: oxc_allocator::Vec::new_in(&&alloc),
+                false_case: oxc_allocator::Vec::new_in(&&alloc),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_statement(&stmt);
@@ -2606,7 +2620,7 @@ mod tests {
     fn test_emit_empty_declare_function_body() {
         use super::super::ast::{DeclareFunctionStmt, StmtModifier};
         use oxc_allocator::{Allocator, Box};
-        use oxc_span::Ident;
+        use oxc_str::Ident;
 
         let emitter = JsEmitter::new();
         let alloc = Allocator::default();
@@ -2614,12 +2628,12 @@ mod tests {
         let stmt = OutputStatement::DeclareFunction(Box::new_in(
             DeclareFunctionStmt {
                 name: Ident::from("foo"),
-                params: oxc_allocator::Vec::new_in(&alloc),
-                statements: oxc_allocator::Vec::new_in(&alloc),
+                params: oxc_allocator::Vec::new_in(&&alloc),
+                statements: oxc_allocator::Vec::new_in(&&alloc),
                 modifiers: StmtModifier::NONE,
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_statement(&stmt);
@@ -2645,15 +2659,15 @@ mod tests {
                 fn_expr: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: Ident::from("signal"), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 args: {
-                    let mut args = oxc_allocator::Vec::new_in(&alloc);
+                    let mut args = oxc_allocator::Vec::new_in(&&alloc);
                     args.push(OutputExpression::Literal(Box::new_in(
                         LiteralExpr { value: LiteralValue::Boolean(true), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )));
                     args
                 },
@@ -2661,30 +2675,26 @@ mod tests {
                 optional: false,
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
-        let mut entries = oxc_allocator::Vec::new_in(&alloc);
-        entries.push(LiteralMapEntry {
-            key: Ident::from("showMenu"),
-            value: signal_call,
-            quoted: false,
-        });
+        let mut entries = oxc_allocator::Vec::new_in(&&alloc);
+        entries.push(LiteralMapEntry::new(Ident::from("showMenu"), signal_call, false));
 
         let obj_literal = OutputExpression::LiteralMap(Box::new_in(
             LiteralMapExpr { entries, source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
-        let params = oxc_allocator::Vec::new_in(&alloc);
+        let params = oxc_allocator::Vec::new_in(&&alloc);
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
                 params,
-                body: ArrowFunctionBody::Expression(Box::new_in(obj_literal, &alloc)),
+                body: ArrowFunctionBody::Expression(Box::new_in(obj_literal, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);
@@ -2710,15 +2720,15 @@ mod tests {
                 fn_expr: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: Ident::from("signal"), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )),
-                    &alloc,
+                    &&alloc,
                 ),
                 args: {
-                    let mut args = oxc_allocator::Vec::new_in(&alloc);
+                    let mut args = oxc_allocator::Vec::new_in(&&alloc);
                     args.push(OutputExpression::Literal(Box::new_in(
                         LiteralExpr { value: LiteralValue::Boolean(true), source_span: None },
-                        &alloc,
+                        &&alloc,
                     )));
                     args
                 },
@@ -2726,36 +2736,32 @@ mod tests {
                 optional: false,
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
-        let mut entries = oxc_allocator::Vec::new_in(&alloc);
-        entries.push(LiteralMapEntry {
-            key: Ident::from("showMenu"),
-            value: signal_call,
-            quoted: false,
-        });
+        let mut entries = oxc_allocator::Vec::new_in(&&alloc);
+        entries.push(LiteralMapEntry::new(Ident::from("showMenu"), signal_call, false));
 
         let obj_literal = OutputExpression::LiteralMap(Box::new_in(
             LiteralMapExpr { entries, source_span: None },
-            &alloc,
+            &&alloc,
         ));
 
         // Wrap in Parenthesized (this is what convert_oxc_expression produces)
         let parenthesized = OutputExpression::Parenthesized(Box::new_in(
-            ParenthesizedExpr { expr: Box::new_in(obj_literal, &alloc), source_span: None },
-            &alloc,
+            ParenthesizedExpr { expr: Box::new_in(obj_literal, &&alloc), source_span: None },
+            &&alloc,
         ));
 
-        let params = oxc_allocator::Vec::new_in(&alloc);
+        let params = oxc_allocator::Vec::new_in(&&alloc);
 
         let expr = OutputExpression::ArrowFunction(Box::new_in(
             ArrowFunctionExpr {
                 params,
-                body: ArrowFunctionBody::Expression(Box::new_in(parenthesized, &alloc)),
+                body: ArrowFunctionBody::Expression(Box::new_in(parenthesized, &&alloc)),
                 source_span: None,
             },
-            &alloc,
+            &&alloc,
         ));
 
         let output = emitter.emit_expression(&expr);

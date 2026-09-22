@@ -12,7 +12,7 @@
 //! ```
 
 use oxc_allocator::{Allocator, Box, Vec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use super::metadata::{InjectableProvider, ProvidedIn, R3InjectableMetadata};
 use crate::factory::{
@@ -60,7 +60,7 @@ pub fn compile_injectable_from_metadata<'a>(
     // Create the expression: ɵɵdefineInjectable(definitionMap)
     let expression = create_define_injectable_call(allocator, definition_map);
 
-    InjectableCompileResult { expression, statements: Vec::new_in(allocator) }
+    InjectableCompileResult { expression, statements: Vec::new_in(&allocator) }
 }
 
 /// Builds the factory expression based on the provider type.
@@ -82,7 +82,7 @@ fn build_factory_expression<'a>(
         type_expr: metadata.r#type.clone_in(allocator),
         type_decl: metadata.r#type.clone_in(allocator),
         type_argument_count: metadata.type_argument_count,
-        deps: R3FactoryDeps::Valid(Vec::new_in(allocator)), // Empty deps for base
+        deps: R3FactoryDeps::Valid(Vec::new_in(&allocator)), // Empty deps for base
         target: FactoryTarget::Injectable,
     };
 
@@ -179,7 +179,7 @@ fn clone_deps_vec<'a>(
     allocator: &'a Allocator,
     deps: &[R3DependencyMetadata<'a>],
 ) -> Vec<'a, R3DependencyMetadata<'a>> {
-    let mut result = Vec::with_capacity_in(deps.len(), allocator);
+    let mut result = Vec::with_capacity_in(deps.len(), &allocator);
     for dep in deps {
         result.push(R3DependencyMetadata {
             token: dep.token.as_ref().map(|t| t.clone_in(allocator)),
@@ -188,6 +188,7 @@ fn clone_deps_vec<'a>(
             optional: dep.optional,
             self_: dep.self_,
             skip_self: dep.skip_self,
+            type_only_invalid: dep.type_only_invalid,
         });
     }
     result
@@ -206,29 +207,29 @@ fn create_inject_call<'a>(
                 receiver: Box::new_in(
                     OutputExpression::ReadVar(Box::new_in(
                         ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                        allocator,
+                        &allocator,
                     )),
-                    allocator,
+                    &allocator,
                 ),
                 name: Ident::from(Identifiers::RESOLVE_FORWARD_REF),
                 optional: false,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
 
-        let mut resolve_args = Vec::new_in(allocator);
+        let mut resolve_args = Vec::new_in(&allocator);
         resolve_args.push(existing.clone_in(allocator));
 
         OutputExpression::InvokeFunction(Box::new_in(
             InvokeFunctionExpr {
-                fn_expr: Box::new_in(resolve_fn, allocator),
+                fn_expr: Box::new_in(resolve_fn, &allocator),
                 args: resolve_args,
                 pure: false,
                 optional: false,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ))
     } else {
         existing.clone_in(allocator)
@@ -240,29 +241,29 @@ fn create_inject_call<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::INJECT),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
-    let mut inject_args = Vec::new_in(allocator);
+    let mut inject_args = Vec::new_in(&allocator);
     inject_args.push(token_expr);
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(inject_fn, allocator),
+            fn_expr: Box::new_in(inject_fn, &allocator),
             args: inject_args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -273,12 +274,12 @@ fn create_factory_delegation<'a>(
 ) -> OutputExpression<'a> {
     OutputExpression::ReadProp(Box::new_in(
         ReadPropExpr {
-            receiver: Box::new_in(type_expr.clone_in(allocator), allocator),
+            receiver: Box::new_in(type_expr.clone_in(allocator), &allocator),
             name: Ident::from("ɵfac"),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -288,7 +289,7 @@ fn create_forward_ref_factory<'a>(
     type_expr: &OutputExpression<'a>,
 ) -> OutputExpression<'a> {
     let param_name = Ident::from("t");
-    let mut params = Vec::new_in(allocator);
+    let mut params = Vec::new_in(&allocator);
     params.push(FnParam { name: param_name.clone() });
 
     // resolveForwardRef(Type)
@@ -297,70 +298,70 @@ fn create_forward_ref_factory<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::RESOLVE_FORWARD_REF),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
-    let mut resolve_args = Vec::new_in(allocator);
+    let mut resolve_args = Vec::new_in(&allocator);
     resolve_args.push(type_expr.clone_in(allocator));
 
     let resolved_type = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(resolve_fn, allocator),
+            fn_expr: Box::new_in(resolve_fn, &allocator),
             args: resolve_args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // resolveForwardRef(Type).ɵfac
     let fac_access = OutputExpression::ReadProp(Box::new_in(
         ReadPropExpr {
-            receiver: Box::new_in(resolved_type, allocator),
+            receiver: Box::new_in(resolved_type, &allocator),
             name: Ident::from("ɵfac"),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // resolveForwardRef(Type).ɵfac(t)
-    let mut call_args = Vec::new_in(allocator);
+    let mut call_args = Vec::new_in(&allocator);
     call_args.push(OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: param_name, source_span: None },
-        allocator,
+        &allocator,
     )));
 
     let fac_call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(fac_access, allocator),
+            fn_expr: Box::new_in(fac_access, &allocator),
             args: call_args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create the arrow function
-    let mut body = Vec::new_in(allocator);
+    let mut body = Vec::new_in(&allocator);
     body.push(OutputStatement::Return(Box::new_in(
         ReturnStatement { value: fac_call, source_span: None },
-        allocator,
+        &allocator,
     )));
 
     OutputExpression::Function(Box::new_in(
         FunctionExpr { name: None, params, statements: body, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -369,29 +370,29 @@ fn create_use_factory_wrapper<'a>(
     allocator: &'a Allocator,
     factory: &OutputExpression<'a>,
 ) -> OutputExpression<'a> {
-    let params = Vec::new_in(allocator);
+    let params = Vec::new_in(&allocator);
 
     // factory()
     let factory_call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(factory.clone_in(allocator), allocator),
-            args: Vec::new_in(allocator),
+            fn_expr: Box::new_in(factory.clone_in(allocator), &allocator),
+            args: Vec::new_in(&allocator),
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
-    let mut body = Vec::new_in(allocator);
+    let mut body = Vec::new_in(&allocator);
     body.push(OutputStatement::Return(Box::new_in(
         ReturnStatement { value: factory_call, source_span: None },
-        allocator,
+        &allocator,
     )));
 
     OutputExpression::Function(Box::new_in(
         FunctionExpr { name: None, params, statements: body, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -401,69 +402,65 @@ fn build_definition_map<'a>(
     metadata: &R3InjectableMetadata<'a>,
     factory_expr: OutputExpression<'a>,
 ) -> Vec<'a, LiteralMapEntry<'a>> {
-    let mut entries = Vec::new_in(allocator);
+    let mut entries = Vec::new_in(&allocator);
 
     // token: MyService
-    entries.push(LiteralMapEntry {
-        key: Ident::from("token"),
-        value: metadata.r#type.clone_in(allocator),
-        quoted: false,
-    });
+    entries.push(LiteralMapEntry::new(
+        Ident::from("token"),
+        metadata.r#type.clone_in(allocator),
+        false,
+    ));
 
     // factory: <factory_function>
-    entries.push(LiteralMapEntry {
-        key: Ident::from("factory"),
-        value: factory_expr,
-        quoted: false,
-    });
+    entries.push(LiteralMapEntry::new(Ident::from("factory"), factory_expr, false));
 
     // providedIn: 'root' (only if not None)
     match &metadata.provided_in {
         ProvidedIn::Root => {
-            entries.push(LiteralMapEntry {
-                key: Ident::from("providedIn"),
-                value: OutputExpression::Literal(Box::new_in(
+            entries.push(LiteralMapEntry::new(
+                Ident::from("providedIn"),
+                OutputExpression::Literal(Box::new_in(
                     LiteralExpr {
                         value: LiteralValue::String(Ident::from("root")),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 )),
-                quoted: false,
-            });
+                false,
+            ));
         }
         ProvidedIn::Platform => {
-            entries.push(LiteralMapEntry {
-                key: Ident::from("providedIn"),
-                value: OutputExpression::Literal(Box::new_in(
+            entries.push(LiteralMapEntry::new(
+                Ident::from("providedIn"),
+                OutputExpression::Literal(Box::new_in(
                     LiteralExpr {
                         value: LiteralValue::String(Ident::from("platform")),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 )),
-                quoted: false,
-            });
+                false,
+            ));
         }
         ProvidedIn::Any => {
-            entries.push(LiteralMapEntry {
-                key: Ident::from("providedIn"),
-                value: OutputExpression::Literal(Box::new_in(
+            entries.push(LiteralMapEntry::new(
+                Ident::from("providedIn"),
+                OutputExpression::Literal(Box::new_in(
                     LiteralExpr {
                         value: LiteralValue::String(Ident::from("any")),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 )),
-                quoted: false,
-            });
+                false,
+            ));
         }
         ProvidedIn::Module(module_expr) => {
-            entries.push(LiteralMapEntry {
-                key: Ident::from("providedIn"),
-                value: module_expr.clone_in(allocator),
-                quoted: false,
-            });
+            entries.push(LiteralMapEntry::new(
+                Ident::from("providedIn"),
+                module_expr.clone_in(allocator),
+                false,
+            ));
         }
         ProvidedIn::None => {
             // Don't add providedIn field
@@ -484,36 +481,36 @@ fn create_define_injectable_call<'a>(
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(Identifiers::DEFINE_INJECTABLE),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     // Create the literal map expression
     let map_expr = OutputExpression::LiteralMap(Box::new_in(
         LiteralMapExpr { entries: definition_map, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     // Create the function call
-    let mut args = Vec::new_in(allocator);
+    let mut args = Vec::new_in(&allocator);
     args.push(map_expr);
 
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(define_injectable_fn, allocator),
+            fn_expr: Box::new_in(define_injectable_fn, &allocator),
             args,
             pure: true, // Pure function for tree-shaking
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -528,7 +525,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("MyService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3InjectableMetadataBuilder::new()
@@ -553,14 +550,14 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("CONFIG_TOKEN"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let value_expr = OutputExpression::Literal(Box::new_in(
             LiteralExpr {
                 value: LiteralValue::String(Ident::from("config_value")),
                 source_span: None,
             },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3InjectableMetadataBuilder::new()
@@ -585,11 +582,11 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("AliasService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let existing_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("RealService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3InjectableMetadataBuilder::new()
@@ -613,7 +610,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("LocalService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3InjectableMetadataBuilder::new()
@@ -649,25 +646,26 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("CipherService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let factory_fn = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("cipherServiceFactory"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         // Create dependency metadata
-        let mut deps = Vec::new_in(&allocator);
+        let mut deps = Vec::new_in(&&allocator);
         deps.push(R3DependencyMetadata {
             token: Some(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("LogService"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             attribute_name_type: None,
             host: false,
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         });
 
         let metadata = R3InjectableMetadataBuilder::new()
@@ -706,25 +704,26 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("BaseService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         let class_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("ConcreteService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         // Create dependency metadata
-        let mut deps = Vec::new_in(&allocator);
+        let mut deps = Vec::new_in(&&allocator);
         deps.push(R3DependencyMetadata {
             token: Some(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("DepService"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             attribute_name_type: None,
             host: false,
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         });
 
         let metadata = R3InjectableMetadataBuilder::new()

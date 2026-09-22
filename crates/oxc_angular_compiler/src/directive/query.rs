@@ -6,7 +6,7 @@
 //! in directive definitions.
 
 use oxc_allocator::{Allocator, Box, FromIn, Vec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use super::metadata::{QueryPredicate, R3QueryMetadata};
 use crate::output::ast::{
@@ -108,15 +108,15 @@ fn import_expr<'a>(allocator: &'a Allocator, identifier: &'static str) -> Output
             receiver: Box::new_in(
                 OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: Ident::from("i0"), source_span: None },
-                    allocator,
+                    &allocator,
                 )),
-                allocator,
+                &allocator,
             ),
             name: Ident::from(identifier),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -124,7 +124,7 @@ fn import_expr<'a>(allocator: &'a Allocator, identifier: &'static str) -> Output
 fn variable<'a>(allocator: &'a Allocator, name: &'static str) -> OutputExpression<'a> {
     OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from(name), source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -132,7 +132,7 @@ fn variable<'a>(allocator: &'a Allocator, name: &'static str) -> OutputExpressio
 fn literal_number<'a>(allocator: &'a Allocator, value: u32) -> OutputExpression<'a> {
     OutputExpression::Literal(Box::new_in(
         LiteralExpr { value: LiteralValue::Number(f64::from(value)), source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -140,12 +140,12 @@ fn literal_number<'a>(allocator: &'a Allocator, value: u32) -> OutputExpression<
 fn context_prop<'a>(allocator: &'a Allocator, property_name: &Ident<'a>) -> OutputExpression<'a> {
     OutputExpression::ReadProp(Box::new_in(
         ReadPropExpr {
-            receiver: Box::new_in(variable(allocator, CONTEXT_NAME), allocator),
+            receiver: Box::new_in(variable(allocator, CONTEXT_NAME), &allocator),
             name: property_name.clone(),
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -157,13 +157,13 @@ fn call_fn<'a>(
 ) -> OutputExpression<'a> {
     OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(fn_expr, allocator),
+            fn_expr: Box::new_in(fn_expr, &allocator),
             args,
             pure: false,
             optional: false,
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -177,21 +177,21 @@ fn render_flag_check_if_stmt<'a>(
     let condition = OutputExpression::BinaryOperator(Box::new_in(
         BinaryOperatorExpr {
             operator: BinaryOperator::BitwiseAnd,
-            lhs: Box::new_in(variable(allocator, RENDER_FLAGS), allocator),
-            rhs: Box::new_in(literal_number(allocator, flags), allocator),
+            lhs: Box::new_in(variable(allocator, RENDER_FLAGS), &allocator),
+            rhs: Box::new_in(literal_number(allocator, flags), &allocator),
             source_span: None,
         },
-        allocator,
+        &allocator,
     ));
 
     OutputStatement::If(Box::new_in(
         IfStmt {
             condition,
             true_case: statements,
-            false_case: Vec::new_in(allocator),
+            false_case: Vec::new_in(&allocator),
             source_span: None,
         },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -199,7 +199,7 @@ fn render_flag_check_if_stmt<'a>(
 fn expr_stmt<'a>(allocator: &'a Allocator, expr: OutputExpression<'a>) -> OutputStatement<'a> {
     OutputStatement::Expression(Box::new_in(
         ExpressionStatement { expr, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -225,7 +225,7 @@ fn get_query_predicate<'a>(
         QueryPredicate::Selectors(selectors) => {
             // Convert selectors to literal array
             // Each selector may contain comma-separated refs that need splitting
-            let mut entries = Vec::new_in(allocator);
+            let mut entries = Vec::new_in(&allocator);
 
             for selector in selectors.iter() {
                 // Split by comma and trim
@@ -237,7 +237,7 @@ fn get_query_predicate<'a>(
                                 value: LiteralValue::String(Ident::from(trimmed)),
                                 source_span: None,
                             },
-                            allocator,
+                            &allocator,
                         )));
                     }
                 }
@@ -245,7 +245,7 @@ fn get_query_predicate<'a>(
 
             let array_expr = OutputExpression::LiteralArray(Box::new_in(
                 LiteralArrayExpr { entries, source_span: None },
-                allocator,
+                &allocator,
             ));
 
             // Pool the array to a top-level constant if pool is provided
@@ -277,7 +277,7 @@ fn get_query_create_parameters_with_predicate<'a>(
     query: &R3QueryMetadata<'a>,
     predicate: OutputExpression<'a>,
 ) -> Vec<'a, OutputExpression<'a>> {
-    let mut parameters = Vec::new_in(allocator);
+    let mut parameters = Vec::new_in(&allocator);
 
     // For signal queries, first param is ctx.propertyName
     if query.is_signal {
@@ -311,7 +311,7 @@ fn get_content_query_create_parameters_with_predicate<'a>(
     predicate: OutputExpression<'a>,
     prepend_params: Vec<'a, OutputExpression<'a>>,
 ) -> Vec<'a, OutputExpression<'a>> {
-    let mut parameters = Vec::new_in(allocator);
+    let mut parameters = Vec::new_in(&allocator);
 
     // Add prepend params (e.g., dirIndex for content queries)
     for param in prepend_params {
@@ -356,14 +356,14 @@ fn collapse_advance_statements<'a>(
     allocator: &'a Allocator,
     statements: Vec<'a, MaybeAdvanceStatement<'a>>,
 ) -> Vec<'a, OutputStatement<'a>> {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
     let mut advance_count = 0u32;
 
     // Process statements and flush pending advances
     let flush_advance = |result: &mut Vec<'a, OutputStatement<'a>>, count: &mut u32| {
         if *count > 0 {
             // Create ɵɵqueryAdvance() or ɵɵqueryAdvance(count)
-            let mut args = Vec::new_in(allocator);
+            let mut args = Vec::new_in(&allocator);
             if *count > 1 {
                 args.push(literal_number(allocator, *count));
             }
@@ -414,7 +414,7 @@ impl TempAllocator {
         self.allocated = true;
         OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from(TEMPORARY_NAME), source_span: None },
-            allocator,
+            &allocator,
         ))
     }
 
@@ -446,6 +446,7 @@ pub fn create_view_queries_function<'a>(
     view_queries: &[R3QueryMetadata<'a>],
     name: Option<&str>,
     pool: Option<&mut ConstantPool<'a>>,
+    angular_version: Option<crate::AngularVersion>,
 ) -> OutputExpression<'a> {
     // Pre-pool all string selector predicates BEFORE building the function.
     // This ensures query predicates are pooled to top-level constants in the correct order
@@ -456,28 +457,63 @@ pub fn create_view_queries_function<'a>(
         view_queries.iter().map(|query| get_query_predicate(allocator, query, None)).collect()
     };
 
-    let mut create_statements = Vec::new_in(allocator);
-    let mut update_statements: Vec<'a, MaybeAdvanceStatement<'a>> = Vec::new_in(allocator);
+    let mut create_statements = Vec::new_in(&allocator);
+    let mut update_statements: Vec<'a, MaybeAdvanceStatement<'a>> = Vec::new_in(&allocator);
     let mut temp_allocator = TempAllocator::new();
+
+    // Chained emit (`ɵɵviewQuery(p1)(p2)`) requires Angular 21.0.4+ /
+    // 21.1.0+ — before that the runtime functions returned `void` and a
+    // chained call would throw `TypeError: not a function`. Consumers
+    // targeting v19/v20/v21.0.0–3 must opt out by passing an explicit
+    // `angular_version`; an unset version falls in line with the rest
+    // of this crate's "assume latest" convention (see e.g.
+    // `supports_implicit_standalone`'s `map_or(true, …)` and the
+    // `angular_version: None // assume latest` comment in `transform.rs`).
+    let chain_emit = angular_version.map_or(true, |v| v.supports_chained_queries());
+    let mut current_chain: Option<OutputExpression<'a>> = None;
+    let mut current_chain_is_signal: bool = false;
+
+    fn flush_chain<'a>(
+        allocator: &'a Allocator,
+        chain: &mut Option<OutputExpression<'a>>,
+        create_statements: &mut Vec<'a, OutputStatement<'a>>,
+    ) {
+        if let Some(expr) = chain.take() {
+            create_statements.push(expr_stmt(allocator, expr));
+        }
+    }
 
     for (idx, query) in view_queries.iter().enumerate() {
         // Creation: ɵɵviewQuery(predicate, flags, read) or ɵɵviewQuerySignal(ctx.prop, predicate, flags, read)
         // Use pre-pooled predicate instead of calling get_query_create_parameters
         let params = get_query_create_parameters_with_predicate(
-            allocator,
+            &allocator,
             query,
             pooled_predicates[idx].clone_in(allocator),
         );
 
-        // Emit each query as a separate statement.
-        // Angular 20's ɵɵviewQuery returns void, so chaining is not supported.
-        if query.is_signal {
-            let call =
-                call_fn(allocator, import_expr(allocator, Identifiers::VIEW_QUERY_SIGNAL), params);
+        let identifier =
+            if query.is_signal { Identifiers::VIEW_QUERY_SIGNAL } else { Identifiers::VIEW_QUERY };
+
+        if !chain_emit {
+            // Pre-v21.0.4: one statement per query, no chaining.
+            let call = call_fn(allocator, import_expr(allocator, identifier), params);
             create_statements.push(expr_stmt(allocator, call));
         } else {
-            let call = call_fn(allocator, import_expr(allocator, Identifiers::VIEW_QUERY), params);
-            create_statements.push(expr_stmt(allocator, call));
+            // Flush the pending chain if this query's signal-ness differs
+            // (different runtime symbol — can't be chained off the previous call).
+            if current_chain.is_some() && current_chain_is_signal != query.is_signal {
+                flush_chain(allocator, &mut current_chain, &mut create_statements);
+            }
+
+            let callee = match current_chain.take() {
+                Some(prev) => prev,
+                None => {
+                    current_chain_is_signal = query.is_signal;
+                    import_expr(allocator, identifier)
+                }
+            };
+            current_chain = Some(call_fn(allocator, callee, params));
         }
 
         // Update phase
@@ -491,25 +527,25 @@ pub fn create_view_queries_function<'a>(
 
             // _t = ɵɵloadQuery()
             let load_query = call_fn(
-                allocator,
+                &allocator,
                 import_expr(allocator, Identifiers::LOAD_QUERY),
-                Vec::new_in(allocator),
+                Vec::new_in(&allocator),
             );
             let temp_set = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::Assign,
-                    lhs: Box::new_in(temp.clone_in(allocator), allocator),
-                    rhs: Box::new_in(load_query, allocator),
+                    lhs: Box::new_in(temp.clone_in(allocator), &allocator),
+                    rhs: Box::new_in(load_query, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
             // ɵɵqueryRefresh(_t = ɵɵloadQuery())
-            let mut refresh_args = Vec::new_in(allocator);
+            let mut refresh_args = Vec::new_in(&allocator);
             refresh_args.push(temp_set);
             let refresh = call_fn(
-                allocator,
+                &allocator,
                 import_expr(allocator, Identifiers::QUERY_REFRESH),
                 refresh_args,
             );
@@ -518,12 +554,12 @@ pub fn create_view_queries_function<'a>(
             let value = if query.first {
                 OutputExpression::ReadProp(Box::new_in(
                     ReadPropExpr {
-                        receiver: Box::new_in(temp.clone_in(allocator), allocator),
+                        receiver: Box::new_in(temp.clone_in(allocator), &allocator),
                         name: Ident::from("first"),
                         optional: false,
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 ))
             } else {
                 temp.clone_in(allocator)
@@ -532,22 +568,22 @@ pub fn create_view_queries_function<'a>(
             let update_directive = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::Assign,
-                    lhs: Box::new_in(context_prop(allocator, &query.property_name), allocator),
-                    rhs: Box::new_in(value, allocator),
+                    lhs: Box::new_in(context_prop(allocator, &query.property_name), &allocator),
+                    rhs: Box::new_in(value, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
             // refresh && (ctx.prop = ...)
             let and_expr = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::And,
-                    lhs: Box::new_in(refresh, allocator),
-                    rhs: Box::new_in(update_directive, allocator),
+                    lhs: Box::new_in(refresh, &allocator),
+                    rhs: Box::new_in(update_directive, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
             update_statements
@@ -555,8 +591,11 @@ pub fn create_view_queries_function<'a>(
         }
     }
 
+    // Flush the trailing chain (if any) as the final create statement.
+    flush_chain(allocator, &mut current_chain, &mut create_statements);
+
     // Build update statements with temp variable declarations
-    let mut final_update_statements = Vec::new_in(allocator);
+    let mut final_update_statements = Vec::new_in(&allocator);
 
     // Add temp variable declarations if needed
     if temp_allocator.needs_declaration() {
@@ -568,7 +607,7 @@ pub fn create_view_queries_function<'a>(
                 leading_comment: None,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -578,32 +617,32 @@ pub fn create_view_queries_function<'a>(
     }
 
     // Build function body
-    let mut body = Vec::new_in(allocator);
+    let mut body = Vec::new_in(&allocator);
     if !create_statements.is_empty() {
         body.push(render_flag_check_if_stmt(allocator, render_flags::CREATE, create_statements));
     }
     if !final_update_statements.is_empty() {
         body.push(render_flag_check_if_stmt(
-            allocator,
+            &allocator,
             render_flags::UPDATE,
             final_update_statements,
         ));
     }
 
     // Build function parameters
-    let mut params = Vec::new_in(allocator);
+    let mut params = Vec::new_in(&allocator);
     params.push(FnParam { name: Ident::from(RENDER_FLAGS) });
     params.push(FnParam { name: Ident::from(CONTEXT_NAME) });
 
     // Create function name
     let fn_name = name.map(|n| {
         let formatted = format!("{n}_Query");
-        Ident::from_in(formatted.as_str(), allocator)
+        Ident::from_in(formatted.as_str(), &allocator)
     });
 
     OutputExpression::Function(Box::new_in(
         FunctionExpr { name: fn_name, params, statements: body, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -630,6 +669,7 @@ pub fn create_content_queries_function<'a>(
     queries: &[R3QueryMetadata<'a>],
     name: Option<&str>,
     pool: Option<&mut ConstantPool<'a>>,
+    angular_version: Option<crate::AngularVersion>,
 ) -> OutputExpression<'a> {
     // Pre-pool all string selector predicates BEFORE building the function.
     // This ensures query predicates are pooled to top-level constants in the correct order
@@ -640,35 +680,60 @@ pub fn create_content_queries_function<'a>(
         queries.iter().map(|query| get_query_predicate(allocator, query, None)).collect()
     };
 
-    let mut create_statements = Vec::new_in(allocator);
-    let mut update_statements: Vec<'a, MaybeAdvanceStatement<'a>> = Vec::new_in(allocator);
+    let mut create_statements = Vec::new_in(&allocator);
+    let mut update_statements: Vec<'a, MaybeAdvanceStatement<'a>> = Vec::new_in(&allocator);
     let mut temp_allocator = TempAllocator::new();
+
+    // See note in `create_view_queries_function` — chained content-query
+    // emit also requires v21.0.4+ runtime support, with `None` meaning
+    // "assume latest" per the rest of this crate's convention.
+    let chain_emit = angular_version.map_or(true, |v| v.supports_chained_queries());
+    let mut current_chain: Option<OutputExpression<'a>> = None;
+    let mut current_chain_is_signal: bool = false;
+
+    fn flush_chain<'a>(
+        allocator: &'a Allocator,
+        chain: &mut Option<OutputExpression<'a>>,
+        create_statements: &mut Vec<'a, OutputStatement<'a>>,
+    ) {
+        if let Some(expr) = chain.take() {
+            create_statements.push(expr_stmt(allocator, expr));
+        }
+    }
 
     for (idx, query) in queries.iter().enumerate() {
         // Prepend dirIndex parameter for content queries
-        let mut prepend = Vec::new_in(allocator);
+        let mut prepend = Vec::new_in(&allocator);
         prepend.push(variable(allocator, "dirIndex"));
         // Use pre-pooled predicate instead of calling get_query_create_parameters
         let params = get_content_query_create_parameters_with_predicate(
-            allocator,
+            &allocator,
             query,
             pooled_predicates[idx].clone_in(allocator),
             prepend,
         );
 
-        // Emit each query as a separate statement.
-        // Angular 20's ɵɵcontentQuery returns void, so chaining is not supported.
-        if query.is_signal {
-            let call = call_fn(
-                allocator,
-                import_expr(allocator, Identifiers::CONTENT_QUERY_SIGNAL),
-                params,
-            );
+        let identifier = if query.is_signal {
+            Identifiers::CONTENT_QUERY_SIGNAL
+        } else {
+            Identifiers::CONTENT_QUERY
+        };
+
+        if !chain_emit {
+            let call = call_fn(allocator, import_expr(allocator, identifier), params);
             create_statements.push(expr_stmt(allocator, call));
         } else {
-            let call =
-                call_fn(allocator, import_expr(allocator, Identifiers::CONTENT_QUERY), params);
-            create_statements.push(expr_stmt(allocator, call));
+            if current_chain.is_some() && current_chain_is_signal != query.is_signal {
+                flush_chain(allocator, &mut current_chain, &mut create_statements);
+            }
+            let callee = match current_chain.take() {
+                Some(prev) => prev,
+                None => {
+                    current_chain_is_signal = query.is_signal;
+                    import_expr(allocator, identifier)
+                }
+            };
+            current_chain = Some(call_fn(allocator, callee, params));
         }
 
         // Update phase (same as view queries)
@@ -678,24 +743,24 @@ pub fn create_content_queries_function<'a>(
             let temp = temp_allocator.allocate(allocator);
 
             let load_query = call_fn(
-                allocator,
+                &allocator,
                 import_expr(allocator, Identifiers::LOAD_QUERY),
-                Vec::new_in(allocator),
+                Vec::new_in(&allocator),
             );
             let temp_set = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::Assign,
-                    lhs: Box::new_in(temp.clone_in(allocator), allocator),
-                    rhs: Box::new_in(load_query, allocator),
+                    lhs: Box::new_in(temp.clone_in(allocator), &allocator),
+                    rhs: Box::new_in(load_query, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
-            let mut refresh_args = Vec::new_in(allocator);
+            let mut refresh_args = Vec::new_in(&allocator);
             refresh_args.push(temp_set);
             let refresh = call_fn(
-                allocator,
+                &allocator,
                 import_expr(allocator, Identifiers::QUERY_REFRESH),
                 refresh_args,
             );
@@ -703,12 +768,12 @@ pub fn create_content_queries_function<'a>(
             let value = if query.first {
                 OutputExpression::ReadProp(Box::new_in(
                     ReadPropExpr {
-                        receiver: Box::new_in(temp.clone_in(allocator), allocator),
+                        receiver: Box::new_in(temp.clone_in(allocator), &allocator),
                         name: Ident::from("first"),
                         optional: false,
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 ))
             } else {
                 temp.clone_in(allocator)
@@ -717,21 +782,21 @@ pub fn create_content_queries_function<'a>(
             let update_directive = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::Assign,
-                    lhs: Box::new_in(context_prop(allocator, &query.property_name), allocator),
-                    rhs: Box::new_in(value, allocator),
+                    lhs: Box::new_in(context_prop(allocator, &query.property_name), &allocator),
+                    rhs: Box::new_in(value, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
             let and_expr = OutputExpression::BinaryOperator(Box::new_in(
                 BinaryOperatorExpr {
                     operator: BinaryOperator::And,
-                    lhs: Box::new_in(refresh, allocator),
-                    rhs: Box::new_in(update_directive, allocator),
+                    lhs: Box::new_in(refresh, &allocator),
+                    rhs: Box::new_in(update_directive, &allocator),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
 
             update_statements
@@ -739,8 +804,11 @@ pub fn create_content_queries_function<'a>(
         }
     }
 
+    // Flush the trailing chain (if any) as the final create statement.
+    flush_chain(allocator, &mut current_chain, &mut create_statements);
+
     // Build update statements with temp variable declarations
-    let mut final_update_statements = Vec::new_in(allocator);
+    let mut final_update_statements = Vec::new_in(&allocator);
 
     if temp_allocator.needs_declaration() {
         final_update_statements.push(OutputStatement::DeclareVar(Box::new_in(
@@ -751,7 +819,7 @@ pub fn create_content_queries_function<'a>(
                 leading_comment: None,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -760,20 +828,20 @@ pub fn create_content_queries_function<'a>(
     }
 
     // Build function body
-    let mut body = Vec::new_in(allocator);
+    let mut body = Vec::new_in(&allocator);
     if !create_statements.is_empty() {
         body.push(render_flag_check_if_stmt(allocator, render_flags::CREATE, create_statements));
     }
     if !final_update_statements.is_empty() {
         body.push(render_flag_check_if_stmt(
-            allocator,
+            &allocator,
             render_flags::UPDATE,
             final_update_statements,
         ));
     }
 
     // Build function parameters (rf, ctx, dirIndex)
-    let mut params = Vec::new_in(allocator);
+    let mut params = Vec::new_in(&allocator);
     params.push(FnParam { name: Ident::from(RENDER_FLAGS) });
     params.push(FnParam { name: Ident::from(CONTEXT_NAME) });
     params.push(FnParam { name: Ident::from("dirIndex") });
@@ -781,12 +849,12 @@ pub fn create_content_queries_function<'a>(
     // Create function name
     let fn_name = name.map(|n| {
         let formatted = format!("{n}_ContentQueries");
-        Ident::from_in(formatted.as_str(), allocator)
+        Ident::from_in(formatted.as_str(), &allocator)
     });
 
     OutputExpression::Function(Box::new_in(
         FunctionExpr { name: fn_name, params, statements: body, source_span: None },
-        allocator,
+        &allocator,
     ))
 }
 
@@ -812,7 +880,8 @@ mod tests {
         let allocator = Allocator::default();
         let queries: &[R3QueryMetadata<'_>] = &[];
 
-        let result = create_view_queries_function(&allocator, queries, Some("TestComponent"), None);
+        let result =
+            create_view_queries_function(&allocator, queries, Some("TestComponent"), None, None);
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
@@ -828,7 +897,7 @@ mod tests {
         let queries: &[R3QueryMetadata<'_>] = &[];
 
         let result =
-            create_content_queries_function(&allocator, queries, Some("TestDirective"), None);
+            create_content_queries_function(&allocator, queries, Some("TestDirective"), None, None);
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
@@ -850,7 +919,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("SomeComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: false,
@@ -861,7 +930,7 @@ mod tests {
 
         let queries = [query];
         let result =
-            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None);
+            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None, None);
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
@@ -892,7 +961,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("ContentComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: false,
@@ -902,8 +971,13 @@ mod tests {
         };
 
         let queries = [query];
-        let result =
-            create_content_queries_function(&allocator, &queries, Some("TestDirective"), None);
+        let result = create_content_queries_function(
+            &allocator,
+            &queries,
+            Some("TestDirective"),
+            None,
+            None,
+        );
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
@@ -922,7 +996,11 @@ mod tests {
         );
     }
 
-    /// Test two chained signal view queries
+    /// Two consecutive signal view queries should be emitted as a single
+    /// chained call — matches upstream ngtsc emit (compiler-cli compliance
+    /// `signal_queries/query_in_component.js`). `ɵɵviewQuerySignal` returns
+    /// `typeof ɵɵviewQuerySignal` (core/src/render3/instructions/
+    /// queries_signals.ts:53), so chaining is safe.
     #[test]
     fn test_chained_signal_view_queries() {
         let allocator = Allocator::default();
@@ -933,7 +1011,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("Component1"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: false,
@@ -947,7 +1025,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("Component2"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: false,
@@ -957,34 +1035,46 @@ mod tests {
         };
 
         let queries = [query1, query2];
-        let result =
-            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None);
+        // Force the v22 path so the chained emit is exercised. On older
+        // runtimes (`None` or anything before v21.0.4) the builder emits
+        // separate statements instead — see `supports_chained_queries`.
+        let result = create_view_queries_function(
+            &allocator,
+            &queries,
+            Some("TestComponent"),
+            None,
+            Some(crate::AngularVersion::new(22, 0, 0)),
+        );
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
 
-        println!("Chained signal queries output:\n{}", output);
-
-        // Each signal query should be emitted as a separate statement.
-        // Angular 20's ɵɵviewQuerySignal returns void, so chaining is not supported.
         let normalized = output.replace(['\n', ' '], "");
         assert!(
-            normalized.contains("viewQuerySignal(ctx.query1,Component1,1);")
-                && normalized.contains("viewQuerySignal(ctx.query2,Component2,1);"),
-            "Each signal query should be a separate statement.\nGot:\n{}",
+            normalized
+                .contains("viewQuerySignal(ctx.query1,Component1,1)(ctx.query2,Component2,1);"),
+            "Consecutive signal view queries should chain.\nGot:\n{}",
+            output
+        );
+        // And there must NOT be two separate statements.
+        assert!(
+            !normalized.contains("viewQuerySignal(ctx.query1,Component1,1);"),
+            "First signal query must not be a standalone statement.\nGot:\n{}",
             output
         );
     }
 
-    /// Regression test: Multiple non-signal view queries must be separate statements.
+    /// Multiple non-signal view queries should chain — `ɵɵviewQuery`
+    /// returns `typeof ɵɵviewQuery` (core/src/render3/instructions/
+    /// queries.ts:58) and upstream emit chains them (see
+    /// compiler-cli/test/compliance/test_cases/r3_compiler_compliance/
+    /// components_and_directives/queries/*.js).
     ///
-    /// Previously, multiple view queries were chained as ɵɵviewQuery(p1)(p2), calling
-    /// the result of the first query as a function. Angular 20's ɵɵviewQuery returns void,
-    /// so chaining breaks with: TypeError: ɵɵviewQuery(...) is not a function.
-    ///
-    /// The fix: Emit each query as a separate statement.
+    /// Earlier versions of this compiler emitted separate statements based
+    /// on an incorrect "returns void" assumption — this regression test
+    /// guards the corrected behavior.
     #[test]
-    fn test_multiple_non_signal_view_queries_are_separate_statements() {
+    fn test_multiple_non_signal_view_queries_are_chained() {
         let allocator = Allocator::default();
 
         let query1 = R3QueryMetadata {
@@ -992,7 +1082,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("ChildComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: true,
@@ -1006,7 +1096,7 @@ mod tests {
             first: false,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("OtherComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: true,
@@ -1016,41 +1106,38 @@ mod tests {
         };
 
         let queries = [query1, query2];
-        let result =
-            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None);
+        let result = create_view_queries_function(
+            &allocator,
+            &queries,
+            Some("TestComponent"),
+            None,
+            Some(crate::AngularVersion::new(22, 0, 0)),
+        );
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
 
         let normalized = output.replace(['\n', ' '], "");
 
-        // Each non-signal view query should be a separate statement (ending with ;),
-        // NOT chained as ɵɵviewQuery(ChildComponent,5)(OtherComponent,5).
+        // Should produce a single chained call statement.
         assert!(
-            normalized.contains("i0.ɵɵviewQuery(ChildComponent,5);"),
-            "First view query should be a separate statement.\nGot:\n{}",
+            normalized.contains("i0.ɵɵviewQuery(ChildComponent,5)(OtherComponent,5);"),
+            "Consecutive non-signal view queries should chain.\nGot:\n{}",
             output
         );
+        // And NOT be two separate statements.
         assert!(
-            normalized.contains("i0.ɵɵviewQuery(OtherComponent,5);"),
-            "Second view query should be a separate statement.\nGot:\n{}",
-            output
-        );
-
-        // Make sure they're NOT chained (the old buggy pattern)
-        assert!(
-            !normalized.contains("viewQuery(ChildComponent,5)(OtherComponent"),
-            "View queries must NOT be chained (Angular 20 returns void).\nGot:\n{}",
+            !normalized.contains("i0.ɵɵviewQuery(ChildComponent,5);"),
+            "First view query must not be a standalone statement.\nGot:\n{}",
             output
         );
     }
 
-    /// Regression test: Multiple content queries must be separate statements.
-    ///
-    /// Same as the view query chaining bug, but for content queries.
-    /// Angular 20's ɵɵcontentQuery also returns void, so chaining breaks.
+    /// Multiple consecutive content queries should chain — same contract
+    /// as view queries (`ɵɵcontentQuery` returns `typeof ɵɵcontentQuery`,
+    /// core/src/render3/instructions/queries.ts:40).
     #[test]
-    fn test_multiple_content_queries_are_separate_statements() {
+    fn test_multiple_content_queries_are_chained() {
         let allocator = Allocator::default();
 
         let query1 = R3QueryMetadata {
@@ -1058,7 +1145,7 @@ mod tests {
             first: false,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("ItemComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: true,
             emit_distinct_changes_only: true,
@@ -1072,7 +1159,7 @@ mod tests {
             first: true,
             predicate: QueryPredicate::Type(OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("HeaderComponent"), source_span: None },
-                &allocator,
+                &&allocator,
             ))),
             descendants: false,
             emit_distinct_changes_only: true,
@@ -1082,31 +1169,31 @@ mod tests {
         };
 
         let queries = [query1, query2];
-        let result =
-            create_content_queries_function(&allocator, &queries, Some("TestDirective"), None);
+        let result = create_content_queries_function(
+            &allocator,
+            &queries,
+            Some("TestDirective"),
+            None,
+            Some(crate::AngularVersion::new(22, 0, 0)),
+        );
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);
 
         let normalized = output.replace(['\n', ' '], "");
 
-        // Each content query should be a separate statement (ending with ;),
-        // NOT chained as ɵɵcontentQuery(dirIndex,ItemComponent,5)(dirIndex,HeaderComponent,4).
+        // Should produce a single chained call statement.
         assert!(
-            normalized.contains("i0.ɵɵcontentQuery(dirIndex,ItemComponent,5);"),
-            "First content query should be a separate statement.\nGot:\n{}",
+            normalized.contains(
+                "i0.ɵɵcontentQuery(dirIndex,ItemComponent,5)(dirIndex,HeaderComponent,4);"
+            ),
+            "Consecutive content queries should chain.\nGot:\n{}",
             output
         );
+        // And NOT be two separate statements.
         assert!(
-            normalized.contains("i0.ɵɵcontentQuery(dirIndex,HeaderComponent,4);"),
-            "Second content query should be a separate statement.\nGot:\n{}",
-            output
-        );
-
-        // Make sure they're NOT chained
-        assert!(
-            !normalized.contains("contentQuery(dirIndex,ItemComponent,5)(dirIndex,HeaderComponent"),
-            "Content queries must NOT be chained (Angular 20 returns void).\nGot:\n{}",
+            !normalized.contains("i0.ɵɵcontentQuery(dirIndex,ItemComponent,5);"),
+            "First content query must not be a standalone statement.\nGot:\n{}",
             output
         );
     }
@@ -1117,7 +1204,7 @@ mod tests {
         let allocator = Allocator::default();
 
         // Create a signal query with a string selector
-        let mut selectors = Vec::new_in(&allocator);
+        let mut selectors = Vec::new_in(&&allocator);
         selectors.push(Ident::from("myRef"));
 
         let query = R3QueryMetadata {
@@ -1133,7 +1220,7 @@ mod tests {
 
         let queries = [query];
         let result =
-            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None);
+            create_view_queries_function(&allocator, &queries, Some("TestComponent"), None, None);
 
         let emitter = JsEmitter::new();
         let output = emitter.emit_expression(&result);

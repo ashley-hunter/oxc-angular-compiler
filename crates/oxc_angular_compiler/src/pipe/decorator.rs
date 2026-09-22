@@ -8,11 +8,13 @@ use oxc_ast::ast::{
     Argument, Class, ClassElement, Decorator, Expression, MethodDefinitionKind, ObjectPropertyKind,
     PropertyKey,
 };
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use super::metadata::R3PipeMetadata;
 use crate::factory::R3DependencyMetadata;
 use crate::output::ast::{OutputExpression, ReadVarExpr};
+use crate::output::oxc_converter::convert_oxc_expression;
 
 /// Extracted pipe metadata from a `@Pipe` decorator.
 ///
@@ -67,7 +69,7 @@ impl<'a> PipeMetadata<'a> {
         // Create type expression: reference to the pipe class
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: self.class_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ));
 
         Some(R3PipeMetadata {
@@ -107,6 +109,7 @@ pub fn extract_pipe_metadata<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
     implicit_standalone: bool,
+    _source_text: Option<&'a str>,
 ) -> Option<PipeMetadata<'a>> {
     // Get the class name
     let class_name: Ident<'a> = class.id.as_ref()?.name.clone().into();
@@ -171,7 +174,9 @@ pub fn extract_pipe_metadata<'a>(
 }
 
 /// Find the @Pipe decorator in a list of decorators.
-fn find_pipe_decorator<'a>(decorators: &'a [Decorator<'a>]) -> Option<&'a Decorator<'a>> {
+pub(crate) fn find_pipe_decorator<'a>(
+    decorators: &'a [Decorator<'a>],
+) -> Option<&'a Decorator<'a>> {
     decorators.iter().find(|d| match &d.expression {
         Expression::CallExpression(call) => is_pipe_call(&call.callee),
         Expression::Identifier(id) => id.name == "Pipe",
@@ -247,7 +252,7 @@ fn extract_constructor_deps<'a>(
 
     // Get the constructor's parameters
     let params = &constructor.value.params;
-    let mut deps = Vec::with_capacity_in(params.items.len(), allocator);
+    let mut deps = Vec::with_capacity_in(params.items.len(), &allocator);
 
     for param in &params.items {
         let dep = extract_param_dependency(allocator, param);
@@ -262,16 +267,26 @@ fn extract_param_dependency<'a>(
     allocator: &'a Allocator,
     param: &oxc_ast::ast::FormalParameter<'a>,
 ) -> R3DependencyMetadata<'a> {
-    // Extract flags from decorators
+    // Extract flags and @Inject token from decorators
     let mut optional = false;
     let mut skip_self = false;
     let mut self_ = false;
     let mut host = false;
+    let mut inject_token: Option<OutputExpression<'a>> = None;
     let mut attribute_name: Option<Ident<'a>> = None;
 
     for decorator in &param.decorators {
         if let Some(name) = get_decorator_name(&decorator.expression) {
             match name.as_str() {
+                "Inject" => {
+                    // @Inject(TOKEN) - extract the token
+                    if let Expression::CallExpression(call) = &decorator.expression {
+                        if let Some(arg) = call.arguments.first() {
+                            inject_token =
+                                convert_oxc_expression(allocator, arg.to_expression(), None);
+                        }
+                    }
+                }
                 "Optional" => optional = true,
                 "SkipSelf" => skip_self = true,
                 "Self" => self_ = true,
@@ -289,8 +304,9 @@ fn extract_param_dependency<'a>(
         }
     }
 
-    // Extract the token (type annotation or parameter name)
-    let token = extract_param_token(allocator, param);
+    // 1. If @Inject(TOKEN) is present, use TOKEN
+    // 2. Otherwise fall back to the type annotation
+    let token = inject_token.or_else(|| extract_param_token(allocator, param));
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
@@ -300,17 +316,26 @@ fn extract_param_dependency<'a>(
                     value: crate::output::ast::LiteralValue::String(attr_name),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ))),
             attribute_name_type: token, // The type annotation
             host,
             optional,
             self_,
             skip_self,
+            type_only_invalid: false,
         };
     }
 
-    R3DependencyMetadata { token, attribute_name_type: None, host, optional, self_, skip_self }
+    R3DependencyMetadata {
+        token,
+        attribute_name_type: None,
+        host,
+        optional,
+        self_,
+        skip_self,
+        type_only_invalid: false,
+    }
 }
 
 /// Get the name of a decorator from its expression.
@@ -337,7 +362,8 @@ fn extract_param_token<'a>(
 ) -> Option<OutputExpression<'a>> {
     // First try to get the type annotation (directly on FormalParameter, not on pattern)
     let type_annotation = param.type_annotation.as_ref()?;
-    let ts_type = &type_annotation.type_annotation;
+    // Narrow `T | null` unions to `T` to match the reference compiler.
+    let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
     // Handle TSTypeReference: SomeClass, SomeModule, etc.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
@@ -354,7 +380,7 @@ fn extract_param_token<'a>(
         // Return a reference to the type
         return Some(OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: type_name, source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -386,8 +412,8 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -395,7 +421,7 @@ mod tests {
 
             if let Some(class) = class {
                 if let Some(metadata) =
-                    extract_pipe_metadata(&allocator, class, implicit_standalone)
+                    extract_pipe_metadata(&allocator, class, implicit_standalone, Some(code))
                 {
                     found_metadata = Some(metadata);
                     break;
@@ -552,6 +578,32 @@ mod tests {
         with_extracted_metadata(code, false, |meta| {
             let meta = meta.expect("Expected metadata");
             assert!(!meta.standalone);
+        });
+    }
+
+    #[test]
+    fn test_pipe_optional_with_nullable_type() {
+        // Regression test for issue #285:
+        // `@Optional() svc: MyService | null` must resolve the token to `MyService`.
+        let code = r#"
+            @Pipe({ name: 'myPipe' })
+            class MyPipe {
+                constructor(@Optional() private svc: MyService | null) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.deps.as_ref().expect("Should have deps");
+            assert_eq!(deps.len(), 1);
+            let dep = &deps[0];
+            assert!(dep.optional);
+            let token = dep.token.as_ref().expect("token should resolve to MyService");
+            let token: &crate::output::ast::OutputExpression<'_> = token;
+            match token {
+                crate::output::ast::OutputExpression::ReadVar(var) => {
+                    assert_eq!(var.name.as_str(), "MyService");
+                }
+                other => panic!("expected ReadVar token, got {:?}", other),
+            }
         });
     }
 

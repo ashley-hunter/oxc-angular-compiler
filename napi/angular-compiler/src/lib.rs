@@ -138,6 +138,16 @@ pub struct TransformOptions {
     /// When not set, assumes latest Angular version (v19+ behavior).
     pub angular_version: Option<AngularVersion>,
 
+    /// Override for the `legacyOptionalChaining` Angular compiler option
+    /// (`angularCompilerOptions.legacyOptionalChaining` in `tsconfig.json`).
+    ///
+    /// Controls the safe-navigation operator (`?.`) in template expressions.
+    /// When `true`, always emits the legacy `== null ? null` form; when `false`,
+    /// emits native optional chaining (yielding `undefined`). When unset, the
+    /// default is derived from `angularVersion` (legacy for < v22, modern for
+    /// >= v22, legacy when the version is unknown).
+    pub legacy_optional_chaining: Option<bool>,
+
     // Component metadata fields for full compilation testing
     // These mirror Angular's @Component decorator options.
     /// The CSS selector that identifies this component in a template.
@@ -184,10 +194,12 @@ pub struct TransformOptions {
 
     /// Emit setClassMetadata() calls for TestBed support.
     ///
-    /// When true, generates `ɵɵsetClassMetadata()` calls wrapped in a dev-mode guard.
-    /// This preserves original decorator information for TestBed's recompilation APIs.
+    /// When true, generates `ɵɵsetClassMetadata()` calls wrapped in a dev-mode guard
+    /// (`(typeof ngDevMode === "undefined" || ngDevMode) && …`). Production bundles
+    /// tree-shake the guarded call. Preserves original decorator information for
+    /// TestBed's recompilation APIs.
     ///
-    /// Default: false (metadata is dev-only and usually stripped in production)
+    /// Default: true — matches `ngc`, which always emits class metadata.
     pub emit_class_metadata: Option<bool>,
 
     /// Minify final component styles before emitting them into `styles: [...]`.
@@ -195,6 +207,16 @@ pub struct TransformOptions {
     /// This runs after Angular style encapsulation, so it applies to the same
     /// final CSS strings that are embedded in generated component definitions.
     pub minify_component_styles: Option<bool>,
+
+    /// Compilation mode: `"full"` (default) or `"partial"`.
+    ///
+    /// - `"full"` emits fully-resolved Ivy definitions (`ɵɵdefineComponent`,
+    ///   `ɵɵdefineDirective`, …) — application builds.
+    /// - `"partial"` emits partial declarations (`ɵɵngDeclareComponent`,
+    ///   `ɵɵngDeclareDirective`, …) — library builds. Consumers run the
+    ///   linker (also exposed by this package) to expand the declarations
+    ///   into full Ivy form at their build time.
+    pub compilation_mode: Option<String>,
 
     /// Resolved import paths for host directives and other imports.
     ///
@@ -217,6 +239,7 @@ impl From<TransformOptions> for RustTransformOptions {
             advanced_optimizations: options.advanced_optimizations.unwrap_or(false),
             i18n_use_external_ids: options.i18n_use_external_ids.unwrap_or(true),
             angular_version: options.angular_version.map(Into::into),
+            legacy_optional_chaining: options.legacy_optional_chaining,
             // Component metadata overrides
             selector: options.selector,
             standalone: options.standalone,
@@ -236,9 +259,25 @@ impl From<TransformOptions> for RustTransformOptions {
             // Resolved imports for host directives
             resolved_imports: options.resolved_imports,
             // Class metadata for TestBed support
-            emit_class_metadata: options.emit_class_metadata.unwrap_or(false),
+            emit_class_metadata: options.emit_class_metadata.unwrap_or(true),
             minify_component_styles: options.minify_component_styles.unwrap_or(false),
+            compilation_mode: options
+                .compilation_mode
+                .as_deref()
+                .and_then(parse_compilation_mode)
+                .unwrap_or_default(),
         }
+    }
+}
+
+/// Parse a CompilationMode string. Recognized values: `"full"`, `"partial"`
+/// (case-insensitive). Returns `None` on unrecognized input — callers fall
+/// back to the `Default` (Full).
+fn parse_compilation_mode(s: &str) -> Option<oxc_angular_compiler::CompilationMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "full" => Some(oxc_angular_compiler::CompilationMode::Full),
+        "partial" => Some(oxc_angular_compiler::CompilationMode::Partial),
+        _ => None,
     }
 }
 
@@ -256,11 +295,13 @@ fn parse_view_encapsulation(s: &str) -> Option<RustViewEncapsulation> {
 
 /// Parse a ChangeDetectionStrategy string to the Rust enum.
 ///
-/// Valid values: "Default", "OnPush"
+/// Valid values: "OnPush", "Eager", and "Default" (the pre-v22 spelling of
+/// "Eager", kept distinct so partial emit preserves the author's member).
 fn parse_change_detection_strategy(s: &str) -> Option<RustChangeDetectionStrategy> {
     match s {
-        "Default" => Some(RustChangeDetectionStrategy::Default),
         "OnPush" => Some(RustChangeDetectionStrategy::OnPush),
+        "Eager" => Some(RustChangeDetectionStrategy::Eager),
+        "Default" => Some(RustChangeDetectionStrategy::Default),
         _ => None,
     }
 }
@@ -431,7 +472,8 @@ pub fn compile_template(
 ///
 /// * `component_id` - The component ID (path@ClassName)
 /// * `template_js` - The compiled template function as JavaScript
-/// * `styles` - Optional array of CSS styles
+/// * `styles` - The component's CSS styles, or `None` when unknown. An empty
+///   array is definitive and emits `styles: []`, clearing the old styles.
 ///
 /// # Returns
 ///
@@ -481,7 +523,11 @@ pub fn generate_style_module(component_id: String, styles: Vec<String>) -> Strin
 /// * `template` - The template HTML string
 /// * `component_name` - The name of the component class
 /// * `file_path` - The path to the component file
-/// * `styles` - Optional array of CSS styles
+/// * `styles` - The component's CSS styles, or `None` when the caller cannot
+///   tell. `Some` is a definitive answer — an EMPTY array means "this component
+///   has no styles" and makes the generated module emit `styles: []`, clearing
+///   whatever it had. `None` omits the key, so the module's `...ɵcmp` spread
+///   keeps the previous styles.
 ///
 /// # Returns
 ///
@@ -510,31 +556,43 @@ pub fn compile_for_hmr_sync(
                 Some(output.declarations_js.as_str())
             };
 
+            // The caller's `Option` carries whether it KNOWS the answer, and
+            // that has to survive to the generated module: `Some` (even
+            // `Some([])`) is definitive, so the module emits `styles: [...]`
+            // and clears whatever the component had; `None` is "unknown", so
+            // the module omits the key and the spread keeps the old value.
+            // Collapsing an empty-but-definitive answer to `None` here is what
+            // left a component's last stylesheet applied after HMR.
+            let caller_is_definitive = styles.is_some();
+
             // Merge external styles with styles extracted from template <style> tags
             let mut all_styles: Vec<String> = styles.unwrap_or_default();
             all_styles.extend(output.styles);
 
             // Apply style encapsulation for ViewEncapsulation.Emulated
             // Angular uses %COMP% as a placeholder that the runtime replaces with the component ID
-            let encapsulated_styles: Option<Vec<String>> = if all_styles.is_empty() {
-                None
-            } else {
-                let styles: Vec<String> = all_styles
-                    .iter()
-                    .map(|style| {
-                        oxc_angular_compiler::styles::finalize_component_style(
-                            style,
-                            true,
-                            "_ngcontent-%COMP%",
-                            "_nghost-%COMP%",
-                            opts.minify_component_styles,
-                        )
-                    })
-                    .filter(|style| !style.trim().is_empty())
-                    .collect();
+            let encapsulated: Vec<String> = all_styles
+                .iter()
+                .map(|style| {
+                    oxc_angular_compiler::styles::finalize_component_style(
+                        style,
+                        true,
+                        "_ngcontent-%COMP%",
+                        "_nghost-%COMP%",
+                        opts.minify_component_styles,
+                    )
+                })
+                .filter(|style| !style.trim().is_empty())
+                .collect();
 
-                if styles.is_empty() { None } else { Some(styles) }
-            };
+            // Emit the array when it is an answer: the caller was definitive,
+            // or the template's own <style> tags produced content.
+            let encapsulated_styles: Option<Vec<String>> =
+                if caller_is_definitive || !encapsulated.is_empty() {
+                    Some(encapsulated)
+                } else {
+                    None
+                };
 
             // Generate HMR module with declarations, encapsulated styles, and consts
             let hmr_module = generate_hmr_update_module_from_js(
@@ -734,7 +792,9 @@ pub struct ComponentUrls {
 ///
 /// A `ComponentUrls` containing all template and style URLs found.
 pub fn extract_component_urls_sync(source: String, filename: String) -> ComponentUrls {
-    use oxc_angular_compiler::{build_import_map, extract_component_metadata};
+    use oxc_angular_compiler::{
+        build_import_map, collect_string_consts, extract_component_metadata,
+    };
     use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
     use oxc_parser::Parser;
     use oxc_span::SourceType;
@@ -747,6 +807,7 @@ pub fn extract_component_urls_sync(source: String, filename: String) -> Componen
 
     // Build import map for component metadata extraction
     let import_map = build_import_map(&allocator, &program.body, None);
+    let string_consts = collect_string_consts(&allocator, program);
 
     let mut template_urls = Vec::new();
     let mut style_urls = Vec::new();
@@ -759,8 +820,8 @@ pub fn extract_component_urls_sync(source: String, filename: String) -> Componen
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -769,8 +830,14 @@ pub fn extract_component_urls_sync(source: String, filename: String) -> Componen
         if let Some(class) = class {
             // Extract metadata from @Component decorator
             // Use implicit_standalone=true (v19+ default) since it doesn't affect URL extraction
-            if let Some(metadata) = extract_component_metadata(&allocator, class, true, &import_map)
-            {
+            if let Some(metadata) = extract_component_metadata(
+                &allocator,
+                class,
+                true,
+                &import_map,
+                Some(&source),
+                &string_consts,
+            ) {
                 // Collect template URL
                 if let Some(template_url) = &metadata.template_url {
                     template_urls.push(template_url.to_string());
@@ -924,32 +991,28 @@ pub fn extract_top_level_declarations_sync(
                 _ => {}
             },
 
-            // Export named: export class Foo { ... }, export const foo = ...
-            Statement::ExportNamedDeclaration(export) => {
-                if let Some(decl) = &export.declaration {
-                    match decl {
-                        Declaration::ClassDeclaration(class) => {
-                            if let Some(id) = &class.id {
-                                names.push(id.name.to_string());
-                            }
-                        }
-                        Declaration::FunctionDeclaration(func) => {
-                            if let Some(id) = &func.id {
-                                names.push(id.name.to_string());
-                            }
-                        }
-                        Declaration::TSEnumDeclaration(enum_decl) => {
-                            names.push(enum_decl.id.name.to_string());
-                        }
-                        Declaration::VariableDeclaration(var_decl) => {
-                            for d in &var_decl.declarations {
-                                track_binding_pattern_names(&d.id, &mut names);
-                            }
-                        }
-                        _ => {}
+            // Export declaration: export class Foo { ... }, export const foo = ...
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => {
+                    if let Some(id) = &class.id {
+                        names.push(id.name.to_string());
                     }
                 }
-            }
+                Declaration::FunctionDeclaration(func) => {
+                    if let Some(id) = &func.id {
+                        names.push(id.name.to_string());
+                    }
+                }
+                Declaration::TSEnumDeclaration(enum_decl) => {
+                    names.push(enum_decl.id.name.to_string());
+                }
+                Declaration::VariableDeclaration(var_decl) => {
+                    for d in &var_decl.declarations {
+                        track_binding_pattern_names(&d.id, &mut names);
+                    }
+                }
+                _ => {}
+            },
 
             // Module declarations (imports)
             Statement::ImportDeclaration(import) => {
@@ -1208,8 +1271,8 @@ pub fn extract_pipe_metadata_sync(
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1225,7 +1288,9 @@ pub fn extract_pipe_metadata_sync(
             }
 
             // Extract metadata from @Pipe decorator
-            if let Some(metadata) = extract_pipe_metadata(&allocator, class, implicit_standalone) {
+            if let Some(metadata) =
+                extract_pipe_metadata(&allocator, class, implicit_standalone, Some(&source))
+            {
                 return Some(ExtractedPipeMetadata {
                     class_name: metadata.class_name.to_string(),
                     span_start: metadata.class_span.start,
@@ -1266,7 +1331,8 @@ pub fn compile_pipe_sync(
     use oxc_angular_compiler::{R3PipeMetadataBuilder, compile_pipe, extract_pipe_metadata};
     use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
     use oxc_parser::Parser;
-    use oxc_span::{Ident, SourceType};
+    use oxc_span::SourceType;
+    use oxc_str::Ident;
 
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(&file_path).unwrap_or_default();
@@ -1283,8 +1349,8 @@ pub fn compile_pipe_sync(
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1300,14 +1366,16 @@ pub fn compile_pipe_sync(
             }
 
             // Extract metadata from @Pipe decorator
-            if let Some(metadata) = extract_pipe_metadata(&allocator, class, implicit_standalone) {
+            if let Some(metadata) =
+                extract_pipe_metadata(&allocator, class, implicit_standalone, Some(&source))
+            {
                 // Create type expression for the pipe class
                 use oxc_allocator::Box;
                 use oxc_angular_compiler::output::ast::{OutputExpression, ReadVarExpr};
 
                 let type_expr = OutputExpression::ReadVar(Box::new_in(
                     ReadVarExpr { name: metadata.class_name, source_span: None },
-                    &allocator,
+                    &&allocator,
                 ));
 
                 // Build R3PipeMetadata
@@ -1476,6 +1544,7 @@ pub struct ExtractedComponentMetadata {
 /// # Returns
 ///
 /// A vector of `ExtractedComponentMetadata` for each component found.
+#[napi]
 pub fn extract_component_metadata_sync(
     source: String,
     file_path: String,
@@ -1483,9 +1552,9 @@ pub fn extract_component_metadata_sync(
     use oxc_angular_compiler::output::emitter::JsEmitter;
     use oxc_angular_compiler::{
         ChangeDetectionStrategy as RustChangeDetection, QueryPredicate,
-        ViewEncapsulation as RustViewEncapsulation, build_import_map, extract_component_metadata,
-        extract_content_queries, extract_input_metadata, extract_output_metadata,
-        extract_view_queries,
+        ViewEncapsulation as RustViewEncapsulation, build_import_map, collect_string_consts,
+        extract_component_metadata, extract_content_queries, extract_input_metadata,
+        extract_output_metadata, extract_view_queries,
     };
     use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
     use oxc_parser::Parser;
@@ -1501,6 +1570,7 @@ pub fn extract_component_metadata_sync(
 
     // Build import map for component metadata extraction
     let import_map = build_import_map(&allocator, &program.body, None);
+    let string_consts = collect_string_consts(&allocator, program);
 
     let mut results = Vec::new();
     let emitter = JsEmitter::new();
@@ -1513,8 +1583,8 @@ pub fn extract_component_metadata_sync(
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1522,9 +1592,14 @@ pub fn extract_component_metadata_sync(
 
         if let Some(class) = class {
             // Extract metadata from @Component decorator
-            if let Some(metadata) =
-                extract_component_metadata(&allocator, class, implicit_standalone, &import_map)
-            {
+            if let Some(metadata) = extract_component_metadata(
+                &allocator,
+                class,
+                implicit_standalone,
+                &import_map,
+                Some(&source),
+                &string_consts,
+            ) {
                 // Convert encapsulation to string
                 let encapsulation = match metadata.encapsulation {
                     RustViewEncapsulation::Emulated => "Emulated",
@@ -1533,10 +1608,14 @@ pub fn extract_component_metadata_sync(
                 }
                 .to_string();
 
-                // Convert change detection to string
+                // Convert change detection to string. `None` (unspecified) maps
+                // to "" so it round-trips back to `None` via
+                // `parse_change_detection_strategy` on the HMR re-compile.
                 let change_detection = match metadata.change_detection {
-                    RustChangeDetection::Default => "Default",
-                    RustChangeDetection::OnPush => "OnPush",
+                    Some(RustChangeDetection::OnPush) => "OnPush",
+                    Some(RustChangeDetection::Eager) => "Eager",
+                    Some(RustChangeDetection::Default) => "Default",
+                    None => "",
                 }
                 .to_string();
 
@@ -1588,7 +1667,7 @@ pub fn extract_component_metadata_sync(
                 let animations = metadata.animations.as_ref().map(|e| emitter.emit_expression(e));
 
                 // Extract inputs from @Input decorators
-                let rust_inputs = extract_input_metadata(&allocator, class);
+                let rust_inputs = extract_input_metadata(&allocator, class, Some(&source));
                 let inputs: Option<Vec<ExtractedInputMetadata>> = if rust_inputs.is_empty() {
                     None
                 } else {
@@ -1642,7 +1721,7 @@ pub fn extract_component_metadata_sync(
                 }
 
                 // Extract view queries from @ViewChild/@ViewChildren decorators
-                let rust_view_queries = extract_view_queries(&allocator, class);
+                let rust_view_queries = extract_view_queries(&allocator, class, Some(&source));
                 let view_queries: Option<Vec<ExtractedQueryMetadata>> =
                     if rust_view_queries.is_empty() {
                         None
@@ -1663,7 +1742,8 @@ pub fn extract_component_metadata_sync(
                     };
 
                 // Extract content queries from @ContentChild/@ContentChildren decorators
-                let rust_content_queries = extract_content_queries(&allocator, class);
+                let rust_content_queries =
+                    extract_content_queries(&allocator, class, Some(&source));
                 let queries: Option<Vec<ExtractedQueryMetadata>> =
                     if rust_content_queries.is_empty() {
                         None
@@ -1715,7 +1795,7 @@ pub fn extract_component_metadata_sync(
                             metadata
                                 .export_as
                                 .iter()
-                                .map(oxc_span::Ident::as_str)
+                                .map(oxc_str::Ident::as_str)
                                 .collect::<Vec<_>>()
                                 .join(","),
                         )
@@ -1804,14 +1884,14 @@ pub fn compile_injector_sync(input: InjectorCompileInput) -> InjectorNapiCompile
     use oxc_angular_compiler::output::ast::{OutputExpression, ReadVarExpr};
     use oxc_angular_compiler::output::emitter::JsEmitter;
     use oxc_angular_compiler::{R3InjectorMetadataBuilder, compile_injector};
-    use oxc_span::Ident;
+    use oxc_str::Ident;
 
     let allocator = Allocator::default();
 
     // Create type expression for the injector class
     let type_expr = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from(input.name.as_str()), source_span: None },
-        &allocator,
+        &&allocator,
     ));
 
     // Build the metadata
@@ -1823,7 +1903,7 @@ pub fn compile_injector_sync(input: InjectorCompileInput) -> InjectorNapiCompile
     if let Some(providers_str) = &input.providers {
         let providers_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from(providers_str.as_str()), source_span: None },
-            &allocator,
+            &&allocator,
         ));
         builder = builder.providers(providers_expr);
     }
@@ -1833,7 +1913,7 @@ pub fn compile_injector_sync(input: InjectorCompileInput) -> InjectorNapiCompile
         for import_name in imports {
             let import_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from(import_name.as_str()), source_span: None },
-                &allocator,
+                &&allocator,
             ));
             builder = builder.add_import(import_expr);
         }
@@ -1905,7 +1985,8 @@ pub fn compile_class_metadata_sync(
     use oxc_angular_compiler::output::emitter::JsEmitter;
     use oxc_ast::ast::{Class, Declaration, ExportDefaultDeclarationKind, Statement};
     use oxc_parser::Parser;
-    use oxc_span::{Ident, SourceType};
+    use oxc_span::SourceType;
+    use oxc_str::Ident;
 
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(&file_path).unwrap_or_default();
@@ -1922,8 +2003,8 @@ pub fn compile_class_metadata_sync(
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1960,12 +2041,19 @@ pub fn compile_class_metadata_sync(
     // Build the class type expression
     let type_expr = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from(class_name.as_str()), source_span: None },
-        &allocator,
+        &&allocator,
     ));
 
     // Build decorators array: [{ type: DecoratorClass, args: [...] }]
     let decorator_ref = decorator;
-    let decorators_expr = core_build_decorator_metadata_array(&allocator, &[decorator_ref]);
+    let decorators_expr = core_build_decorator_metadata_array(
+        &allocator,
+        &[decorator_ref],
+        Some(&source),
+        None,
+        None,
+        None,
+    );
 
     // Build constructor parameters metadata
     // This standalone API doesn't have full transform pipeline context (constructor deps
@@ -1979,10 +2067,16 @@ pub fn compile_class_metadata_sync(
         None,
         &mut namespace_registry,
         &empty_import_map,
+        Some(&source),
     );
 
     // Build property decorators metadata
-    let prop_decorators_expr = core_build_prop_decorators_metadata(&allocator, class);
+    let prop_decorators_expr = core_build_prop_decorators_metadata(
+        &allocator,
+        class,
+        Some(&source),
+        &mut namespace_registry,
+    );
 
     // Create R3ClassMetadata
     let metadata = R3ClassMetadata {
@@ -2144,7 +2238,7 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
     };
     use oxc_angular_compiler::output::ast::{OutputExpression, ReadVarExpr};
     use oxc_angular_compiler::output::emitter::JsEmitter;
-    use oxc_span::Ident;
+    use oxc_str::Ident;
 
     let allocator = Allocator::default();
 
@@ -2168,7 +2262,7 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
     // Create type expression for the class
     let type_expr = OutputExpression::ReadVar(Box::new_in(
         ReadVarExpr { name: Ident::from(input.name.as_str()), source_span: None },
-        &allocator,
+        &&allocator,
     ));
 
     // Parse deps_kind and build deps
@@ -2177,14 +2271,14 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
         Some("None") => R3FactoryDeps::None,
         Some("Valid") | None => {
             // Build valid dependencies
-            let mut dep_list = AllocVec::new_in(&allocator);
+            let mut dep_list = AllocVec::new_in(&&allocator);
             if let Some(deps) = &input.deps {
                 for dep in deps {
                     // Use ReadVarExpr for token since WrappedNodeExpr cannot be emitted
                     let token = dep.token.as_ref().map(|t| {
                         OutputExpression::ReadVar(Box::new_in(
                             ReadVarExpr { name: Ident::from(t.as_str()), source_span: None },
-                            &allocator,
+                            &&allocator,
                         ))
                     });
 
@@ -2192,7 +2286,7 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
                     let attribute_name_type = dep.attribute_name_type.as_ref().map(|a| {
                         OutputExpression::ReadVar(Box::new_in(
                             ReadVarExpr { name: Ident::from(a.as_str()), source_span: None },
-                            &allocator,
+                            &&allocator,
                         ))
                     });
 
@@ -2203,6 +2297,7 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
                         optional: dep.optional.unwrap_or(false),
                         self_: dep.self_.unwrap_or(false),
                         skip_self: dep.skip_self.unwrap_or(false),
+                        type_only_invalid: false,
                     });
                 }
             }
@@ -2461,10 +2556,8 @@ pub fn extract_angular_component_by_ast(
             }
 
             // Handle export declarations that might contain classes
-            Statement::ExportNamedDeclaration(export) => {
-                if let Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) =
-                    &export.declaration
-                {
+            Statement::ExportDeclaration(export) => {
+                if let oxc_ast::ast::Declaration::ClassDeclaration(class) = &export.declaration {
                     let is_target_class =
                         class.id.as_ref().is_some_and(|id| id.name.as_str() == class_name);
 

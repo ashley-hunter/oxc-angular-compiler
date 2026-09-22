@@ -4,7 +4,7 @@
 
 use oxc_allocator::{Allocator, Vec};
 use oxc_ast::ast::Class;
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use crate::factory::R3DependencyMetadata;
 use crate::output::ast::OutputExpression;
@@ -112,7 +112,7 @@ impl<'a> R3QueryMetadata<'a> {
         Self {
             property_name,
             first: false,
-            predicate: QueryPredicate::Selectors(Vec::new_in(allocator)),
+            predicate: QueryPredicate::Selectors(Vec::new_in(&allocator)),
             descendants: true,
             emit_distinct_changes_only: true,
             read: None,
@@ -147,9 +147,9 @@ impl<'a> R3HostMetadata<'a> {
     /// Create a new empty host metadata.
     pub fn new(allocator: &'a Allocator) -> Self {
         Self {
-            attributes: Vec::new_in(allocator),
-            listeners: Vec::new_in(allocator),
-            properties: Vec::new_in(allocator),
+            attributes: Vec::new_in(&allocator),
+            listeners: Vec::new_in(&allocator),
+            properties: Vec::new_in(&allocator),
             style_attr: None,
             class_attr: None,
         }
@@ -282,18 +282,18 @@ impl<'a> R3DirectiveMetadataBuilder<'a> {
             type_argument_count: 0,
             deps: None,
             selector: None,
-            queries: Vec::new_in(allocator),
-            view_queries: Vec::new_in(allocator),
+            queries: Vec::new_in(&allocator),
+            view_queries: Vec::new_in(&allocator),
             host: R3HostMetadata::new(allocator),
             uses_on_changes: false,
-            inputs: Vec::new_in(allocator),
-            outputs: Vec::new_in(allocator),
+            inputs: Vec::new_in(&allocator),
+            outputs: Vec::new_in(&allocator),
             uses_inheritance: false,
-            export_as: Vec::new_in(allocator),
+            export_as: Vec::new_in(&allocator),
             providers: None,
             is_standalone: true, // Default to standalone in modern Angular
             is_signal: false,
-            host_directives: Vec::new_in(allocator),
+            host_directives: Vec::new_in(&allocator),
         }
     }
 
@@ -410,9 +410,15 @@ impl<'a> R3DirectiveMetadataBuilder<'a> {
     ///
     /// # Returns
     /// The builder with all extracted metadata added.
-    pub fn extract_from_class(mut self, allocator: &'a Allocator, class: &'a Class<'a>) -> Self {
+    pub fn extract_from_class(
+        mut self,
+        allocator: &'a Allocator,
+        class: &'a Class<'a>,
+        source_text: Option<&'a str>,
+    ) -> Self {
         // Extract inputs from @Input decorators
-        let inputs = super::property_decorators::extract_input_metadata(allocator, class);
+        let inputs =
+            super::property_decorators::extract_input_metadata(allocator, class, source_text);
         for input in inputs {
             self = self.add_input(input);
         }
@@ -424,13 +430,15 @@ impl<'a> R3DirectiveMetadataBuilder<'a> {
         }
 
         // Extract view queries from @ViewChild/@ViewChildren
-        let view_queries = super::property_decorators::extract_view_queries(allocator, class);
+        let view_queries =
+            super::property_decorators::extract_view_queries(allocator, class, source_text);
         for query in view_queries {
             self = self.add_view_query(query);
         }
 
         // Extract content queries from @ContentChild/@ContentChildren
-        let content_queries = super::property_decorators::extract_content_queries(allocator, class);
+        let content_queries =
+            super::property_decorators::extract_content_queries(allocator, class, source_text);
         for query in content_queries {
             self = self.add_query(query);
         }
@@ -520,8 +528,8 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -597,7 +605,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestDirective")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -635,7 +643,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestDirective")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -668,7 +676,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestComponent"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestComponent")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -701,7 +709,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestComponent"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestComponent")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -734,7 +742,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestDirective")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -769,7 +777,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestDirective")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -807,7 +815,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("TestComponent"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestComponent")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -837,7 +845,7 @@ mod tests {
         let builder = R3DirectiveMetadataBuilder::new(&allocator)
             .name(Ident::from("EmptyDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("EmptyDirective")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());
@@ -870,7 +878,7 @@ mod tests {
             .name(Ident::from("TestDirective"))
             .r#type(OutputAstBuilder::variable(&allocator, Ident::from("TestDirective")))
             .add_input(R3InputMetadata::simple(Ident::from("existingInput")))
-            .extract_from_class(&allocator, class.unwrap());
+            .extract_from_class(&allocator, class.unwrap(), Some(code));
 
         let metadata = builder.build();
         assert!(metadata.is_some());

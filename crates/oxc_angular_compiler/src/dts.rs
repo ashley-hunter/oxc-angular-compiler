@@ -18,6 +18,8 @@ use crate::directive::{R3DirectiveMetadata, R3InputMetadata};
 use crate::injectable::InjectableMetadata;
 use crate::ng_module::NgModuleMetadata;
 use crate::pipe::PipeMetadata;
+use crate::service::ServiceMetadata;
+use oxc_str::Ident;
 
 /// A `.d.ts` type declaration for an Angular class.
 ///
@@ -422,6 +424,31 @@ pub fn generate_injectable_dts(
 }
 
 // =============================================================================
+// Service Declarations (Angular v22+ `@Service`)
+// =============================================================================
+
+/// Generate `.d.ts` declarations for a `@Service`-decorated class.
+///
+/// The shape is identical to `@Injectable` (the `.d.ts` type is reused for
+/// downstream consumers — see upstream `service_compiler.ts:55` which calls
+/// `createInjectableType`). The ctor deps tuple is always `never` because
+/// `@Service` ɵfac is generated with empty deps.
+pub fn generate_service_dts(
+    metadata: &ServiceMetadata,
+    type_argument_count: u32,
+) -> DtsDeclaration {
+    let class_name = metadata.class_name.as_str();
+    let type_with_params = type_with_parameters(class_name, type_argument_count);
+
+    let fac = format!("static ɵfac: i0.ɵɵFactoryDeclaration<{type_with_params}, never>;");
+    let prov = format!("static ɵprov: i0.ɵɵInjectableDeclaration<{type_with_params}>;");
+
+    let members = format!("{fac}\n{prov}");
+
+    DtsDeclaration { class_name: class_name.to_string(), members }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -578,7 +605,7 @@ fn generate_input_map_type(inputs: &[R3InputMetadata]) -> String {
 /// Generate the output map type.
 ///
 /// Produces: `{ "clicked": "clicked"; "valueChanged": "onChange"; }`
-fn generate_output_map_type(outputs: &[(oxc_span::Ident, oxc_span::Ident)]) -> String {
+fn generate_output_map_type(outputs: &[(Ident, Ident)]) -> String {
     if outputs.is_empty() {
         return "{}".to_string();
     }
@@ -762,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_generate_output_map_type_empty() {
-        let outputs: Vec<(oxc_span::Ident, oxc_span::Ident)> = vec![];
+        let outputs: Vec<(Ident, Ident)> = vec![];
         assert_eq!(generate_output_map_type(&outputs), "{}");
     }
 }

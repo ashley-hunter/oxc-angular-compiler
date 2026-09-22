@@ -4,7 +4,8 @@
 //! ported from Angular's `ml_parser/ast.ts`.
 
 use oxc_allocator::{Box, Vec};
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use super::expression::AngularExpression;
 
@@ -124,6 +125,9 @@ pub struct HtmlElement<'a> {
     /// Whether this is a void element (area, base, br, col, embed, hr, img, input, link, meta, param, source, track, wbr).
     /// Void elements cannot have content and do not have end tags.
     pub is_void: bool,
+    /// Parsed from a selectorless component tag (`<MyComp>`, `<MyComp:iframe>`).
+    /// The class is `name`; the host element is `component_prefix` / `component_tag_name`.
+    pub is_component: bool,
 }
 
 /// A selectorless component in the HTML AST.
@@ -509,50 +513,53 @@ mod tests {
             name: Ident::from("span"),
             component_prefix: None,
             component_tag_name: None,
-            attrs: Vec::new_in(&allocator),
-            directives: Vec::new_in(&allocator),
-            children: Vec::new_in(&allocator),
+            attrs: Vec::new_in(&&allocator),
+            directives: Vec::new_in(&&allocator),
+            children: Vec::new_in(&&allocator),
             span: Span::default(),
             start_span: Span::default(),
             end_span: None,
             is_self_closing: false,
             is_void: false,
+            is_component: false,
         };
 
         let child2 = HtmlElement {
             name: Ident::from("p"),
             component_prefix: None,
             component_tag_name: None,
-            attrs: Vec::new_in(&allocator),
-            directives: Vec::new_in(&allocator),
-            children: Vec::new_in(&allocator),
+            attrs: Vec::new_in(&&allocator),
+            directives: Vec::new_in(&&allocator),
+            children: Vec::new_in(&&allocator),
             span: Span::default(),
             start_span: Span::default(),
             end_span: None,
             is_self_closing: false,
             is_void: false,
+            is_component: false,
         };
 
-        let mut children = Vec::new_in(&allocator);
-        children.push(HtmlNode::Element(Box::new_in(child1, &allocator)));
-        children.push(HtmlNode::Element(Box::new_in(child2, &allocator)));
+        let mut children = Vec::new_in(&&allocator);
+        children.push(HtmlNode::Element(Box::new_in(child1, &&allocator)));
+        children.push(HtmlNode::Element(Box::new_in(child2, &&allocator)));
 
         let root = HtmlElement {
             name: Ident::from("div"),
             component_prefix: None,
             component_tag_name: None,
-            attrs: Vec::new_in(&allocator),
-            directives: Vec::new_in(&allocator),
+            attrs: Vec::new_in(&&allocator),
+            directives: Vec::new_in(&&allocator),
             children,
             span: Span::default(),
             start_span: Span::default(),
             end_span: None,
             is_self_closing: false,
             is_void: false,
+            is_component: false,
         };
 
-        let mut nodes = Vec::new_in(&allocator);
-        nodes.push(HtmlNode::Element(Box::new_in(root, &allocator)));
+        let mut nodes = Vec::new_in(&&allocator);
+        nodes.push(HtmlNode::Element(Box::new_in(root, &&allocator)));
 
         let mut counter = ElementCounter { count: 0 };
         visit_all(&mut counter, &nodes);
@@ -568,11 +575,11 @@ mod tests {
             value: Ident::from("Hello"),
             span: Span::default(),
             full_start: None,
-            tokens: Vec::new_in(&allocator),
+            tokens: Vec::new_in(&&allocator),
         };
 
-        let mut nodes = Vec::new_in(&allocator);
-        nodes.push(HtmlNode::Text(Box::new_in(text, &allocator)));
+        let mut nodes = Vec::new_in(&&allocator);
+        nodes.push(HtmlNode::Text(Box::new_in(text, &&allocator)));
 
         let mut visited = 0;
         traverse_all(&nodes, |_node| {

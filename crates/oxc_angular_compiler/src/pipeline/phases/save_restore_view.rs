@@ -14,7 +14,7 @@
 //! Ported from Angular's `template/pipeline/src/phases/save_restore_view.ts`.
 
 use oxc_allocator::{Box, Vec as OxcVec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use crate::ir::enums::{ExpressionKind, SemanticVariableKind, VariableFlags};
 use crate::ir::expression::{
@@ -182,7 +182,7 @@ fn process_arrow_functions_in_view(
             // The target is o.variable(expr.currentViewName) where currentViewName is 'view'
             let view_var_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: Ident::from("view"), source_span: None },
-                allocator,
+                &allocator,
             ));
 
             let restore_var = UpdateOp::Variable(UpdateVariableOp {
@@ -194,14 +194,14 @@ fn process_arrow_functions_in_view(
                     IrExpression::RestoreView(Box::new_in(
                         RestoreViewExpr {
                             view: RestoreViewTarget::Dynamic(Box::new_in(
-                                IrExpression::OutputExpr(Box::new_in(view_var_expr, allocator)),
-                                allocator,
+                                IrExpression::OutputExpr(Box::new_in(view_var_expr, &allocator)),
+                                &allocator,
                             )),
                             source_span: None,
                         },
-                        allocator,
+                        &allocator,
                     )),
-                    allocator,
+                    &allocator,
                 ),
                 flags: VariableFlags::NONE,
                 view: Some(view_xref),
@@ -329,7 +329,7 @@ fn process_view_listeners(job: &mut ComponentCompilationJob<'_>, view_xref: Xref
             CreateOp::Listener(listener) => {
                 if let Some(var_xref) = needs_restore {
                     add_restore_view_to_listener(
-                        allocator,
+                        &allocator,
                         &mut listener.handler_ops,
                         &mut listener.handler_expression,
                         var_xref,
@@ -341,7 +341,7 @@ fn process_view_listeners(job: &mut ComponentCompilationJob<'_>, view_xref: Xref
                 if let Some(var_xref) = needs_restore {
                     // TwoWayListener doesn't have handler_expression, only handler_ops
                     add_restore_view_ops_only(
-                        allocator,
+                        &allocator,
                         &mut listener.handler_ops,
                         var_xref,
                         view_xref,
@@ -352,7 +352,7 @@ fn process_view_listeners(job: &mut ComponentCompilationJob<'_>, view_xref: Xref
                 if let Some(var_xref) = needs_restore {
                     // Animation doesn't have handler_expression, only handler_ops
                     add_restore_view_ops_only(
-                        allocator,
+                        &allocator,
                         &mut animation.handler_ops,
                         var_xref,
                         view_xref,
@@ -363,7 +363,7 @@ fn process_view_listeners(job: &mut ComponentCompilationJob<'_>, view_xref: Xref
                 if let Some(var_xref) = needs_restore {
                     // AnimationListener doesn't have handler_expression, only handler_ops
                     add_restore_view_ops_only(
-                        allocator,
+                        &allocator,
                         &mut listener.handler_ops,
                         var_xref,
                         view_xref,
@@ -395,13 +395,13 @@ fn add_restore_view_ops_only<'a>(
         base: UpdateOpBase::default(),
         xref: var_xref,
         kind: SemanticVariableKind::Context,
-        name: oxc_span::Ident::from(""), // Empty = naming phase will assign it
+        name: Ident::from(""), // Empty = naming phase will assign it
         initializer: Box::new_in(
             IrExpression::RestoreView(Box::new_in(
                 RestoreViewExpr { view: RestoreViewTarget::Static(view_xref), source_span: None },
-                allocator,
+                &allocator,
             )),
-            allocator,
+            &allocator,
         ),
         flags: VariableFlags::NONE,
         view: Some(view_xref),
@@ -435,13 +435,13 @@ fn add_restore_view_to_listener<'a>(
         base: UpdateOpBase::default(),
         xref: var_xref,
         kind: SemanticVariableKind::Context,
-        name: oxc_span::Ident::from(""), // Empty = naming phase will assign it
+        name: Ident::from(""), // Empty = naming phase will assign it
         initializer: Box::new_in(
             IrExpression::RestoreView(Box::new_in(
                 RestoreViewExpr { view: RestoreViewTarget::Static(view_xref), source_span: None },
-                allocator,
+                &allocator,
             )),
-            allocator,
+            &allocator,
         ),
         flags: VariableFlags::NONE,
         view: Some(view_xref),
@@ -457,10 +457,10 @@ fn add_restore_view_to_listener<'a>(
         let cloned_expr = expr.clone_in(allocator);
         *handler_expression = Some(Box::new_in(
             IrExpression::ResetView(Box::new_in(
-                ResetViewExpr { expr: Box::new_in(cloned_expr, allocator), source_span: None },
-                allocator,
+                ResetViewExpr { expr: Box::new_in(cloned_expr, &allocator), source_span: None },
+                &allocator,
             )),
-            allocator,
+            &allocator,
         ));
     }
 }
@@ -511,13 +511,13 @@ fn create_saved_view_variable<'a>(
         base: Default::default(),
         xref,
         kind: SemanticVariableKind::SavedView,
-        name: oxc_span::Ident::from(""), // Empty = naming phase will assign it
+        name: Ident::from(""), // Empty = naming phase will assign it
         initializer: Box::new_in(
             IrExpression::GetCurrentView(Box::new_in(
                 GetCurrentViewExpr { source_span: None },
-                allocator,
+                &allocator,
             )),
-            allocator,
+            &allocator,
         ),
         flags: VariableFlags::NONE,
         view: Some(view_xref),
@@ -554,17 +554,17 @@ fn wrap_return_statements_in_reset_view<'a>(
                         // Wrap the inner IR expression in ResetView
                         let reset_expr = IrExpression::ResetView(Box::new_in(
                             ResetViewExpr {
-                                expr: Box::new_in(wrapped.node.clone_in(allocator), allocator),
+                                expr: Box::new_in(wrapped.node.clone_in(allocator), &allocator),
                                 source_span: None,
                             },
-                            allocator,
+                            &allocator,
                         ));
                         OutputExpression::WrappedIrNode(Box::new_in(
                             WrappedIrExpr {
-                                node: Box::new_in(reset_expr, allocator),
+                                node: Box::new_in(reset_expr, &allocator),
                                 source_span: wrapped.source_span,
                             },
-                            allocator,
+                            &allocator,
                         ))
                     }
                     _ => {
@@ -581,7 +581,7 @@ fn wrap_return_statements_in_reset_view<'a>(
                 // Replace the return statement with the wrapped version
                 stmt_op.statement = OutputStatement::Return(Box::new_in(
                     ReturnStatement { value: wrapped_reset, source_span: ret_stmt.source_span },
-                    allocator,
+                    &allocator,
                 ));
             }
         }

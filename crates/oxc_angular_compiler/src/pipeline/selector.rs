@@ -7,7 +7,7 @@
 //! `core.ts` parseSelectorToR3Selector function.
 
 use oxc_allocator::{Allocator, Vec as OxcVec};
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use crate::output::ast::{LiteralExpr, LiteralValue, OutputExpression};
 
@@ -245,9 +245,10 @@ impl CssSelector {
                 continue;
             }
 
-            // Handle * wildcard element
+            // `*` is a wildcard, not an element name: upstream's regexp has no
+            // `*` production, so `element` stays unset and selector consumers
+            // treat it as "any element".
             if c == '*' {
-                target.set_element("*");
                 i += 1;
                 continue;
             }
@@ -435,7 +436,7 @@ pub fn r3_selector_to_output_expr<'a>(
     allocator: &'a Allocator,
     elements: &[R3SelectorElement],
 ) -> OxcVec<'a, OutputExpression<'a>> {
-    let mut result = OxcVec::with_capacity_in(elements.len(), allocator);
+    let mut result = OxcVec::with_capacity_in(elements.len(), &allocator);
     for element in elements {
         match element {
             R3SelectorElement::String(s) => {
@@ -444,13 +445,13 @@ pub fn r3_selector_to_output_expr<'a>(
                         value: LiteralValue::String(Ident::from(allocator.alloc_str(s))),
                         source_span: None,
                     },
-                    allocator,
+                    &allocator,
                 )));
             }
             R3SelectorElement::Flag(f) => {
                 result.push(OutputExpression::Literal(oxc_allocator::Box::new_in(
                     LiteralExpr { value: LiteralValue::Number(*f as f64), source_span: None },
-                    allocator,
+                    &allocator,
                 )));
             }
         }

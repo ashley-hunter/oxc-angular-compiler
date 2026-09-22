@@ -6,7 +6,8 @@
 //! Ported from Angular's `render3/r3_ast.ts`.
 
 use oxc_allocator::{Allocator, Box, HashMap, Vec};
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use crate::ast::expression::{ASTWithSource, AngularExpression, BindingType, ParsedEventType};
 
@@ -199,11 +200,11 @@ impl<'a> I18nMessage<'a> {
     /// Note: This preserves the `instance_id` so that cloned messages maintain
     /// their identity for i18n context sharing.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
-        let mut nodes = Vec::new_in(allocator);
+        let mut nodes = Vec::new_in(&allocator);
         for node in self.nodes.iter() {
             nodes.push(node.clone_in(allocator));
         }
-        let mut legacy_ids = Vec::new_in(allocator);
+        let mut legacy_ids = Vec::new_in(&allocator);
         for id in self.legacy_ids.iter() {
             legacy_ids.push(id.clone());
         }
@@ -246,7 +247,7 @@ impl<'a> I18nText<'a> {
 impl<'a> I18nContainer<'a> {
     /// Creates a deep clone of this i18n container using the provided allocator.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
-        let mut children = Vec::new_in(allocator);
+        let mut children = Vec::new_in(&allocator);
         for child in self.children.iter() {
             children.push(child.clone_in(allocator));
         }
@@ -257,7 +258,7 @@ impl<'a> I18nContainer<'a> {
 impl<'a> I18nIcu<'a> {
     /// Creates a deep clone of this ICU expression using the provided allocator.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
-        let mut cases = HashMap::new_in(allocator);
+        let mut cases = HashMap::new_in(&allocator);
         for (key, value) in self.cases.iter() {
             cases.insert(key.clone(), value.clone_in(allocator));
         }
@@ -274,11 +275,11 @@ impl<'a> I18nIcu<'a> {
 impl<'a> I18nTagPlaceholder<'a> {
     /// Creates a deep clone of this tag placeholder using the provided allocator.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
-        let mut attrs = HashMap::new_in(allocator);
+        let mut attrs = HashMap::new_in(&allocator);
         for (key, value) in self.attrs.iter() {
             attrs.insert(key.clone(), value.clone());
         }
-        let mut children = Vec::new_in(allocator);
+        let mut children = Vec::new_in(&allocator);
         for child in self.children.iter() {
             children.push(child.clone_in(allocator));
         }
@@ -311,7 +312,7 @@ impl<'a> I18nIcuPlaceholder<'a> {
     /// Creates a deep clone of this ICU placeholder using the provided allocator.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
         I18nIcuPlaceholder {
-            value: Box::new_in(self.value.clone_in(allocator), allocator),
+            value: Box::new_in(self.value.clone_in(allocator), &allocator),
             name: self.name.clone(),
             source_span: self.source_span,
         }
@@ -321,11 +322,11 @@ impl<'a> I18nIcuPlaceholder<'a> {
 impl<'a> I18nBlockPlaceholder<'a> {
     /// Creates a deep clone of this block placeholder using the provided allocator.
     pub fn clone_in(&self, allocator: &'a Allocator) -> Self {
-        let mut parameters = Vec::new_in(allocator);
+        let mut parameters = Vec::new_in(&allocator);
         for param in self.parameters.iter() {
             parameters.push(param.clone());
         }
-        let mut children = Vec::new_in(allocator);
+        let mut children = Vec::new_in(&allocator);
         for child in self.children.iter() {
             children.push(child.clone_in(allocator));
         }
@@ -823,6 +824,26 @@ pub struct R3SwitchBlock<'a> {
     pub groups: Vec<'a, R3SwitchBlockCaseGroup<'a>>,
     /// Unknown blocks for error recovery.
     pub unknown_blocks: Vec<'a, R3UnknownBlock<'a>>,
+    /// Optional exhaustive check (`@default never;`, v22+).
+    pub exhaustive_check: Option<R3SwitchExhaustiveCheck<'a>>,
+    /// Source span.
+    pub source_span: Span,
+    /// Start span.
+    pub start_source_span: Span,
+    /// End span.
+    pub end_source_span: Option<Span>,
+    /// Name span.
+    pub name_span: Span,
+}
+
+/// A switch exhaustive check (`@default never;`, v22+).
+///
+/// Marks a `@switch` as exhaustive for type-narrowing purposes. It carries no
+/// body and emits no runtime output.
+#[derive(Debug)]
+pub struct R3SwitchExhaustiveCheck<'a> {
+    /// Optional expression (`@default never(expr);`).
+    pub expression: Option<AngularExpression<'a>>,
     /// Source span.
     pub source_span: Span,
     /// Start span.
@@ -948,6 +969,9 @@ pub struct R3NeverDeferredTrigger {
 /// An idle deferred trigger.
 #[derive(Debug)]
 pub struct R3IdleDeferredTrigger {
+    /// Optional timeout in milliseconds (v22+: `on idle(100)`). `f64` to
+    /// preserve fractional precision, mirroring the timer trigger's delay.
+    pub timeout: Option<f64>,
     /// Source span.
     pub source_span: Span,
     /// Name span.
@@ -1418,7 +1442,13 @@ pub trait R3Visitor<'a> {
         for group in &block.groups {
             self.visit_switch_block_case_group(group);
         }
+        if let Some(check) = &block.exhaustive_check {
+            self.visit_switch_exhaustive_check(check);
+        }
     }
+
+    /// Visit a switch exhaustive check (`@default never;`).
+    fn visit_switch_exhaustive_check(&mut self, _check: &R3SwitchExhaustiveCheck<'a>) {}
 
     /// Visit a switch block case group.
     fn visit_switch_block_case_group(&mut self, group: &R3SwitchBlockCaseGroup<'a>) {

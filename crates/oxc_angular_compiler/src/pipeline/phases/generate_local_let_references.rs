@@ -17,6 +17,7 @@
 //! Ported from Angular's `template/pipeline/src/phases/generate_local_let_references.ts`.
 
 use oxc_allocator::Box;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ir::enums::{SemanticVariableKind, VariableFlags};
@@ -42,7 +43,7 @@ pub fn generate_local_let_references(job: &mut ComponentCompilationJob<'_>) {
                 None => continue,
             };
 
-            let mut names: FxHashMap<XrefId, oxc_span::Ident<'_>> = FxHashMap::default();
+            let mut names: FxHashMap<XrefId, Ident<'_>> = FxHashMap::default();
             for op in view.create.iter() {
                 if let CreateOp::DeclareLet(let_decl) = op {
                     names.insert(let_decl.xref, let_decl.name.clone());
@@ -85,17 +86,17 @@ pub fn generate_local_let_references(job: &mut ComponentCompilationJob<'_>) {
                     let declared_name = let_names
                         .get(&store_let.target)
                         .cloned()
-                        .unwrap_or_else(|| oxc_span::Ident::from(""));
+                        .unwrap_or_else(|| Ident::from(""));
 
                     // Create a new Variable op with StoreLetExpr as the initializer
                     let store_let_expr = IrExpression::StoreLet(Box::new_in(
                         StoreLetExpr {
                             target: store_let.target,
-                            value: Box::new_in((*store_let.value).clone_in(allocator), allocator),
+                            value: Box::new_in((*store_let.value).clone_in(allocator), &allocator),
                             var_offset: None, // Assigned by var_counting phase
                             source_span: store_let.base.source_span.unwrap_or_default(),
                         },
-                        allocator,
+                        &allocator,
                     ));
 
                     // Use pre-allocated xref
@@ -109,7 +110,7 @@ pub fn generate_local_let_references(job: &mut ComponentCompilationJob<'_>) {
                         xref: var_xref,
                         kind: SemanticVariableKind::Identifier,
                         name: declared_name,
-                        initializer: Box::new_in(store_let_expr, allocator),
+                        initializer: Box::new_in(store_let_expr, &allocator),
                         flags: VariableFlags::NONE,
                         view: None,
                         local: true, // @let declarations are local to the view

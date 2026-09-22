@@ -4,7 +4,7 @@
 //!
 //! Ported from Angular's `template/pipeline/src/phases/resolve_i18n_expression_placeholders.ts`.
 
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ir::enums::{I18nExpressionFor, I18nParamResolutionTime, I18nParamValueFlags};
@@ -119,7 +119,7 @@ pub fn resolve_i18n_expression_placeholders(job: &mut ComponentCompilationJob<'_
                                 if let Some(values) = params.get_mut(&placeholder_atom) {
                                     values.push(update.value);
                                 } else {
-                                    let mut values = oxc_allocator::Vec::new_in(allocator);
+                                    let mut values = oxc_allocator::Vec::new_in(&allocator);
                                     values.push(update.value);
                                     params.insert(placeholder_atom, values);
                                 }

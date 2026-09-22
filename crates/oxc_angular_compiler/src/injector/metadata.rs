@@ -3,7 +3,7 @@
 //! Ported from Angular's `render3/r3_injector_compiler.ts`.
 
 use oxc_allocator::Vec;
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use crate::output::ast::OutputExpression;
 
@@ -60,7 +60,7 @@ impl<'a> R3InjectorMetadataBuilder<'a> {
             name: None,
             r#type: None,
             providers: None,
-            imports: Vec::new_in(allocator),
+            imports: Vec::new_in(&allocator),
             raw_imports: None,
         }
     }

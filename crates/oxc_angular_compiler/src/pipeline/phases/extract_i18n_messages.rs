@@ -7,7 +7,7 @@
 
 use std::ptr::NonNull;
 
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ir::enums::{I18nContextKind, I18nParamValueFlags};
@@ -136,7 +136,7 @@ pub fn extract_i18n_messages(job: &mut ComponentCompilationJob<'_>) {
                                 associated_message_id: metadata
                                     .and_then(|m| m.associated_message_id),
                                 needs_postprocessing,
-                                sub_messages: oxc_allocator::Vec::new_in(allocator),
+                                sub_messages: oxc_allocator::Vec::new_in(&allocator),
                             });
                         }
                     }

@@ -1,9 +1,12 @@
-# Changelog for Oxlint
+# Changelog
 
-See [Oxlint GitHub Release](https://github.com/oxc-project/oxc/releases)
+## 0.0.39 - 2026-09-21
 
-# Changelog for published crates
+- Fixed JIT mode leaving dead bare imports when every specifier of an import statement is an inline `type` specifier.
+- Updated Oxc, napi-rs, and related dependencies.
 
-See each `./crates/*/CHANGELOG.md`
+## 0.0.38 - 2026-08-25
 
-See [summarized release PR](https://github.com/oxc-project/oxc/pulls?q=is%3Apr+is%3Aclosed+release%28crates%29)
+- Fixed template HMR so changes reach every component that shares a template without forcing a full-page reload.
+- Fixed style HMR for shared resources, multiple components in one file, imported resources, and components that remove their last style.
+- Updated Oxc and related dependencies.

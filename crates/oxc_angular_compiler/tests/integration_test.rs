@@ -13,7 +13,7 @@ use oxc_angular_compiler::{
     transform::html_to_r3::{HtmlToR3Transform, TransformOptions},
     transform_angular_file,
 };
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 /// Compiles an Angular template to JavaScript.
 fn compile_template_to_js(template: &str, component_name: &str) -> String {
@@ -41,7 +41,11 @@ fn compile_template_to_js_with_version(
     }
 
     // Stage 2: Transform HTML AST to R3 AST
-    let transformer = HtmlToR3Transform::new(&allocator, template, TransformOptions::default());
+    let transformer = HtmlToR3Transform::new(
+        &allocator,
+        template,
+        TransformOptions { angular_version, ..TransformOptions::default() },
+    );
     let r3_result = transformer.transform(&html_result.nodes);
 
     // Check for transform errors
@@ -504,7 +508,7 @@ fn test_defer_block() {
 #[test]
 fn test_defer_inside_i18n() {
     let js = compile_template_to_js(
-        r#"<div i18n>
+        r"<div i18n>
   Content:
   @defer (when isLoaded) {
     before<span>middle</span>after
@@ -515,7 +519,7 @@ fn test_defer_inside_i18n() {
   } @error {
     before<h1>error</h1>after
   }
-</div>"#,
+</div>",
         "MyApp",
     );
 
@@ -589,6 +593,327 @@ fn test_defer_on_viewport() {
     let js =
         compile_template_to_js(r"@defer (on viewport) { <heavy-component /> }", "TestComponent");
     insta::assert_snapshot!("defer_on_viewport", js);
+}
+
+/// Reproduces voidzero-dev/oxc-angular-compiler#289 (aligned with Angular's
+/// local-compilation behavior): a `@defer` block on a component whose lazy
+/// dependency is declared in the `@Component.deferredImports` array must emit
+/// a deferrable-dependencies resolver — a no-arg arrow returning an array of
+/// dynamic `import()` calls — wired in as the third argument of
+/// `ɵɵdefer(...)`. Previously the resolver argument was omitted entirely and
+/// no `import('./lazy')` appeared anywhere in the output.
+#[test]
+fn test_defer_emits_dependency_resolver_from_deferred_imports() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    deferredImports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    // The output must contain a dynamic import of the lazy module.
+    assert!(
+        code.contains("import(\"./lazy\")") || code.contains("import('./lazy')"),
+        "Expected a dynamic `import('./lazy')` for the deferred dependency. Output:\n{code}"
+    );
+
+    // The dynamic import should be followed by `.then(...)` with a callback
+    // that reads `m.LazyCmp` (the original / local export name). Exact
+    // whitespace and parenthesization of the arrow params is up to the
+    // emitter.
+    let collapsed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        collapsed.contains(".then((m)=>m.LazyCmp)") || collapsed.contains(".then(m=>m.LazyCmp)"),
+        "Expected `.then(m => m.LazyCmp)` chain after dynamic import. Output:\n{code}"
+    );
+
+    // The resolver expression must be wired into `ɵɵdefer(...)` as a non-null
+    // third argument.
+    assert!(
+        code.contains("ɵɵdefer(1,0,() =>[import(\"./lazy\")")
+            || code.contains("ɵɵdefer(1,0,()=>[import(\"./lazy\")"),
+        "ɵɵdefer's 3rd argument (resolverFn) must be the deferrable-deps arrow function. Output:\n{code}"
+    );
+
+    // The deferred symbol must NOT appear in the eager dependencies factory.
+    // (When the component has only `deferredImports` and no `imports`, the
+    // `dependencies` field is omitted entirely.)
+    assert!(
+        !code.contains("ɵɵgetComponentDepsFactory(Parent,[LazyCmp]"),
+        "Deferred symbol must not appear in the eager `ɵɵgetComponentDepsFactory` array. Output:\n{code}"
+    );
+
+    // `setClassMetadataAsync` (not the sync `setClassMetadata`) should be
+    // emitted so the TestBed-facing metadata is built lazily — the deferred
+    // symbol is reached through the async callback's parameter, not a
+    // static import reference.
+    assert!(
+        code.contains("setClassMetadataAsync"),
+        "Components with `deferredImports` should emit `setClassMetadataAsync`. Output:\n{code}"
+    );
+}
+
+/// Aliased imports must use the original exported name in `m.X`, not the
+/// local alias.
+#[test]
+fn test_defer_dependency_resolver_uses_original_export_name_for_aliases() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { HeavyWidget as Heavy } from './widget';
+
+@Component({
+    selector: 'app-parent',
+    deferredImports: [Heavy],
+    template: '@defer { <app-heavy/> }',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        code.contains("import(\"./widget\")") || code.contains("import('./widget')"),
+        "Expected dynamic `import('./widget')`. Output:\n{code}"
+    );
+
+    // The chain must resolve `m.HeavyWidget` (the original export name), not
+    // `m.Heavy` (the local alias).
+    let collapsed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        collapsed.contains(".then((m)=>m.HeavyWidget)")
+            || collapsed.contains(".then(m=>m.HeavyWidget)"),
+        "Expected `.then(m => m.HeavyWidget)` using the original export name. Output:\n{code}"
+    );
+    assert!(
+        !collapsed.contains("m.Heavy)") && !collapsed.contains("m.Heavy,"),
+        "Aliased import must not resolve to the local alias `Heavy`. Output:\n{code}"
+    );
+
+    // The `setClassMetadataAsync` callback parameter must use the *local*
+    // binding so the decorator metadata body's `Heavy` reference shadows the
+    // outer static import — letting bundlers drop the eager declaration.
+    // Angular emits `(HeavyWidget) =>` here and leaves the static import
+    // pinned; we diverge to enable tree-shaking.
+    assert!(
+        collapsed.contains("(Heavy)=>"),
+        "Expected `(Heavy) =>` callback parameter (local binding shadows static import). Output:\n{code}"
+    );
+    assert!(
+        !collapsed.contains("(HeavyWidget)=>"),
+        "Callback parameter must NOT be the original export name `HeavyWidget` (would leave the static import pinned). Output:\n{code}"
+    );
+}
+
+/// Default imports must use `m.default` in the resolver chain.
+#[test]
+fn test_defer_dependency_resolver_uses_default_for_default_imports() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import LazyCmp from './lazy-default';
+
+@Component({
+    selector: 'app-parent',
+    deferredImports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        code.contains("import(\"./lazy-default\")") || code.contains("import('./lazy-default')"),
+        "Expected dynamic `import('./lazy-default')`. Output:\n{code}"
+    );
+
+    let collapsed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        collapsed.contains(".then((m)=>m.default)") || collapsed.contains(".then(m=>m.default)"),
+        "Default import must resolve to `m.default`. Output:\n{code}"
+    );
+
+    // The `setClassMetadataAsync` callback parameter name must be a legal JS
+    // identifier — not the reserved word `default`. Use the local binding.
+    assert!(
+        !collapsed.contains("(default)=>") && !collapsed.contains("(default)=>"),
+        "Default-import callback parameter must not be the reserved word `default`. Output:\n{code}"
+    );
+    assert!(
+        collapsed.contains("(LazyCmp)=>"),
+        "Default-import callback parameter must use the local binding name `LazyCmp`. Output:\n{code}"
+    );
+}
+
+/// Components without `@defer` blocks must not generate a resolver function
+/// (regression guard so we don't accidentally produce dead lazy-loading code).
+#[test]
+fn test_no_defer_block_skips_dependency_resolver() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { ChildCmp } from './child';
+
+@Component({
+    selector: 'app-parent',
+    deferredImports: [ChildCmp],
+    template: '<app-child/>',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    assert!(
+        !code.contains("import(\"./child\")") && !code.contains("import('./child')"),
+        "Components without @defer must not emit dynamic imports. Output:\n{code}"
+    );
+}
+
+/// When the user lists a symbol only in `@Component.imports`, OXC must NOT
+/// auto-detect it as deferrable (that's the full-compilation behavior, which
+/// needs cross-file selector info OXC doesn't have). Issue #289's original
+/// repro form (`imports: [LazyCmp]` with `@defer`) therefore emits no
+/// resolver — the user must move the symbol to `deferredImports`.
+#[test]
+fn test_defer_with_only_imports_does_not_auto_detect() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    // `imports: [LazyCmp]` alone must remain eager — no dynamic import emitted.
+    assert!(
+        !code.contains("import(\"./lazy\")") && !code.contains("import('./lazy')"),
+        "Symbols declared only in `imports` (not `deferredImports`) must not be lazy-loaded in local compilation. Output:\n{code}"
+    );
+}
+
+/// Matches Angular's `validateNoImportOverlap` (handler.ts:2558+): a symbol
+/// listed in both `imports` and `deferredImports` is an error — each
+/// dependency must have a single, unambiguous role.
+#[test]
+fn test_defer_overlap_between_imports_and_deferred_imports_is_diagnostic() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { Mixed } from './mixed';
+
+@Component({
+    selector: 'app-parent',
+    imports: [Mixed],
+    deferredImports: [Mixed],
+    template: '@defer { <app-mixed/> }',
+    standalone: true,
+})
+export class Parent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+
+    assert!(
+        result.has_errors(),
+        "Symbol used in both `imports` and `deferredImports` must yield a diagnostic. Output:\n{}",
+        result.code
+    );
+    let any_overlap_msg = result.diagnostics.iter().any(|d| {
+        let s = format!("{d}");
+        s.contains("`@Component.imports`") && s.contains("`@Component.deferredImports`")
+    });
+    assert!(
+        any_overlap_msg,
+        "Diagnostic should mention both `@Component.imports` and `@Component.deferredImports`. Got: {:?}",
+        result.diagnostics
+    );
+}
+
+/// The `@default never;` exhaustive marker must be the last case in a `@switch`
+/// (Angular v22). A `@case`/`@default` that appears after it is a diagnostic.
+#[test]
+fn test_switch_default_never_must_be_last() {
+    let allocator = Allocator::default();
+    let ordering_msg = "must be the last case in a switch";
+
+    // Exhaustive check followed by a @case -> diagnostic.
+    let bad = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'app-x',
+    template: '@switch (x) { @default never; @case (1) {} }',
+    standalone: true,
+})
+export class X { x = 1; }
+"#;
+    let result = transform_angular_file(&allocator, "x.component.ts", bad, None, None);
+    assert!(
+        result.has_errors(),
+        "A @case after `@default never;` must be a diagnostic. Output:\n{}",
+        result.code
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| format!("{d}").contains(ordering_msg)),
+        "Expected a 'must be the last case' diagnostic. Got: {:?}",
+        result.diagnostics
+    );
+
+    // Exhaustive check as the last case (after a case with a body) -> no ordering error.
+    let good = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'app-x',
+    template: '@switch (x) { @case (1) {x} @default never; }',
+    standalone: true,
+})
+export class X { x = 1; }
+"#;
+    let result = transform_angular_file(&allocator, "x.component.ts", good, None, None);
+    assert!(
+        !result.diagnostics.iter().any(|d| format!("{d}").contains(ordering_msg)),
+        "`@default never;` as the last case should not report the ordering diagnostic. Got: {:?}",
+        result.diagnostics
+    );
 }
 
 #[test]
@@ -763,6 +1088,89 @@ fn test_let_with_pipe_multiple_in_child_view_varoffset() {
 }
 
 // ============================================================================
+// Template literal Tests
+// ============================================================================
+
+#[test]
+fn test_template_literal_with_pipe() {
+    // {{ `${num | percent}` }} - template literal containing a pipe call on a @let variable.
+    // TemplateLiteral was not handled in convert_ast_to_ir and fell through to
+    // store_and_ref_expr, so the inner BindingPipe was never registered with
+    // pipe_creation and the @let variable was resolved against ctx instead of the
+    // local scope.
+    let js = compile_template_to_js(r"@let num = 0.75; {{ `${num | percent}` }}", "TestComponent");
+    assert!(js.contains("ɵɵpipeBind1"), "percent pipe should be registered. Output:\n{js}");
+    insta::assert_snapshot!("template_literal_with_pipe", js);
+}
+
+#[test]
+fn test_template_literal_with_pipe_and_text() {
+    // Template literal with mixed text and pipe: `Value: ${num | percent} done`
+    let js = compile_template_to_js(
+        r"@let num = 0.75; {{ `Value: ${num | percent} done` }}",
+        "TestComponent",
+    );
+    assert!(
+        js.contains("ɵɵpipeBind1"),
+        "percent pipe should be registered in template literal with surrounding text. Output:\n{js}"
+    );
+    insta::assert_snapshot!("template_literal_with_pipe_and_text", js);
+}
+
+#[test]
+fn test_template_literal_without_pipe() {
+    // Template literal without pipe should still work correctly (regression guard).
+    let js =
+        compile_template_to_js(r"@let name = 'world'; {{ `Hello ${name}!` }}", "TestComponent");
+    insta::assert_snapshot!("template_literal_without_pipe", js);
+}
+
+#[test]
+fn test_template_literal_pipe_in_attribute_binding() {
+    // Template literal with pipe used as an attribute binding value.
+    // Real-world pattern: [label]="`${(count() | number)}`"
+    // Before the fix the pipe was silently dropped, producing `${ctx.count()}` instead.
+    let js = compile_template_to_js(
+        r#"<div [title]="`${count() | number} items`"></div>"#,
+        "TestComponent",
+    );
+    assert!(
+        js.contains("ɵɵpipeBind1"),
+        "number pipe should appear in attribute binding template literal. Output:\n{js}"
+    );
+    insta::assert_snapshot!("template_literal_pipe_in_attribute_binding", js);
+}
+
+#[test]
+fn test_template_literal_multiple_pipes() {
+    // Two pipes inside one template literal. Both must be registered.
+    let js = compile_template_to_js(
+        r"@let a = 0.5; @let b = 1234; {{ `${a | percent} of ${b | number}` }}",
+        "TestComponent",
+    );
+    assert!(
+        js.matches("ɵɵpipeBind1").count() >= 2,
+        "both percent and number pipes should appear. Output:\n{js}"
+    );
+    insta::assert_snapshot!("template_literal_multiple_pipes", js);
+}
+
+#[test]
+fn test_template_literal_pipe_in_child_view() {
+    // Template literal + pipe inside an @if child view.
+    // Pipe must be registered in the child view's create block.
+    let js = compile_template_to_js(
+        r"@let n = 0.75; @if (true) { {{ `${n | percent}` }} }",
+        "TestComponent",
+    );
+    assert!(
+        js.contains("ɵɵpipeBind1"),
+        "percent pipe should be registered in child view template literal. Output:\n{js}"
+    );
+    insta::assert_snapshot!("template_literal_pipe_in_child_view", js);
+}
+
+// ============================================================================
 // @let self-reference / forward-reference Tests
 // ============================================================================
 
@@ -774,6 +1182,178 @@ fn test_let_self_reference_replaced_with_undefined() {
     // in the declaration op itself.
     let js = compile_template_to_js(r"@let x = x + 1; <div>{{x}}</div>", "TestComponent");
     insta::assert_snapshot!("let_self_reference", js);
+}
+
+// ============================================================================
+// Object Spread Tests
+// ============================================================================
+
+#[test]
+fn test_object_spread_in_binding() {
+    // { ...base, extra: 'val' } — spread was silently dropped, resulting in { extra: 'val' }
+    // Keys/values in LiteralMap are parallel arrays; LiteralMapKey::Spread was skipped in
+    // convert_ast_to_ir so the spread expression never reached the IR or emitter.
+    let js = compile_template_to_js(
+        r#"<div [title]="{ ...base, extra: 'val' }"></div>"#,
+        "TestComponent",
+    );
+    // Angular wraps object literals in pure functions; spread appears as ...a0 in the
+    // pure function body and ctx.base is passed as the argument.
+    assert!(js.contains("...a0"), "object spread should be preserved in output. Output:\n{js}");
+    assert!(js.contains("ctx.base"), "spread variable should be referenced. Output:\n{js}");
+    insta::assert_snapshot!("object_spread_in_binding", js);
+}
+
+#[test]
+fn test_object_spread_only() {
+    let js = compile_template_to_js(r#"<div [title]="{ ...base }"></div>"#, "TestComponent");
+    assert!(js.contains("...a0"), "spread-only object should emit spread. Output:\n{js}");
+    assert!(js.contains("ctx.base"), "spread variable should be referenced. Output:\n{js}");
+    insta::assert_snapshot!("object_spread_only", js);
+}
+
+#[test]
+fn test_object_multiple_spreads() {
+    let js = compile_template_to_js(
+        r#"<div [title]="{ ...a, ...b, key: 'val' }"></div>"#,
+        "TestComponent",
+    );
+    assert!(
+        js.contains("...a0") && js.contains("...a1"),
+        "multiple spreads should both appear. Output:\n{js}"
+    );
+    assert!(
+        js.contains("ctx.a") && js.contains("ctx.b"),
+        "both spread variables should be referenced. Output:\n{js}"
+    );
+    insta::assert_snapshot!("object_multiple_spreads", js);
+}
+
+#[test]
+fn test_object_spread_with_pipe() {
+    // Pipe inside the same object literal as a spread — pipe must still be registered.
+    let js = compile_template_to_js(
+        r#"<div [title]="{ ...base, val: num | percent }"></div>"#,
+        "TestComponent",
+    );
+    assert!(js.contains("...a0"), "spread should be preserved alongside pipe. Output:\n{js}");
+    assert!(
+        js.contains("ɵɵpipeBind1"),
+        "pipe inside object literal with spread should still be registered. Output:\n{js}"
+    );
+    insta::assert_snapshot!("object_spread_with_pipe", js);
+}
+
+#[test]
+fn test_object_spread_at_end() {
+    let js =
+        compile_template_to_js(r#"<div [title]="{ key: 'val', ...base }"></div>"#, "TestComponent");
+    assert!(js.contains("...a0"), "trailing spread should be preserved. Output:\n{js}");
+    assert!(js.contains("ctx.base"), "spread variable should be referenced. Output:\n{js}");
+    insta::assert_snapshot!("object_spread_at_end", js);
+}
+
+// ============================================================================
+// Spread in Complex Expressions
+// ============================================================================
+
+#[test]
+fn test_spread_in_arrow_function_body() {
+    // Array spread inside an arrow function binding. Arrow functions fall through to the
+    // ExpressionStore in ingest (not explicitly handled), so the LiteralArray with SpreadElement
+    // reaches convert_angular_expression_with_ctx directly. Before the fix to the LiteralArray
+    // arm in reify/angular_expression.rs, SpreadElement entries were silently unwrapped,
+    // resulting in `() => [ctx.base,"extra"]` instead of `() => [...ctx.base,"extra"]`.
+    let js = compile_template_to_js(
+        r#"<button (click)="handler(() => [...base, 'extra'])">click</button>"#,
+        "TestComponent",
+    );
+    assert!(
+        js.contains("...ctx.base"),
+        "spread inside arrow function body should be preserved. Output:\n{js}"
+    );
+    insta::assert_snapshot!("spread_in_arrow_function_body", js);
+}
+
+#[test]
+fn test_object_spread_chained_bindings() {
+    // Two property bindings on the same element force the chaining phase to run.
+    // The chaining phase clones instruction args via clone_expression. Before the fix to
+    // chaining.rs, LiteralMapEntry::new() was used (which always sets is_spread: false),
+    // silently dropping spread info from any LiteralMap that clone_expression encountered.
+    let js = compile_template_to_js(
+        r#"<div [title]="{ ...base, extra: 'val' }" [id]="myId"></div>"#,
+        "TestComponent",
+    );
+    assert!(
+        js.contains("...a0"),
+        "spread should be preserved when bindings are chained. Output:\n{js}"
+    );
+    assert!(
+        js.contains("ctx.base"),
+        "spread variable should be referenced when bindings are chained. Output:\n{js}"
+    );
+    insta::assert_snapshot!("object_spread_chained_bindings", js);
+}
+
+// ============================================================================
+// Array Spread Tests
+// ============================================================================
+
+#[test]
+fn test_array_spread_in_binding() {
+    let js = compile_template_to_js(r#"<div [title]="[...base, 'extra']"></div>"#, "TestComponent");
+    assert!(js.contains("...a0"), "array spread should be preserved in output. Output:\n{js}");
+    assert!(js.contains("ctx.base"), "spread variable should be referenced. Output:\n{js}");
+    insta::assert_snapshot!("array_spread_in_binding", js);
+}
+
+#[test]
+fn test_array_multiple_spreads() {
+    let js =
+        compile_template_to_js(r#"<div [title]="[...a, ...b, 'val']"></div>"#, "TestComponent");
+    assert!(
+        js.contains("...a0") && js.contains("...a1"),
+        "multiple array spreads should both appear. Output:\n{js}"
+    );
+    assert!(
+        js.contains("ctx.a") && js.contains("ctx.b"),
+        "both spread variables should be referenced. Output:\n{js}"
+    );
+    insta::assert_snapshot!("array_multiple_spreads", js);
+}
+
+#[test]
+fn test_array_spread_vs_non_spread_pooling_distinct() {
+    // Two array bindings whose entries are identical except for spread shape: `[a]` vs `[...a]`.
+    // The pure-function pool deduplicates by body key, so if the key generation ignores the
+    // spread metadata on DerivedLiteralArray entries, both bindings collide on the same pooled
+    // helper and one binding gets the other's runtime semantics.
+    let js = compile_template_to_js(
+        r#"<div [title]="[a]"></div><div [id]="[...a]"></div>"#,
+        "TestComponent",
+    );
+    // Each binding must produce its own pure function: one emitting `[a0]`, the other `[...a0]`.
+    assert!(js.contains("[a0]"), "non-spread array binding should emit `[a0]` body. Output:\n{js}");
+    assert!(
+        js.contains("[...a0]"),
+        "spread array binding should emit `[...a0]` body. Output:\n{js}"
+    );
+}
+
+#[test]
+fn test_object_spread_vs_non_spread_pooling_distinct() {
+    // Object literal counterpart of the array test above. `{k: a}` and `{...a}` would collide
+    // on the same pooled helper if spread metadata is excluded from the key.
+    let js = compile_template_to_js(
+        r#"<div [title]="{k: a}"></div><div [id]="{...a}"></div>"#,
+        "TestComponent",
+    );
+    assert!(js.contains("...a0"), "object spread binding should emit `...a0`. Output:\n{js}");
+    assert!(
+        js.contains("k: a0") || js.contains("k:a0"),
+        "non-spread object binding should emit `k: a0`. Output:\n{js}"
+    );
 }
 
 // ============================================================================
@@ -1176,7 +1756,7 @@ fn test_nested_for_with_outer_scope_track() {
 #[test]
 fn test_for_track_binary_with_component_method() {
     let js = compile_template_to_js(
-        r#"@for (item of items; track prefix() + item.id) { <div>{{item.name}}</div> }"#,
+        r"@for (item of items; track prefix() + item.id) { <div>{{item.name}}</div> }",
         "TestComponent",
     );
     // Must generate a regular function, not an arrow function, because prefix() needs `this`
@@ -1201,7 +1781,7 @@ fn test_for_track_binary_with_component_method() {
 #[test]
 fn test_for_track_nullish_coalescing_with_component_method() {
     let js = compile_template_to_js(
-        r#"@for (item of items; track item.prefix ?? defaultPrefix()) { <div>{{item.name}}</div> }"#,
+        r"@for (item of items; track item.prefix ?? defaultPrefix()) { <div>{{item.name}}</div> }",
         "TestComponent",
     );
     assert!(
@@ -1219,7 +1799,7 @@ fn test_for_track_nullish_coalescing_with_component_method() {
 #[test]
 fn test_for_track_ternary_with_component_method() {
     let js = compile_template_to_js(
-        r#"@for (item of items; track useId() ? item.id : item.name) { <div>{{item.name}}</div> }"#,
+        r"@for (item of items; track useId() ? item.id : item.name) { <div>{{item.name}}</div> }",
         "TestComponent",
     );
     assert!(
@@ -1238,7 +1818,7 @@ fn test_for_track_ternary_with_component_method() {
 #[test]
 fn test_for_track_complex_binary_with_nullish_coalescing() {
     let js = compile_template_to_js(
-        r#"@for (tag of visibleTags(); track (tag.queryPrefix ?? queryPrefix()) + '.' + tag.key) { <span>{{ tag.key }}</span> }"#,
+        r"@for (tag of visibleTags(); track (tag.queryPrefix ?? queryPrefix()) + '.' + tag.key) { <span>{{ tag.key }}</span> }",
         "TestComponent",
     );
     assert!(
@@ -1261,7 +1841,7 @@ fn test_for_track_complex_binary_with_nullish_coalescing() {
 #[test]
 fn test_for_track_binary_without_component_context() {
     let js = compile_template_to_js(
-        r#"@for (item of items; track item.type + ':' + item.id) { <div>{{item.name}}</div> }"#,
+        r"@for (item of items; track item.type + ':' + item.id) { <div>{{item.name}}</div> }",
         "TestComponent",
     );
     // This should be an arrow function since no component members are referenced
@@ -1280,7 +1860,7 @@ fn test_for_track_binary_without_component_context() {
 #[test]
 fn test_for_track_not_with_component_method() {
     let js = compile_template_to_js(
-        r#"@for (item of items; track !isDisabled()) { <div>{{item.name}}</div> }"#,
+        r"@for (item of items; track !isDisabled()) { <div>{{item.name}}</div> }",
         "TestComponent",
     );
     assert!(
@@ -1503,10 +2083,263 @@ fn test_pipe_in_binary_with_safe_property_read() {
     // TypeScript Angular compiler produces: (tmp = pipeBind(...) || fallback) == null ? null : tmp.prop
     // Without the fix, OXC duplicates the pipe call in both the guard and the access expression.
     let js = compile_template_to_js(
-        r#"<div>{{ ((data$ | async) || fallback)?.name }}</div>"#,
+        r"<div>{{ ((data$ | async) || fallback)?.name }}</div>",
         "TestComponent",
     );
     insta::assert_snapshot!("pipe_in_binary_with_safe_property_read", js);
+}
+
+// ----------------------------------------------------------------------------
+// legacyOptionalChaining (Angular v22+): native `?.` vs legacy `== null ? null`
+// See issue #317 and angular/angular@2896c93cc1.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_safe_navigation_modern_interpolation_v22() {
+    // Angular v22+ emits native optional chaining, which yields `undefined`.
+    let js = compile_template_to_js_with_version(
+        r"<div>{{user?.name}}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.user?.name"), "expected native optional chaining, got:\n{js}");
+    assert!(!js.contains("== null"), "modern mode must not emit the legacy null ternary:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_modern_chain_v22() {
+    let js = compile_template_to_js_with_version(
+        r"<div>{{user?.address?.city}}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.user?.address?.city"), "expected chained native `?.`, got:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_modern_mixed_chain_v22() {
+    // Only the safe steps become optional; the plain `.b` stays a normal read.
+    let js = compile_template_to_js_with_version(
+        r"<div>{{a?.b.c?.d}}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.a?.b.c?.d"), "expected mixed optional/plain chain, got:\n{js}");
+}
+
+#[test]
+fn test_safe_call_modern_v22() {
+    let js = compile_template_to_js_with_version(
+        r"<div>{{getData?.()}}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.getData?.()"), "expected native optional call, got:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_legacy_on_v21() {
+    // Pre-v22 keeps the legacy `== null ? null` expansion.
+    let js = compile_template_to_js_with_version(
+        r"<div>{{user?.name}}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(21, 0, 0)),
+    );
+    assert!(js.contains("== null"), "v21 must use the legacy null ternary, got:\n{js}");
+    assert!(!js.contains("ctx.user?.name"), "v21 must not emit native optional chaining:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_migration_forces_legacy_on_v22() {
+    // The `$safeNavigationMigration(...)` magic function opts a subtree back into
+    // legacy null semantics even on a modern (v22) target, and is stripped from
+    // the output.
+    let js = compile_template_to_js_with_version(
+        r"<div>{{ $safeNavigationMigration(user?.name) }}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("== null"), "wrapped subtree must use the legacy null ternary, got:\n{js}");
+    assert!(
+        !js.contains("$safeNavigationMigration"),
+        "the migration wrapper must be stripped from the output:\n{js}"
+    );
+}
+
+#[test]
+fn test_safe_navigation_preserved_in_chained_property_bindings_v22() {
+    // CX-47617: when an element has several property bindings, the reify phase
+    // chains them into a single `ɵɵproperty(a)(b)` call. The chaining phase
+    // clones the arguments of every binding after the first, and that clone used
+    // to hard-code `optional: false`, silently dropping the `?.` guard on all but
+    // the first binding. Under Angular v22 (native optional chaining) this emitted
+    // e.g. `ctx.c.d` instead of `ctx.c?.d`, crashing at runtime when `c` is nullish.
+    let js = compile_template_to_js_with_version(
+        r#"<div [title]="a?.b" [subtitle]="c?.d" [tooltip]="e?.f"></div>"#,
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.a?.b"), "first binding must keep `?.`, got:\n{js}");
+    assert!(js.contains("ctx.c?.d"), "second (chained) binding must keep `?.`, got:\n{js}");
+    assert!(js.contains("ctx.e?.f"), "third (chained) binding must keep `?.`, got:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_preserved_in_chained_keyed_and_call_bindings_v22() {
+    // Same chaining-clone bug for SafeKeyedRead (`?.[k]`) and SafeCall (`?.()`)
+    // in later bindings of a chain.
+    let js = compile_template_to_js_with_version(
+        r#"<div [title]="a?.b" [subtitle]="c?.[k]" [tooltip]="fn?.()"></div>"#,
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("ctx.c?.[ctx.k]"), "chained keyed read must keep `?.[`, got:\n{js}");
+    assert!(js.contains("ctx.fn?.()"), "chained safe call must keep `?.()`, got:\n{js}");
+}
+
+#[test]
+fn test_safe_navigation_preserved_in_chained_attr_class_style_v22() {
+    // The chaining-clone bug affected every chainable binding instruction, not
+    // just ɵɵproperty. Verify attribute, class and style bindings keep `?.` on
+    // their chained (non-first) argument.
+    for (tpl, instr) in [
+        (r#"<div [attr.a]="w?.x" [attr.b]="y?.z"></div>"#, "attribute"),
+        (r#"<div [class.a]="w?.x" [class.b]="y?.z"></div>"#, "class"),
+        (r#"<div [style.a]="w?.x" [style.b]="y?.z"></div>"#, "style"),
+    ] {
+        let js = compile_template_to_js_with_version(
+            tpl,
+            "TestComponent",
+            Some(AngularVersion::new(22, 0, 0)),
+        );
+        assert!(js.contains("ctx.w?.x"), "{instr}: first binding must keep `?.`, got:\n{js}");
+        assert!(js.contains("ctx.y?.z"), "{instr}: chained binding must keep `?.`, got:\n{js}");
+    }
+}
+
+#[test]
+fn test_safe_navigation_preserved_when_nested_in_chained_binding_v22() {
+    // `?.` buried inside a larger expression (under `!`, in a binary, chained,
+    // or in a ternary branch) on a chained binding must survive the recursive
+    // clone.
+    let js = compile_template_to_js_with_version(
+        r#"<div [title]="a?.b" [subtitle]="!c?.d" [tooltip]="e?.f?.g" [alt]="h ? i?.j : k?.l"></div>"#,
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(js.contains("!ctx.c?.d"), "`?.` under `!` on chained binding must survive, got:\n{js}");
+    assert!(js.contains("ctx.e?.f?.g"), "chained `?.` on chained binding must survive, got:\n{js}");
+    assert!(
+        js.contains("ctx.i?.j"),
+        "`?.` in ternary branch on chained binding must survive, got:\n{js}"
+    );
+    assert!(
+        js.contains("ctx.k?.l"),
+        "`?.` in ternary branch on chained binding must survive, got:\n{js}"
+    );
+}
+
+#[test]
+fn test_safe_navigation_preserved_in_chained_host_property_bindings_v22() {
+    // CX-47617: host property bindings go through the same `chain_for_host` ->
+    // `clone_expression` path as template bindings. Multiple host `[prop]`
+    // bindings chain into `ɵɵhostProperty(a)(b)`, and the chained (non-first)
+    // ones must keep their `?.` guard under Angular v22.
+    use oxc_angular_compiler::{HostMetadataInput, compile_template_to_js_with_options};
+
+    let allocator = Allocator::default();
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(22, 0, 0)),
+        host: Some(HostMetadataInput {
+            properties: vec![
+                ("[title]".to_string(), "a?.b".to_string()),
+                ("[id]".to_string(), "c?.d".to_string()),
+                ("[lang]".to_string(), "e?.f".to_string()),
+            ],
+            attributes: vec![],
+            listeners: vec![],
+            class_attr: None,
+            style_attr: None,
+        }),
+        selector: Some("my-comp".to_string()),
+        ..Default::default()
+    };
+
+    let output = compile_template_to_js_with_options(
+        &allocator,
+        "<p>hi</p>",
+        "MyComponent",
+        "test.ts",
+        &options,
+    )
+    .expect("compilation should succeed");
+    let code = &output.code;
+
+    assert!(code.contains("ctx.a?.b"), "first host binding must keep `?.`, got:\n{code}");
+    assert!(
+        code.contains("ctx.c?.d"),
+        "second (chained) host binding must keep `?.`, got:\n{code}"
+    );
+    assert!(code.contains("ctx.e?.f"), "third (chained) host binding must keep `?.`, got:\n{code}");
+}
+
+#[test]
+fn test_safe_navigation_preserved_in_chained_bindings_legacy_v21() {
+    // Older Angular (< v22) uses the legacy `== null ? null` expansion instead of
+    // native `?.`. The guard there is a structural ternary, not the `optional`
+    // flag, so the chaining-clone bug never affected legacy output. This test
+    // pins that: every chained binding — not just the first — must keep its own
+    // null-guard ternary in v21, and the fix must not perturb legacy codegen.
+    let js = compile_template_to_js_with_version(
+        r#"<div [title]="a?.b" [subtitle]="c?.d" [tooltip]="e?.f"></div>"#,
+        "TestComponent",
+        Some(AngularVersion::new(21, 0, 0)),
+    );
+    assert!(!js.contains("?."), "v21 must not emit native optional chaining, got:\n{js}");
+    for (recv, member) in [("ctx.a", "ctx.a.b"), ("ctx.c", "ctx.c.d"), ("ctx.e", "ctx.e.f")] {
+        assert!(
+            js.contains(&format!("({recv} == null)? null: {member}")),
+            "each chained binding must keep its legacy null guard; missing for {member}, got:\n{js}"
+        );
+    }
+}
+
+#[test]
+fn test_two_way_binding_writeback_target_is_never_optional_v22() {
+    // Guard against "helpfully" preserving `?.` when cloning a two-way binding's
+    // write-back assignment target. `a?.b = $event` is a JS SyntaxError (an
+    // optional chain is not a legal assignment target), so the LHS of the
+    // `|| (target = value)` clause must stay a plain member access even when the
+    // bound expression uses safe navigation under Angular v22.
+    let js = compile_template_to_js_with_version(
+        r#"<input [(ngModel)]="a?.b">"#,
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    // The twoWayBindingSet argument keeps its `?.` (it is only read, never assigned)...
+    assert!(js.contains("ɵɵtwoWayBindingSet(ctx.a?.b"), "read side should keep `?.`, got:\n{js}");
+    // ...but the write-back assignment target must be a plain, assignable read.
+    assert!(js.contains("ctx.a.b = $event"), "write-back LHS must be non-optional, got:\n{js}");
+    assert!(
+        !js.contains("a?.b = $event"),
+        "must not emit an illegal optional-chain LHS, got:\n{js}"
+    );
+}
+
+#[test]
+fn test_safe_navigation_migration_ignores_qualified_call() {
+    // Only the *unqualified* `$safeNavigationMigration(...)` helper is magic. A
+    // method named `$safeNavigationMigration` on some object is a legitimate call
+    // and must be preserved (matching Angular, which keys on a bare lexical read).
+    let js = compile_template_to_js_with_version(
+        r"<div>{{ svc.$safeNavigationMigration(user) }}</div>",
+        "TestComponent",
+        Some(AngularVersion::new(22, 0, 0)),
+    );
+    assert!(
+        js.contains("$safeNavigationMigration"),
+        "a qualified `svc.$safeNavigationMigration(...)` call must not be stripped, got:\n{js}"
+    );
 }
 
 // ============================================================================
@@ -2299,6 +3132,84 @@ fn test_animate_enter_and_leave_together() {
     );
 }
 
+#[test]
+fn test_host_animation_trigger_binding() {
+    // Component with animation trigger in host property should emit ɵɵsyntheticHostProperty
+    let source = r"
+import { Component } from '@angular/core';
+import { trigger, transition, style, animate } from '@angular/animations';
+
+@Component({
+    selector: 'app-slide',
+    template: '<ng-content></ng-content>',
+    animations: [trigger('slideIn', [transition(':enter', [style({ width: 0 }), animate('200ms')])])],
+    host: {
+        '[@slideIn]': 'animationState',
+    }
+})
+export class SlideComponent {
+    animationState = 'active';
+}
+";
+    let allocator = Allocator::default();
+    let result = transform_angular_file(&allocator, "slide.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    // Should have ɵɵsyntheticHostProperty in the hostBindings update block
+    assert!(
+        code.contains("syntheticHostProperty"),
+        "Expected ɵɵsyntheticHostProperty for host animation trigger.\nGot:\n{code}"
+    );
+    assert!(
+        code.contains(r#"syntheticHostProperty("@slideIn""#),
+        "Expected syntheticHostProperty with @slideIn name.\nGot:\n{code}"
+    );
+
+    // Should NOT have ɵɵanimateEnter/ɵɵanimateLeave for [@trigger] bindings
+    assert!(
+        !code.contains("animateEnter") && !code.contains("animateLeave"),
+        "Host [@trigger] bindings should not use animateEnter/animateLeave.\nGot:\n{code}"
+    );
+}
+
+#[test]
+fn test_directive_host_animation_trigger_binding() {
+    // Directive with animation trigger in host property should emit ɵɵsyntheticHostProperty
+    let source = r"
+import { Directive } from '@angular/core';
+import { trigger, transition, style, animate } from '@angular/animations';
+
+@Directive({
+    selector: '[appSlide]',
+    host: {
+        '[@slideIn]': 'animationState',
+    }
+})
+export class SlideDirective {
+    animationState = 'active';
+}
+";
+    let allocator = Allocator::default();
+    let result = transform_angular_file(&allocator, "slide.directive.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    // Should have ɵɵsyntheticHostProperty in the hostBindings update block
+    assert!(
+        code.contains(r#"syntheticHostProperty("@slideIn""#),
+        "Expected syntheticHostProperty with @slideIn name for directive.\nGot:\n{code}"
+    );
+
+    // Should NOT use regular hostProperty for animation triggers
+    assert!(
+        !code.contains(r#"hostProperty("@slideIn""#),
+        "Should not use hostProperty for animation triggers.\nGot:\n{code}"
+    );
+}
+
 /// Test that multiple components with host bindings in the same file have unique constant names.
 ///
 /// This test simulates the real-world scenario from Material Angular's fab.ts where
@@ -2529,7 +3440,12 @@ export class MatMiniFabButton {
     let mut templates = std::collections::HashMap::new();
     templates.insert("button.html".to_string(), button_template.to_string());
 
-    let resources = ResolvedResources { templates, styles: std::collections::HashMap::new() };
+    // Both components also declare `styleUrl: 'fab.css'`; provide it so the
+    // fixture stays fully resolved now that missing resources are hard errors.
+    let mut styles = std::collections::HashMap::new();
+    styles.insert("fab.css".to_string(), vec![".fab {}".to_string()]);
+
+    let resources = ResolvedResources { templates, styles };
 
     let result = transform_angular_file(&allocator, "fab.ts", source, None, Some(&resources));
 
@@ -3146,6 +4062,147 @@ export class TestComponent {
     assert!(
         has_both_in_same_const,
         "Both 'formField' and 'open' should appear in the same consts entry. Output:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_form_field_emits_property_and_zero_arg_control() {
+    let js = compile_template_to_js(r#"<input [formField]="myField">"#, "TestComponent");
+
+    assert!(
+        js.contains(r#"ɵɵproperty("formField""#),
+        "[formField] should emit a regular ɵɵproperty(\"formField\", ...). Got:\n{js}"
+    );
+
+    assert!(
+        js.contains("ɵɵcontrol();"),
+        "[formField] should emit zero-arg ɵɵcontrol(). Got:\n{js}"
+    );
+
+    assert!(
+        !js.contains(r#"ɵɵcontrol(ctx.myField,"formField")"#),
+        "[formField] should not emit legacy ɵɵcontrol(value, \"formField\"). Got:\n{js}"
+    );
+}
+
+#[test]
+fn test_form_field_maintains_mixed_property_order() {
+    let js = compile_template_to_js(
+        r#"<input type="radio" [formField]="value" [value]="'foo'" id="radio" /><input type="radio" [value]="'foo'" [formField]="value" id="radio" />"#,
+        "TestComponent",
+    );
+
+    let compact: String = js.chars().filter(|c| !c.is_whitespace()).collect();
+    let first_binding = r#"i0.ɵɵproperty("formField",ctx.value)("value","foo");i0.ɵɵcontrol();"#;
+    let second_binding = r#"i0.ɵɵproperty("value","foo")("formField",ctx.value);i0.ɵɵcontrol();"#;
+
+    assert!(
+        compact.contains(first_binding),
+        "Expected first radio input to keep [formField] before [value]. Got:\n{js}"
+    );
+    assert!(
+        compact.contains(second_binding),
+        "Expected second radio input to keep [value] before [formField]. Got:\n{js}"
+    );
+    assert!(
+        compact.find(first_binding) < compact.find(second_binding),
+        "Expected first radio binding sequence to appear before the second. Got:\n{js}"
+    );
+}
+
+#[test]
+fn test_form_field_extracted_consts_preserve_binding_order() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, Directive, input } from '@angular/core';
+
+@Directive({ selector: '[formField]' })
+export class FormField {
+    readonly formField = input<string>();
+}
+
+@Component({
+    selector: 'test-comp',
+    template: `
+      <input
+          type="radio"
+          [formField]="value"
+          [value]="'foo'"
+          id="radio"
+        />
+
+        <input
+          type="radio"
+          [value]="'foo'"
+          [formField]="value"
+          id="radio"
+        />
+    `,
+    imports: [FormField],
+    standalone: true,
+})
+export class TestComponent {
+    value = 'foo';
+}
+"#;
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(
+            r#"consts:[["type","radio","id","radio",3,"formField","value"],["type","radio","id","radio",3,"value","formField"]]"#
+        ),
+        "Extracted const bindings should preserve per-element source order. Output:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_form_field_does_not_inflate_vars_count() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, Directive, input } from '@angular/core';
+
+@Directive({ selector: '[formField]' })
+export class FormField {
+    readonly formField = input<string>();
+}
+
+@Component({
+    selector: 'test-comp',
+    template: `
+      <input
+          type="radio"
+          [formField]="value"
+          [value]="'foo'"
+          id="radio"
+        />
+
+        <input
+          type="radio"
+          [value]="'foo'"
+          [formField]="value"
+          id="radio"
+        />
+    `,
+    imports: [FormField],
+    standalone: true,
+})
+export class TestComponent {
+    value = 'foo';
+}
+"#;
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("decls:2,vars:4,consts:"),
+        "[formField] should not inflate vars beyond Angular's control fixture count. Output:\n{}",
         result.code
     );
 }
@@ -3990,7 +5047,7 @@ export class TestComponent {}
 #[test]
 fn test_dom_only_mode_not_used_for_standalone_with_pipe_only_imports() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { AsyncPipe } from '@angular/common';
 
@@ -4003,7 +5060,7 @@ import { AsyncPipe } from '@angular/common';
 export class TestComponent {
   data$ = null;
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
@@ -4026,7 +5083,7 @@ export class TestComponent {
 #[test]
 fn test_dom_only_mode_not_used_for_standalone_with_multiple_pipe_imports() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { AsyncPipe, DatePipe, SlicePipe } from '@angular/common';
 
@@ -4037,7 +5094,7 @@ import { AsyncPipe, DatePipe, SlicePipe } from '@angular/common';
   template: `<div>Hello</div>`
 })
 export class TestComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
@@ -4058,7 +5115,7 @@ export class TestComponent {}
 #[test]
 fn test_full_mode_used_for_standalone_with_mixed_imports() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Directive } from '@angular/core';
 import { AsyncPipe } from '@angular/common';
 
@@ -4072,7 +5129,7 @@ export class HighlightDirective {}
   template: `<div>Hello</div>`
 })
 export class TestComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
@@ -4246,7 +5303,7 @@ export class TestComponent {
 #[test]
 fn test_i18n_expression_ordering_with_pipes() {
     let js = compile_template_to_js(
-        r#"<span i18n>{{ a }} and {{ b }} and {{ c }} and {{ b | uppercase }}</span>"#,
+        r"<span i18n>{{ a }} and {{ b }} and {{ c }} and {{ b | uppercase }}</span>",
         "TestComponent",
     );
 
@@ -4270,7 +5327,7 @@ fn test_i18n_expression_ordering_with_pipes() {
 #[test]
 fn test_i18n_expression_ordering_icu_plural_with_pipe() {
     let js = compile_template_to_js(
-        r#"<div i18n>{{ name }} {count, plural, =1 {({{ amount }} credits x 1 user)} other {({{ amount }} credits x {{ count | number }} users)}}</div>"#,
+        r"<div i18n>{{ name }} {count, plural, =1 {({{ amount }} credits x 1 user)} other {({{ amount }} credits x {{ count | number }} users)}}</div>",
         "TestComponent",
     );
 
@@ -4934,7 +5991,7 @@ fn test_for_index_xref_with_i18n_attribute_binding() {
 #[test]
 fn test_set_class_metadata_uses_namespace_for_imported_ctor_params() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { SomeService } from './some.service';
 
@@ -4946,7 +6003,7 @@ import { SomeService } from './some.service';
 export class TestComponent {
     constructor(private svc: SomeService) {}
 }
-"#;
+";
 
     let options = ComponentTransformOptions {
         emit_class_metadata: true,
@@ -4969,13 +6026,11 @@ export class TestComponent {
     // the imported SomeService: `{type:i1.SomeService}` not `{type:SomeService}`
     assert!(
         metadata_section.contains("i1.SomeService"),
-        "setClassMetadata ctor_parameters should use namespace-prefixed type (i1.SomeService) for imported constructor parameter. Metadata section:\n{}",
-        metadata_section
+        "setClassMetadata ctor_parameters should use namespace-prefixed type (i1.SomeService) for imported constructor parameter. Metadata section:\n{metadata_section}"
     );
     assert!(
         !metadata_section.contains("type:SomeService}"),
-        "setClassMetadata should NOT use bare type name for imported types. Metadata section:\n{}",
-        metadata_section
+        "setClassMetadata should NOT use bare type name for imported types. Metadata section:\n{metadata_section}"
     );
 }
 
@@ -4992,7 +6047,7 @@ export class TestComponent {
 #[test]
 fn test_set_class_metadata_namespace_with_inject_decorator() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Inject, Optional, SkipSelf } from '@angular/core';
 import { SomeService } from './some.service';
 
@@ -5006,7 +6061,7 @@ export class TestComponent {
         @Optional() @SkipSelf() @Inject(SomeService) private svc: SomeService
     ) {}
 }
-"#;
+";
 
     let options = ComponentTransformOptions {
         emit_class_metadata: true,
@@ -5029,8 +6084,7 @@ export class TestComponent {
     // because the type annotation is erased by TypeScript
     assert!(
         metadata_section.contains("i1.SomeService"),
-        "setClassMetadata should use namespace-prefixed type even with @Inject. Metadata section:\n{}",
-        metadata_section
+        "setClassMetadata should use namespace-prefixed type even with @Inject. Metadata section:\n{metadata_section}"
     );
 }
 
@@ -5040,7 +6094,7 @@ export class TestComponent {
 #[test]
 fn test_set_class_metadata_inject_differs_from_type() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Inject } from '@angular/core';
 import { DOCUMENT } from '@angular/common';
 
@@ -5052,7 +6106,7 @@ import { DOCUMENT } from '@angular/common';
 export class TestComponent {
     constructor(@Inject(DOCUMENT) private doc: Document) {}
 }
-"#;
+";
 
     let options = ComponentTransformOptions {
         emit_class_metadata: true,
@@ -5074,14 +6128,12 @@ export class TestComponent {
     // even though the @Inject token (DOCUMENT) is from @angular/common
     assert!(
         metadata_section.contains("type:Document"),
-        "setClassMetadata should use bare type for globals when @Inject token differs. Metadata section:\n{}",
-        metadata_section
+        "setClassMetadata should use bare type for globals when @Inject token differs. Metadata section:\n{metadata_section}"
     );
     // Should NOT add namespace prefix for Document
     assert!(
         !metadata_section.contains("i1.Document"),
-        "setClassMetadata should NOT namespace-prefix global types. Metadata section:\n{}",
-        metadata_section
+        "setClassMetadata should NOT namespace-prefix global types. Metadata section:\n{metadata_section}"
     );
 }
 
@@ -5297,7 +6349,7 @@ fn test_pipe_in_binary_with_safe_nav_chain() {
 #[test]
 fn test_i18n_nested_icu_with_interpolations_inside_elements() {
     let js = compile_template_to_js(
-        r#"<span i18n>{count, plural, =1 {<strong>{{ name }}</strong> was deleted from {nestedCount, plural, =1 {<strong>{{ category }}</strong>} other {<strong>{{ category }}</strong> and {{ extra }} more}}} other {{{ count }} items deleted}}</span>"#,
+        r"<span i18n>{count, plural, =1 {<strong>{{ name }}</strong> was deleted from {nestedCount, plural, =1 {<strong>{{ category }}</strong>} other {<strong>{{ category }}</strong> and {{ extra }} more}}} other {{{ count }} items deleted}}</span>",
         "TestComponent",
     );
 
@@ -5408,7 +6460,7 @@ fn test_directive_factory_deps_use_namespace_prefixed_tokens() {
     let allocator = Allocator::default();
 
     // Simulate the ClickUp pattern: a directive injecting services from multiple modules
-    let source = r#"
+    let source = r"
 import { Directive } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { ToastService } from './toast.service';
@@ -5423,7 +6475,7 @@ export class ToastPositionHelperDirective {
         private toastService: ToastService,
     ) {}
 }
-"#;
+";
 
     let result = transform_angular_file(
         &allocator,
@@ -5472,7 +6524,7 @@ export class ToastPositionHelperDirective {
 fn test_directive_multiple_deps_different_modules_correct_namespaces() {
     let allocator = Allocator::default();
 
-    let source = r#"
+    let source = r"
 import { Directive, ElementRef } from '@angular/core';
 import { Router } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
@@ -5490,7 +6542,7 @@ export class MultiDepDirective {
         private fb: FormBuilder,
     ) {}
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "multi-dep.directive.ts", source, None, None);
 
@@ -5544,7 +6596,7 @@ fn test_i18n_icu_postprocess_uses_namespace_prefix() {
 
     // An ICU plural with sub-messages triggers ɵɵi18nPostprocess.
     // This is the pattern from ClickUp's ChatBotTriggerComponent.
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -5556,7 +6608,7 @@ export class ChatBotTriggerComponent {
     count = 0;
     name = '';
 }
-"#;
+";
 
     let result =
         transform_angular_file(&allocator, "chatbot-trigger.component.ts", source, None, None);
@@ -5585,21 +6637,19 @@ export class ChatBotTriggerComponent {
     }
 }
 
-/// Regression: Multiple view queries must emit separate statements, not chained calls.
+/// Multiple `@ViewChild` decorators on the same component should emit
+/// as a single chained `ɵɵviewQuery(p1)(p2)(p3)` call — matches upstream
+/// ngtsc's `instructionChainAfter()` emit. `ɵɵviewQuery` returns
+/// `typeof ɵɵviewQuery` (core/src/render3/instructions/queries.ts:58),
+/// so chaining is safe.
 ///
-/// Bug: Multiple `@ViewChild`/`@ViewChildren` queries were chained as
-/// `ɵɵviewQuery(pred1)(pred2)`, treating the return value of `ɵɵviewQuery` as a callable.
-/// Angular 20's `ɵɵviewQuery` returns `void`, so chaining causes:
-/// `TypeError: i0.ɵɵviewQuery(...) is not a function`.
-///
-/// Fix: Emit each query as a separate statement:
-///   `ɵɵviewQuery(pred1); ɵɵviewQuery(pred2);`
+/// Earlier versions of this compiler emitted three separate statements
+/// based on an incorrect "returns void" reading of Angular's source.
 #[test]
-fn test_multiple_view_queries_emit_separate_statements() {
+fn test_multiple_view_queries_emit_chained_call() {
     let allocator = Allocator::default();
 
-    // Reproduce the ClickUp LoginFormComponent pattern: multiple @ViewChild decorators
-    let source = r#"
+    let source = r"
 import { Component, ViewChild, ElementRef } from '@angular/core';
 
 @Component({
@@ -5611,28 +6661,40 @@ export class LoginFormComponent {
     @ViewChild('passwordInput') passwordInput: ElementRef;
     @ViewChild('submitBtn') submitBtn: ElementRef;
 }
-"#;
+";
 
-    let result = transform_angular_file(&allocator, "login-form.component.ts", source, None, None);
+    // Chained query emit requires Angular ≥ 21.0.4 (queries return
+    // `typeof <fn>`, not `void`). Pin the version explicitly so this
+    // test exercises the chained path; without it the compiler falls
+    // back to the older safe separate-statement form.
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(22, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "login-form.component.ts", source, Some(&options), None);
 
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
     let code = &result.code;
 
-    // Count separate ɵɵviewQuery calls - should be 3 (one per @ViewChild)
+    // Three decorator-form view queries — one chained call expression has
+    // the root identifier `ɵɵviewQuery` appearing exactly once, with two
+    // additional `(...)` argument groups appended via chaining.
     let view_query_count = code.matches("ɵɵviewQuery(").count();
     assert_eq!(
-        view_query_count, 3,
-        "Should have exactly 3 separate ɵɵviewQuery calls. Found {view_query_count}. Output:\n{code}"
+        view_query_count, 1,
+        "Three consecutive decorator queries should chain into a single \
+         `ɵɵviewQuery(...)...` expression. Found {view_query_count} root calls. \
+         Output:\n{code}"
     );
 
-    // Must NOT have chained calls: ɵɵviewQuery(...)(...) pattern
-    // This regex-free check: after each `ɵɵviewQuery(` find the matching `)` and check
-    // the next non-whitespace char is NOT `(`
+    // The single `ɵɵviewQuery(` must be followed (after its closing `)`)
+    // by another `(` — the chain continuation.
     let query_fn = "ɵɵviewQuery(";
+    let mut chain_followups = 0;
     for (start_idx, _) in code.match_indices(query_fn) {
         let after_fn = &code[start_idx + query_fn.len()..];
-        // Find the closing paren (handle nested parens)
         let mut depth = 1;
         let mut end = 0;
         for (i, ch) in after_fn.char_indices() {
@@ -5648,25 +6710,26 @@ export class LoginFormComponent {
                 _ => {}
             }
         }
-        // Check what comes after the closing paren
-        let after_close = after_fn[end..].trim_start();
-        assert!(
-            !after_close.starts_with('('),
-            "Found chained ɵɵviewQuery call (return value used as function). \
-             Angular 20's ɵɵviewQuery returns void. Output:\n{code}"
-        );
+        if after_fn[end..].trim_start().starts_with('(') {
+            chain_followups += 1;
+        }
     }
+    assert_eq!(
+        chain_followups, 1,
+        "Chained queries should produce one continuation `(...)` after the \
+         root call. Got {chain_followups}. Output:\n{code}"
+    );
 }
 
-/// Regression: Multiple content queries must emit separate statements, not chained calls.
-///
-/// Same issue as view queries but for `@ContentChild`/`@ContentChildren`.
-/// The fix applies to both `create_view_queries_function` and `create_content_queries_function`.
+/// Multiple `@ContentChild`/`@ContentChildren` queries should emit
+/// as a single chained `ɵɵcontentQuery(...)(...)(...)` call. Same
+/// contract as `ɵɵviewQuery` — `ɵɵcontentQuery` returns
+/// `typeof ɵɵcontentQuery` (core/src/render3/instructions/queries.ts:40).
 #[test]
-fn test_multiple_content_queries_emit_separate_statements() {
+fn test_multiple_content_queries_emit_chained_call() {
     let allocator = Allocator::default();
 
-    let source = r#"
+    let source = r"
 import { Component, ContentChild, ContentChildren, QueryList, TemplateRef } from '@angular/core';
 
 @Component({
@@ -5678,23 +6741,30 @@ export class TabsComponent {
     @ContentChildren('tab') tabs: QueryList<TemplateRef<any>>;
     @ContentChild('footer') footer: TemplateRef<any>;
 }
-"#;
+";
 
-    let result = transform_angular_file(&allocator, "tabs.component.ts", source, None, None);
+    // Pin to v22 — see note on the view-query chained test above.
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(22, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "tabs.component.ts", source, Some(&options), None);
 
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
     let code = &result.code;
 
-    // Count separate ɵɵcontentQuery calls - should be 3
     let content_query_count = code.matches("ɵɵcontentQuery(").count();
     assert_eq!(
-        content_query_count, 3,
-        "Should have exactly 3 separate ɵɵcontentQuery calls. Found {content_query_count}. Output:\n{code}"
+        content_query_count, 1,
+        "Three consecutive decorator content queries should chain into a single \
+         `ɵɵcontentQuery(...)...` expression. Found {content_query_count} root calls. \
+         Output:\n{code}"
     );
 
-    // Must NOT have chained calls
     let query_fn = "ɵɵcontentQuery(";
+    let mut chain_followups = 0;
     for (start_idx, _) in code.match_indices(query_fn) {
         let after_fn = &code[start_idx + query_fn.len()..];
         let mut depth = 1;
@@ -5712,24 +6782,27 @@ export class TabsComponent {
                 _ => {}
             }
         }
-        let after_close = after_fn[end..].trim_start();
-        assert!(
-            !after_close.starts_with('('),
-            "Found chained ɵɵcontentQuery call. Angular 20's query functions return void. Output:\n{code}"
-        );
+        if after_fn[end..].trim_start().starts_with('(') {
+            chain_followups += 1;
+        }
     }
+    assert_eq!(
+        chain_followups, 1,
+        "Should produce one continuation `(...)` after the root content-query call. \
+         Got {chain_followups}. Output:\n{code}"
+    );
 }
 
-/// Regression: Mixed view queries (signal + decorator) must all be separate statements.
-///
-/// Signal-based queries (`viewChild()`, `viewChildren()`) and decorator-based queries
-/// (`@ViewChild`, `@ViewChildren`) can coexist on the same component. All of them must
-/// emit as separate statements.
+/// Mixed signal + decorator view queries: consecutive same-kind calls
+/// chain (`ɵɵviewQuerySignal(...)(...)` for the two signal queries), but
+/// the chain breaks at the boundary to the decorator-form
+/// (`ɵɵviewQuery(...)`) because the two runtime symbols aren't
+/// interchangeable.
 #[test]
-fn test_mixed_signal_and_decorator_view_queries_separate_statements() {
+fn test_mixed_signal_and_decorator_view_queries_break_chain_on_boundary() {
     let allocator = Allocator::default();
 
-    let source = r#"
+    let source = r"
 import { Component, ViewChild, viewChild, viewChildren, ElementRef } from '@angular/core';
 
 @Component({
@@ -5741,23 +6814,44 @@ export class MixedQueryComponent {
     b = viewChildren<ElementRef>('b');
     @ViewChild('c') c: ElementRef;
 }
-"#;
+";
 
-    let result = transform_angular_file(&allocator, "mixed-query.component.ts", source, None, None);
+    // Pin to v22 — see note on the view-query chained test above.
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(22, 0, 0)),
+        ..Default::default()
+    };
+    let result = transform_angular_file(
+        &allocator,
+        "mixed-query.component.ts",
+        source,
+        Some(&options),
+        None,
+    );
 
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
     let code = &result.code;
 
-    // Should have signal query calls AND decorator query calls, all separate
-    let total_query_calls = code.matches("ɵɵviewQuery").count();
-    assert!(
-        total_query_calls >= 3,
-        "Should have at least 3 view query calls (signal + decorator). Found {total_query_calls}. Output:\n{code}"
+    // Exactly one root ɵɵviewQuerySignal call (the two signal queries chain
+    // into it) and exactly one root ɵɵviewQuery call (the decorator one).
+    let signal_roots = code.matches("ɵɵviewQuerySignal(").count();
+    let decorator_roots = code.matches("ɵɵviewQuery(").count();
+    assert_eq!(
+        signal_roots, 1,
+        "Two signal view queries should chain into one root call. \
+         Found {signal_roots}. Output:\n{code}"
+    );
+    assert_eq!(
+        decorator_roots, 1,
+        "The single decorator view query should produce one root call after \
+         the signal chain breaks. Found {decorator_roots}. Output:\n{code}"
     );
 
-    // Verify no chaining for any view query variant
-    for query_fn in ["ɵɵviewQuerySignal(", "ɵɵviewQuery("] {
+    // Signal chain should have exactly one continuation `(...)` (the second
+    // signal call). The decorator call should have zero continuations.
+    fn count_chain_followups(code: &str, query_fn: &str) -> usize {
+        let mut followups = 0;
         for (start_idx, _) in code.match_indices(query_fn) {
             let after_fn = &code[start_idx + query_fn.len()..];
             let mut depth = 1;
@@ -5775,12 +6869,136 @@ export class MixedQueryComponent {
                     _ => {}
                 }
             }
-            let after_close = after_fn[end..].trim_start();
-            assert!(
-                !after_close.starts_with('('),
-                "Found chained {query_fn} call. Output:\n{code}"
-            );
+            if after_fn[end..].trim_start().starts_with('(') {
+                followups += 1;
+            }
         }
+        followups
+    }
+    assert_eq!(
+        count_chain_followups(code, "ɵɵviewQuerySignal("),
+        1,
+        "Two consecutive signal queries should chain (one continuation). \
+         Output:\n{code}"
+    );
+    assert_eq!(
+        count_chain_followups(code, "ɵɵviewQuery("),
+        0,
+        "Single decorator query should have no chain continuation. \
+         Output:\n{code}"
+    );
+}
+
+/// Compatibility guard. Two contracts at once:
+///
+/// 1. **`None` = assume latest.** Crates-wide convention: unset
+///    `angular_version` means the consumer is on latest, so the
+///    compiler emits the modern (chained) form. Mirrors
+///    `supports_implicit_standalone`/`supports_service_decorator`'s
+///    `map_or(true, …)`.
+/// 2. **Explicit pre-v21.0.4 falls back.** On Angular 19, 20, and
+///    v21.0.0–v21.0.3 the runtime query functions return `void`, so
+///    chained emit would throw at runtime. Consumers targeting those
+///    versions must pass `angular_version` explicitly to opt out of
+///    the chained form.
+#[test]
+fn test_query_chaining_obeys_angular_version_gate() {
+    let allocator = Allocator::default();
+
+    let source = r"
+import { Component, ViewChild, ElementRef } from '@angular/core';
+
+@Component({
+    selector: 'app-login',
+    template: '<input #a /><input #b /><input #c />',
+})
+export class LoginFormComponent {
+    @ViewChild('a') a: ElementRef;
+    @ViewChild('b') b: ElementRef;
+    @ViewChild('c') c: ElementRef;
+}
+";
+
+    // Versions where chained emit would crash at runtime — must produce
+    // three separate `ɵɵviewQuery(…)` statements.
+    let unsafe_versions: [AngularVersion; 3] = [
+        AngularVersion::new(19, 2, 0),
+        AngularVersion::new(20, 0, 0),
+        AngularVersion::new(21, 0, 3),
+    ];
+    for version in unsafe_versions {
+        let options =
+            ComponentTransformOptions { angular_version: Some(version), ..Default::default() };
+        let result =
+            transform_angular_file(&allocator, "login.component.ts", source, Some(&options), None);
+        assert!(!result.has_errors(), "v{version:?} should compile: {:?}", result.diagnostics);
+
+        let code = &result.code;
+        let root_calls = code.matches("ɵɵviewQuery(").count();
+        assert_eq!(
+            root_calls, 3,
+            "v{version:?}: expected 3 separate ɵɵviewQuery statements (chained emit \
+             unsafe pre-v21.0.4). Output:\n{code}"
+        );
+    }
+
+    // Versions where chained emit is safe — including `None` (assume
+    // latest) per the crate's convention.
+    let chained_versions: [Option<AngularVersion>; 3] =
+        [None, Some(AngularVersion::new(21, 0, 4)), Some(AngularVersion::new(22, 0, 0))];
+    for version in chained_versions {
+        let options = ComponentTransformOptions { angular_version: version, ..Default::default() };
+        let result =
+            transform_angular_file(&allocator, "login.component.ts", source, Some(&options), None);
+        let code = &result.code;
+        assert_eq!(
+            code.matches("ɵɵviewQuery(").count(),
+            1,
+            "v{version:?}: should chain — `None` defaults to assume-latest, \
+             v21.0.4+ has `typeof <fn>` return. Output:\n{code}"
+        );
+    }
+}
+
+/// The control instructions (`ɵɵcontrolCreate()` / `ɵɵcontrol()`) for a
+/// two-way `[(ngModel)]` were added in Angular v22
+/// (`supports_extended_control_properties`); v21 only emitted control
+/// instructions for `[formField]`. Pre-v22 targets must therefore emit only the
+/// `ɵɵtwoWayProperty` for `[(ngModel)]`, while v22+ — and `None`, which assumes
+/// latest — also emit the paired control instructions.
+#[test]
+fn test_ng_model_control_instructions_obey_angular_version_gate() {
+    let template = r#"<input [(ngModel)]="name">"#;
+
+    // Pre-v22: no control instructions, just the two-way property.
+    for version in [
+        AngularVersion::new(19, 0, 0),
+        AngularVersion::new(20, 0, 0),
+        AngularVersion::new(21, 2, 0),
+    ] {
+        let code = compile_template_to_js_with_version(template, "TestComponent", Some(version));
+        assert!(
+            code.contains("ɵɵtwoWayProperty("),
+            "v{version:?}: expected ɵɵtwoWayProperty. Output:\n{code}"
+        );
+        assert!(
+            !code.contains("ɵɵcontrolCreate("),
+            "v{version:?}: must NOT emit ɵɵcontrolCreate (v22+ only). Output:\n{code}"
+        );
+        assert!(
+            !code.contains("ɵɵcontrol("),
+            "v{version:?}: must NOT emit ɵɵcontrol (v22+ only). Output:\n{code}"
+        );
+    }
+
+    // v22+ and `None` (assume latest): emit the paired control instructions.
+    for version in [Some(AngularVersion::new(22, 0, 0)), None] {
+        let code = compile_template_to_js_with_version(template, "TestComponent", version);
+        assert!(
+            code.contains("ɵɵcontrolCreate("),
+            "v{version:?}: expected ɵɵcontrolCreate. Output:\n{code}"
+        );
+        assert!(code.contains("ɵɵcontrol("), "v{version:?}: expected ɵɵcontrol. Output:\n{code}");
     }
 }
 
@@ -5792,7 +7010,7 @@ fn test_for_loop_multiple_index_aliases_in_track() {
     // while a bug in OXC previously stored only the last alias (overwriting earlier ones).
     // Reference: Angular's ingest.ts uses `indexVarNames = new Set<string>()` and `.add()`.
     let js = compile_template_to_js(
-        r#"@for (item of items; track i + j; let i = $index, j = $index) { {{item}} }"#,
+        r"@for (item of items; track i + j; let i = $index, j = $index) { {{item}} }",
         "TestComponent",
     );
     // The track function should rewrite both `i` and `j` to `$index`.
@@ -5867,7 +7085,7 @@ fn transform_to_r3_nodes(template: &str) -> (std::vec::Vec<String>, std::vec::Ve
 
 #[test]
 fn test_for_block_no_expression_returns_none() {
-    // Finding 2: @for with no expression should return None (no ForLoopBlock node),
+    // @for with no expression should return None (no ForLoopBlock node),
     // matching Angular's behavior where parseForLoopParameters returns null.
     let (errors, has_for_block) = transform_to_r3("@for { <div></div> }");
     assert!(
@@ -5879,7 +7097,7 @@ fn test_for_block_no_expression_returns_none() {
 
 #[test]
 fn test_for_block_missing_track_returns_none() {
-    // Finding 2: @for with valid expression but missing track should return None,
+    // @for with valid expression but missing track should return None,
     // matching Angular's behavior (params.trackBy === null → node stays null).
     let (errors, has_for_block) = transform_to_r3("@for (item of items) { <div></div> }");
     assert!(
@@ -5894,7 +7112,7 @@ fn test_for_block_missing_track_returns_none() {
 
 #[test]
 fn test_if_block_no_expression_skips_main_branch() {
-    // Finding 3: @if with no parameters should not push a main branch,
+    // @if with no parameters should not push a main branch,
     // matching Angular where parseConditionalBlockParameters returns null.
     let (errors, node_types) = transform_to_r3_nodes("@if { <div></div> }");
     // The IfBlock should have 0 branches (main branch skipped)
@@ -5924,18 +7142,17 @@ fn test_switch_default_first_preserves_source_order() {
     );
 
     // Case_0 should be the default (Other), NOT reordered
-    assert!(js.contains("Case_0_Template"), "Expected Case_0_Template in output. Got:\n{}", js);
+    assert!(js.contains("Case_0_Template"), "Expected Case_0_Template in output. Got:\n{js}");
     let case0_start = js.find("Case_0_Template").unwrap();
     let case0_body = &js[case0_start..case0_start + 200];
     assert!(
         case0_body.contains("Other"),
-        "Case_0 should render 'Other' (default in source order). Got:\n{}",
-        js
+        "Case_0 should render 'Other' (default in source order). Got:\n{js}"
     );
 
     // Conditional ternary: default slot (0) should be the fallback base
     // Expected: (tmp === 1) ? 1 : (tmp === 2) ? 2 : 0
-    assert!(js.contains("2: 0)"), "Ternary fallback should be slot 0 (default). Got:\n{}", js);
+    assert!(js.contains("2: 0)"), "Ternary fallback should be slot 0 (default). Got:\n{js}");
 }
 
 // ============================================================================
@@ -5951,20 +7168,15 @@ fn test_field_property_not_control_binding() {
     let js = compile_template_to_js(r#"<cu-comp [field]="myField"></cu-comp>"#, "TestComponent");
 
     // Should NOT have controlCreate
-    assert!(
-        !js.contains("controlCreate"),
-        "[field] should NOT produce controlCreate. Got:\n{}",
-        js
-    );
+    assert!(!js.contains("controlCreate"), "[field] should NOT produce controlCreate. Got:\n{js}");
 
     // Should NOT have control() call
-    assert!(!js.contains("ɵɵcontrol("), "[field] should NOT produce ɵɵcontrol(). Got:\n{}", js);
+    assert!(!js.contains("ɵɵcontrol("), "[field] should NOT produce ɵɵcontrol(). Got:\n{js}");
 
     // Should have regular property binding
     assert!(
         js.contains(r#"ɵɵproperty("field""#),
-        "[field] should produce regular ɵɵproperty(\"field\", ...). Got:\n{}",
-        js
+        "[field] should produce regular ɵɵproperty(\"field\", ...). Got:\n{js}"
     );
 }
 
@@ -6089,7 +7301,7 @@ fn test_unicode_text_not_escaped() {
     // Unicode characters like en-dash should be emitted as raw UTF-8, not escaped.
     // Angular's TypeScript emitter does NOT escape non-ASCII printable characters.
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6098,7 +7310,7 @@ import { Component } from '@angular/core';
     standalone: true,
 })
 export class TestComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
 
@@ -6294,7 +7506,7 @@ export class TestComponent {
 /// a dynamic value, the compiler extracts a pure function constant (e.g., `_c0`).
 /// This constant must be emitted in the output — not silently dropped.
 ///
-/// Regression test for: host binding pool constants not being emitted in
+/// Guards against host binding pool constants not being emitted in
 /// compile_template_to_js_with_options path.
 #[test]
 fn test_host_binding_pure_function_declarations_emitted() {
@@ -6359,7 +7571,7 @@ fn test_host_binding_pure_function_declarations_emitted() {
 #[test]
 fn test_standalone_component_omits_standalone_field() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6368,19 +7580,30 @@ import { Component } from '@angular/core';
   template: '<div>test</div>'
 })
 export class TestComponent {}
-"#;
+";
 
     let options = ComponentTransformOptions::default();
     let result =
         transform_angular_file(&allocator, "test.component.ts", source, Some(&options), None);
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
-    let normalized = result.code.replace([' ', '\n', '\t'], "");
-    // Angular TS compiler omits standalone when true (runtime defaults to true via ?? true)
+    // Scope the check to the ɵɵdefineComponent({...}) literal. The setClassMetadata
+    // emission (now on by default, matching ngc) faithfully preserves the user's
+    // source `standalone: true` for TestBed — that's expected and not what this test
+    // is asserting against.
+    let define_start =
+        result.code.find("ɵɵdefineComponent(").expect("expected ɵɵdefineComponent call in output");
+    let define_end = result.code[define_start..]
+        .find("});")
+        .map(|i| define_start + i)
+        .unwrap_or(result.code.len());
+    let define_block = &result.code[define_start..define_end];
+    let normalized_define = define_block.replace([' ', '\n', '\t'], "");
     assert!(
-        !normalized.contains("standalone:true"),
-        "Standalone component should NOT emit `standalone:true` (runtime defaults to true). Output:\n{}",
-        result.code
+        !normalized_define.contains("standalone:true"),
+        "ɵɵdefineComponent should NOT emit `standalone:true` (runtime defaults to true). \
+         defineComponent block:\n{}",
+        define_block
     );
 }
 
@@ -6388,7 +7611,7 @@ export class TestComponent {}
 #[test]
 fn test_non_standalone_component_emits_standalone_false() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6397,7 +7620,7 @@ import { Component } from '@angular/core';
   template: '<div>legacy</div>'
 })
 export class LegacyComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
@@ -6452,7 +7675,7 @@ fn test_jit_component_with_inline_template() {
     // When jit: true, the compiler should NOT compile templates.
     // Instead, it should keep the decorator and downlevel it using __decorate.
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6461,7 +7684,7 @@ import { Component } from '@angular/core';
     standalone: true,
 })
 export class AppComponent {}
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6504,7 +7727,7 @@ fn test_jit_component_with_template_url() {
     // When jit: true and templateUrl is used, it should be replaced with
     // an import from angular:jit:template:file;./path
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6513,7 +7736,7 @@ import { Component } from '@angular/core';
     standalone: true,
 })
 export class AppComponent {}
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6542,7 +7765,7 @@ fn test_jit_component_with_style_url() {
     // When jit: true and styleUrl/styleUrls is used, it should be replaced with
     // imports from angular:jit:style:file;./path
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6551,7 +7774,7 @@ import { Component } from '@angular/core';
     styleUrl: './app.css',
 })
 export class AppComponent {}
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6572,7 +7795,7 @@ export class AppComponent {}
 fn test_jit_component_with_constructor_deps() {
     // JIT compilation should generate ctorParameters for constructor dependencies
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { TitleService } from './title.service';
 
@@ -6583,7 +7806,7 @@ import { TitleService } from './title.service';
 export class AppComponent {
     constructor(private titleService: TitleService) {}
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6608,10 +7831,78 @@ export class AppComponent {
 }
 
 #[test]
+fn test_jit_all_inline_type_import_elided() {
+    // An import whose specifiers all carry inline `type` modifiers must be
+    // elided entirely, not left behind as a bare side-effect import.
+    let allocator = Allocator::default();
+    let source = r#"
+import './side-effect';
+import { Pipe, type PipeTransform } from '@angular/core';
+import { type Get } from 'type-fest';
+import type { Whole } from './whole';
+import Def, { type Partial } from './default-mixed';
+
+@Pipe({ name: 'demo' })
+export class DemoPipe implements PipeTransform {
+    transform(v: string) { return Def(v as unknown as Whole as Partial as string); }
+}
+
+export let sample: Get<{ a: 1 }, 'a'> | undefined;
+"#;
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "demo.pipe.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        !result.code.contains("type-fest"),
+        "All-inline-type import should be elided, not kept as a side-effect import. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("./whole"),
+        "`import type {{ ... }}` statement should be elided. Got:\n{}",
+        result.code
+    );
+
+    // Mixed import keeps its value binding, drops the type-only one
+    assert!(
+        result.code.contains("import { Pipe } from"),
+        "Value binding of mixed import should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("PipeTransform"),
+        "Type-only binding of mixed import should be dropped. Got:\n{}",
+        result.code
+    );
+
+    // Default import alongside an inline-type specifier keeps the default
+    // binding and drops the type-only sibling
+    assert!(
+        result.code.contains("import Def from"),
+        "Default import with inline-type sibling should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("Partial"),
+        "Inline-type sibling of a default import should be dropped. Got:\n{}",
+        result.code
+    );
+
+    // Deliberate side-effect imports (no specifier list) must survive
+    assert!(
+        result.code.contains("import \"./side-effect\""),
+        "Bare side-effect import should be preserved. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
 fn test_jit_component_class_restructuring() {
     // JIT should restructure: export class X {} → let X = class X {}; X = __decorate([...], X); export { X };
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -6621,7 +7912,7 @@ import { Component } from '@angular/core';
 export class AppComponent {
     title = 'app';
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6649,7 +7940,7 @@ export class AppComponent {
 fn test_jit_directive() {
     // @Directive should also be JIT-transformed with __decorate
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Input } from '@angular/core';
 
 @Directive({
@@ -6659,7 +7950,7 @@ import { Directive, Input } from '@angular/core';
 export class HighlightDirective {
     @Input() color: string = 'yellow';
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6684,10 +7975,196 @@ export class HighlightDirective {
 }
 
 #[test]
+fn test_jit_service_decorator() {
+    // @Service (Angular v22+) should be JIT-downleveled exactly like @Injectable:
+    // decorator removed, static decorators/ctorParameters emitted, and __decorate applied.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service()
+export class CounterService {
+    constructor(private http: HttpClient) {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The @Service decorator should be removed and lowered through __decorate.
+    assert!(
+        !result.code.contains("@Service"),
+        "JIT output should NOT contain the @Service decorator. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("__decorate("),
+        "JIT service output should use __decorate. Got:\n{}",
+        result.code
+    );
+
+    // ctorParameters reflecting the constructor dependency should be emitted.
+    assert!(
+        result.code.contains("ctorParameters") && result.code.contains("HttpClient"),
+        "JIT service output should emit ctorParameters with HttpClient. Got:\n{}",
+        result.code
+    );
+
+    // JIT must NOT emit AOT definitions; the runtime's compileService handles that.
+    assert!(
+        !result.code.contains("ɵsvc") && !result.code.contains("ɵfac"),
+        "JIT service output should NOT contain AOT definitions. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_service_decorator", result.code);
+}
+
+#[test]
+fn test_jit_service_decorator_version_gated() {
+    // Targeting Angular < 22 must not downlevel @Service (the runtime lacks
+    // compileService). The decorator is left in source and a diagnostic is surfaced.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service()
+export class CounterService {}
+";
+
+    let options = ComponentTransformOptions {
+        jit: true,
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    // A diagnostic should be surfaced for the unsupported decorator.
+    assert!(
+        result.has_errors(),
+        "Targeting v21 with @Service should produce a diagnostic. Got none.\n{}",
+        result.code
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Diagnostic should mention @Service and v22. Got: {:?}",
+        result.diagnostics
+    );
+
+    // The decorator should remain in the source (pass-through, not downleveled).
+    assert!(
+        result.code.contains("@Service"),
+        "JIT output for v21 should leave the @Service decorator unchanged. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("__decorate("),
+        "JIT output for v21 should NOT downlevel @Service via __decorate. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_jit_non_angular_service_decorator_does_not_shadow_injectable() {
+    // A `@Service()` decorator from a non-Angular library must not cause the JIT
+    // pipeline to misclassify the class as v22 `@Service`, nor (on pre-v22
+    // targets) swallow a sibling `@Injectable` via the version-gate's early
+    // `continue`. Name matching alone is insufficient — `Service` is a common
+    // export name in DI containers and web frameworks.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { Service } from 'some-other-lib';
+
+@Service()
+@Injectable()
+export class CounterService {
+    constructor(private http: HttpClient) {}
+}
+";
+
+    let options = ComponentTransformOptions {
+        jit: true,
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    // No "@Service requires v22" diagnostic should fire — this isn't Angular's
+    // Service.
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Non-Angular @Service should not trigger the v22 diagnostic. Got: {:?}",
+        result.diagnostics
+    );
+
+    // The real @Injectable must still be lowered.
+    assert!(
+        result.code.contains("__decorate("),
+        "JIT output should still lower @Injectable via __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("ctorParameters") && result.code.contains("HttpClient"),
+        "JIT output should emit ctorParameters for the lowered @Injectable. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_jit_third_party_namespace_service_decorator_is_ignored() {
+    // `@other.Service()` where `other` is a namespace import from a
+    // third-party library must NOT be classified as Angular's v22
+    // @Service. The Service classification's import-map gate needs to
+    // walk through `StaticMemberExpression` callees and verify the
+    // namespace object resolves to `@angular/core` — otherwise any
+    // namespaced `Service` decorator trips the v22 version gate.
+    let allocator = Allocator::default();
+    let source = r"
+import * as other from 'some-other-lib';
+
+@other.Service()
+export class CounterService {}
+";
+
+    let options = ComponentTransformOptions {
+        jit: true,
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Third-party namespace @Service should not trip the v22 diagnostic. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result.code.contains("other.Service"),
+        "Third-party namespace @Service decorator should be left intact. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
 fn test_jit_full_component_example() {
     // Full example matching the issue #97 scenario
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, signal } from '@angular/core';
 import { RouterOutlet } from '@angular/router';
 import { Lib1 } from 'lib1';
@@ -6707,7 +8184,7 @@ export class App {
         this.title.set(this.titleService.getTitle());
     }
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6746,7 +8223,7 @@ fn test_jit_prop_decorators_emitted() {
     // to static propDecorators so Angular's JIT runtime can discover inputs/outputs.
     // Without this, @Input/@Output decorators are silently lost, breaking data binding.
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Input, Output, HostBinding, EventEmitter } from '@angular/core';
 
 @Directive({
@@ -6758,7 +8235,7 @@ export class HighlightDirective {
     @Output() colorChange = new EventEmitter<string>();
     @HostBinding('class.active') isActive = false;
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6808,7 +8285,7 @@ fn test_jit_union_type_ctor_params() {
     //
     // See: angular/packages/compiler-cli/src/ngtsc/transform/jit/src/downlevel_decorators_transform.ts
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { ServiceA } from './a.service';
 import { ServiceB } from './b.service';
@@ -6822,7 +8299,7 @@ export class TestComponent {
         svcC: ServiceC | null,
     ) {}
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6855,7 +8332,7 @@ export class TestComponent {
 #[test]
 fn test_jit_abstract_class() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Injectable } from '@angular/core';
 
 @Injectable()
@@ -6867,7 +8344,7 @@ export abstract class BaseProvider {
         return `Hello from ${this.name}`;
     }
 }
-"#;
+";
 
     let options = ComponentTransformOptions { jit: true, ..Default::default() };
     let result =
@@ -6899,6 +8376,1106 @@ export abstract class BaseProvider {
     insta::assert_snapshot!("jit_abstract_class", result.code);
 }
 
+#[test]
+fn test_jit_non_angular_class_decorators_lowered() {
+    // When a class has both Angular and non-Angular class-level decorators,
+    // ALL decorators must be lowered into the __decorate() call.
+    // Non-Angular decorators left as raw @Decorator syntax on a class expression
+    // cause TS1206 (decorators are not valid on class expressions).
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { State } from '@ngxs/store';
+
+interface TodoStateModel {
+    items: string[];
+}
+
+@State<TodoStateModel>({ name: 'todo', defaults: { items: [] } })
+@Injectable()
+export class TodoState {}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw @State decorator should remain in the output
+    assert!(
+        !result.code.contains("@State"),
+        "Non-Angular class decorators should be lowered, not left as raw syntax. Got:\n{}",
+        result.code
+    );
+
+    // Both decorators should appear in the __decorate call
+    assert!(
+        result.code.contains("State("),
+        "Non-Angular class decorator State should appear in __decorate call. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("Injectable()"),
+        "Angular class decorator Injectable should appear in __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // Decorator order should be preserved (State before Injectable)
+    let state_pos = result.code.find("State(").unwrap();
+    let injectable_pos = result.code.find("Injectable()").unwrap();
+    assert!(
+        state_pos < injectable_pos,
+        "Decorator order should be preserved (State before Injectable). Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_angular_class_decorators", result.code);
+}
+
+#[test]
+fn test_jit_non_angular_method_decorators_lowered() {
+    // Non-Angular method decorators should be lowered to __decorate() calls
+    // on the class prototype (for instance methods) or class itself (for static methods).
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector } from '@ngxs/store';
+
+@State({ name: 'todo' })
+@Injectable()
+export class TodoState {
+    @Selector()
+    static todos(state: any): any[] { return state.items; }
+
+    @Action(AddTodo)
+    add(ctx: any, action: any) { ctx.setState(action); }
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw @Selector or @Action decorator should remain
+    assert!(
+        !result.code.contains("@Selector"),
+        "Non-Angular method decorators should be lowered. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("@Action"),
+        "Non-Angular method decorators should be lowered. Got:\n{}",
+        result.code
+    );
+
+    // Static method → __decorate([Selector()], TodoState, "todos", null)
+    assert!(
+        result.code.contains("__decorate([Selector()], TodoState, \"todos\", null)"),
+        "Static method decorator should use class directly (no .prototype). Got:\n{}",
+        result.code
+    );
+
+    // Instance method → __decorate([Action(AddTodo)], TodoState.prototype, "add", null)
+    assert!(
+        result.code.contains("__decorate([Action(AddTodo)], TodoState.prototype, \"add\", null)"),
+        "Instance method decorator should use .prototype. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_angular_method_decorators", result.code);
+}
+
+#[test]
+fn test_jit_full_ngxs_example() {
+    // Full example with NGXS-style decorators: @State, @Selector, @Action combined with @Injectable
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector, StateContext } from '@ngxs/store';
+
+interface TodoStateModel {
+    items: TodoItem[];
+    filter: string;
+}
+
+interface TodoItem {
+    text: string;
+    done: boolean;
+}
+
+class AddTodo {
+    static readonly type = '[Todo] Add';
+    constructor(public text: string) {}
+}
+
+class ToggleTodo {
+    static readonly type = '[Todo] Toggle';
+    constructor(public index: number) {}
+}
+
+@State<TodoStateModel>({ name: 'todo', defaults: { items: [], filter: 'all' } })
+@Injectable()
+export class TodoState {
+    @Selector()
+    static todos(state: TodoStateModel): TodoItem[] { return state.items; }
+
+    @Selector()
+    static filter(state: TodoStateModel): string { return state.filter; }
+
+    @Action(AddTodo)
+    add(ctx: StateContext<TodoStateModel>, action: AddTodo) { /* ... */ }
+
+    @Action(ToggleTodo)
+    toggle(ctx: StateContext<TodoStateModel>, action: ToggleTodo) { /* ... */ }
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "todo.state.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain anywhere
+    assert!(
+        !result.code.contains("@State")
+            && !result.code.contains("@Injectable")
+            && !result.code.contains("@Selector")
+            && !result.code.contains("@Action"),
+        "No raw decorator syntax should remain in output. Got:\n{}",
+        result.code
+    );
+
+    // Member __decorate calls should come before class __decorate
+    let selector_decorate =
+        result.code.find("__decorate([Selector()], TodoState, \"todos\"").unwrap();
+    let class_decorate = result.code.find("TodoState = __decorate(").unwrap();
+    assert!(
+        selector_decorate < class_decorate,
+        "Member decorators should be emitted before class decorator. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_full_ngxs_example", result.code);
+}
+
+#[test]
+fn test_jit_non_angular_property_decorator_uses_void_0() {
+    // TypeScript uses `void 0` (not `null`) as the 4th argument for property decorators
+    // because properties don't have an existing descriptor on the prototype.
+    // Methods use `null` which tells __decorate to call Object.getOwnPropertyDescriptor.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function Validate() { return function(t: any, k: string) {}; }
+function Log(target: any, key: string, desc: PropertyDescriptor) {}
+
+@Injectable()
+export class MyService {
+    @Validate()
+    name: string = '';
+
+    @Log
+    greet() { return 'hello'; }
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Property decorator should use `void 0`
+    assert!(
+        result.code.contains("__decorate([Validate()], MyService.prototype, \"name\", void 0)"),
+        "Property decorator should use `void 0` as 4th arg. Got:\n{}",
+        result.code
+    );
+
+    // Method decorator should use `null`
+    assert!(
+        result.code.contains("__decorate([Log], MyService.prototype, \"greet\", null)"),
+        "Method decorator should use `null` as 4th arg. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_property_decorator_void_0", result.code);
+}
+
+#[test]
+fn test_jit_mixed_angular_and_non_angular_decorators_on_same_member() {
+    // When a member has both Angular and non-Angular decorators, the Angular
+    // decorator goes into propDecorators while the non-Angular one is lowered
+    // to a __decorate() call. Both must be stripped from the class body.
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive, Input, Output, EventEmitter } from '@angular/core';
+
+function Required() { return function(t: any, k: string) {}; }
+function Throttle(ms: number) { return function(t: any, k: string, d: any) {}; }
+
+@Directive({ selector: '[appField]' })
+export class FieldDirective {
+    @Required()
+    @Input()
+    value: string = '';
+
+    @Throttle(300)
+    @Output()
+    valueChange = new EventEmitter<string>();
+
+    @Throttle(100)
+    onChange() {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "field.directive.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain
+    assert!(
+        !result.code.contains("@Required")
+            && !result.code.contains("@Input")
+            && !result.code.contains("@Throttle")
+            && !result.code.contains("@Output"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Angular decorators should appear in propDecorators
+    assert!(
+        result.code.contains("propDecorators"),
+        "Angular member decorators should be in propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: Input"),
+        "propDecorators should contain Input. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: Output"),
+        "propDecorators should contain Output. Got:\n{}",
+        result.code
+    );
+
+    // Non-Angular decorators should be lowered via __decorate()
+    assert!(
+        result
+            .code
+            .contains("__decorate([Required()], FieldDirective.prototype, \"value\", void 0)"),
+        "Non-Angular property decorator should use __decorate with void 0. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains(
+            "__decorate([Throttle(300)], FieldDirective.prototype, \"valueChange\", void 0)"
+        ),
+        "Non-Angular property decorator should use __decorate with void 0. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result
+            .code
+            .contains("__decorate([Throttle(100)], FieldDirective.prototype, \"onChange\", null)"),
+        "Non-Angular method decorator should use __decorate with null. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_mixed_angular_non_angular_same_member", result.code);
+}
+
+#[test]
+fn test_jit_multiple_non_angular_decorators_on_same_member() {
+    // Multiple non-Angular decorators on the same member should all appear
+    // in a single __decorate() call for that member.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function Log() { return function(t: any, k: string, d: any) {}; }
+function Memoize() { return function(t: any, k: string, d: any) {}; }
+function Validate() { return function(t: any, k: string) {}; }
+
+@Injectable()
+export class MyService {
+    @Log()
+    @Memoize()
+    compute() { return 42; }
+
+    @Validate()
+    @Log()
+    name: string = '';
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Multiple decorators on method should be in single __decorate call, in source order
+    assert!(
+        result
+            .code
+            .contains("__decorate([Log(), Memoize()], MyService.prototype, \"compute\", null)"),
+        "Multiple method decorators should be in one __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // Multiple decorators on property should also be in single __decorate call
+    assert!(
+        result
+            .code
+            .contains("__decorate([Validate(), Log()], MyService.prototype, \"name\", void 0)"),
+        "Multiple property decorators should be in one __decorate call. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_multiple_decorators_same_member", result.code);
+}
+
+#[test]
+fn test_jit_multiple_decorated_classes_in_same_file() {
+    // Multiple Angular-decorated classes in the same file should each get
+    // their own class expression conversion and __decorate calls.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, Injectable } from '@angular/core';
+
+function Logger() { return function(t: any) { return t; }; }
+
+@Component({ selector: 'app-foo', template: '<p>foo</p>' })
+export class FooComponent {}
+
+@Logger()
+@Injectable()
+export class FooService {
+    @Logger()
+    doWork() {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "foo.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Both classes should be converted to class expressions
+    assert!(
+        result.code.contains("let FooComponent = class FooComponent"),
+        "FooComponent should be a class expression. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("let FooService = class FooService"),
+        "FooService should be a class expression. Got:\n{}",
+        result.code
+    );
+
+    // Both should have __decorate calls
+    assert!(
+        result.code.contains("FooComponent = __decorate("),
+        "FooComponent should have a __decorate call. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("FooService = __decorate("),
+        "FooService should have a __decorate call. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Component")
+            && !result.code.contains("@Injectable")
+            && !result.code.contains("@Logger"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // FooService should include Logger in its class __decorate
+    let service_decorate_pos = result.code.find("FooService = __decorate(").unwrap();
+    let service_decorate_section = &result.code[service_decorate_pos..];
+    assert!(
+        service_decorate_section.contains("Logger()"),
+        "FooService __decorate should include Logger. Got:\n{}",
+        result.code
+    );
+
+    // FooService member decorator should also be lowered
+    assert!(
+        result.code.contains("__decorate([Logger()], FooService.prototype, \"doWork\", null)"),
+        "FooService method decorator should be lowered. Got:\n{}",
+        result.code
+    );
+
+    // Both should be re-exported
+    assert!(
+        result.code.contains("export { FooComponent }"),
+        "FooComponent should be re-exported. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("export { FooService }"),
+        "FooService should be re-exported. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_multiple_classes_same_file", result.code);
+}
+
+#[test]
+fn test_jit_non_exported_class_with_decorators() {
+    // A non-exported Angular class with non-Angular decorators should still
+    // be lowered but without an export statement.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function Singleton() { return function(t: any) { return t; }; }
+
+@Singleton()
+@Injectable()
+class InternalService {
+    @Singleton()
+    getInstance() {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "internal.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Should be converted to class expression
+    assert!(
+        result.code.contains("let InternalService = class InternalService"),
+        "Non-exported class should still be converted. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Singleton") && !result.code.contains("@Injectable"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Should NOT have an export statement
+    assert!(
+        !result.code.contains("export {") && !result.code.contains("export default"),
+        "Non-exported class should not get an export statement. Got:\n{}",
+        result.code
+    );
+
+    // Both class decorators should be in __decorate
+    assert!(
+        result.code.contains("InternalService = __decorate("),
+        "Should have class __decorate. Got:\n{}",
+        result.code
+    );
+
+    // Member decorator should be lowered
+    assert!(
+        result.code.contains(
+            "__decorate([Singleton()], InternalService.prototype, \"getInstance\", null)"
+        ),
+        "Member decorator should be lowered. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_non_exported_class", result.code);
+}
+
+#[test]
+fn test_jit_default_exported_class_with_decorators() {
+    // A default-exported Angular class with non-Angular decorators should
+    // be lowered with `export default ClassName` at the end.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function Logger() { return function(t: any) { return t; }; }
+
+@Logger()
+@Injectable()
+export default class AppService {
+    @Logger()
+    process() {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "app.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Should be class expression
+    assert!(
+        result.code.contains("let AppService = class AppService"),
+        "Default-exported class should be converted. Got:\n{}",
+        result.code
+    );
+
+    // Should have `export default AppService` (not `export { AppService }`)
+    assert!(
+        result.code.contains("export default AppService"),
+        "Should use export default. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("export { AppService }"),
+        "Should NOT use named export for default export. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Logger") && !result.code.contains("@Injectable"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_default_export_class", result.code);
+}
+
+#[test]
+fn test_jit_getter_setter_decorators() {
+    // Decorators on getter/setter methods should be lowered like regular methods
+    // (using null, not void 0, since they are accessor methods not property fields).
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive, Input } from '@angular/core';
+
+function Validate() { return function(t: any, k: string, d: any) {}; }
+function Transform() { return function(t: any, k: string, d: any) {}; }
+
+@Directive({ selector: '[appField]' })
+export class FieldDirective {
+    private _value = '';
+
+    @Validate()
+    @Input()
+    get value() { return this._value; }
+    set value(v: string) { this._value = v; }
+
+    @Transform()
+    get computed() { return this._value.toUpperCase(); }
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "field.directive.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@Validate")
+            && !result.code.contains("@Input")
+            && !result.code.contains("@Transform"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Getter decorator should use null (method/accessor, not property)
+    assert!(
+        result.code.contains("__decorate([Validate()], FieldDirective.prototype, \"value\", null)"),
+        "Getter decorator should use null (accessor). Got:\n{}",
+        result.code
+    );
+    assert!(
+        result
+            .code
+            .contains("__decorate([Transform()], FieldDirective.prototype, \"computed\", null)"),
+        "Getter decorator should use null (accessor). Got:\n{}",
+        result.code
+    );
+
+    // Angular decorator should be in propDecorators
+    assert!(
+        result.code.contains("type: Input"),
+        "Angular getter decorator should be in propDecorators. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_getter_setter_decorators", result.code);
+}
+
+#[test]
+fn test_jit_decorator_with_complex_arguments() {
+    // Decorators with complex arguments (objects, arrays, arrow functions,
+    // template literals) should have their argument text preserved verbatim.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function Config(opts: any) { return function(t: any) { return t; }; }
+function Transform(fn: any) { return function(t: any, k: string, d: any) {}; }
+
+@Config({
+    name: 'test',
+    deps: [ServiceA, ServiceB],
+    factory: () => new TestService(),
+})
+@Injectable()
+export class TestService {
+    @Transform((val: string) => val.trim())
+    process() {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "test.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // No raw decorators should remain
+    assert!(
+        !result.code.contains("@Config")
+            && !result.code.contains("@Injectable")
+            && !result.code.contains("@Transform"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // Complex arguments should be preserved in the __decorate call
+    assert!(
+        result.code.contains("Config("),
+        "Config decorator with complex args should be in __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("factory: () => new TestService()"),
+        "Arrow function argument should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("deps: [ServiceA, ServiceB]"),
+        "Array argument should be preserved. Got:\n{}",
+        result.code
+    );
+
+    // Method decorator with arrow function arg
+    assert!(
+        result.code.contains("Transform((val) => val.trim())"),
+        "Arrow function in method decorator should be preserved. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_complex_decorator_arguments", result.code);
+}
+
+#[test]
+fn test_jit_angular_param_decorators_not_in_member_decorate() {
+    // Angular parameter decorators (@Inject, @Optional, @Self, @SkipSelf, @Host, @Attribute)
+    // should NOT be emitted in __decorate() calls if they appear on a member.
+    // While these are designed for constructor params, if someone puts them on a member,
+    // they should be treated as Angular decorators (not lowered via __decorate).
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable, Inject, Optional } from '@angular/core';
+
+function Custom() { return function(t: any, k: string) {}; }
+
+@Injectable()
+export class MyService {
+    @Inject('TOKEN')
+    token: any;
+
+    @Optional()
+    optionalDep: any;
+
+    @Custom()
+    customProp: string = '';
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // @Custom should be lowered via __decorate (it's non-Angular)
+    assert!(
+        result.code.contains("__decorate([Custom()], MyService.prototype, \"customProp\", void 0)"),
+        "Non-Angular decorator should be in __decorate. Got:\n{}",
+        result.code
+    );
+
+    // @Inject and @Optional should NOT appear in __decorate calls for members
+    // They are Angular decorators and should not be treated as non-Angular
+    let member_decorate_calls: Vec<&str> = result
+        .code
+        .lines()
+        .filter(|l| l.contains("__decorate(") && l.contains(".prototype"))
+        .collect();
+    for call in &member_decorate_calls {
+        assert!(
+            !call.contains("Inject(") && !call.contains("Optional()"),
+            "Angular param decorators should not appear in member __decorate calls. Got:\n{call}"
+        );
+    }
+
+    insta::assert_snapshot!("jit_angular_param_decorators_on_members", result.code);
+}
+
+// =========================================================================
+// Reference output comparison tests
+// =========================================================================
+// These tests compare our output against the actual output from Angular's
+// official JIT compiler (@angular/compiler-cli) + TypeScript emit pipeline.
+// Reference outputs were generated by compiling TypeScript files with
+// Angular's downlevel_decorators_transform followed by tsc emit.
+
+#[test]
+fn test_jit_reference_ngxs_animals_state() {
+    // Reference: AnimalsState from Angular's actual JIT output
+    // Non-Angular @State class decorator + @Injectable, with @Selector (static) and @Action (instance)
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector } from '@ngxs/store';
+
+@State({
+    name: 'animals',
+    defaults: []
+})
+@Injectable()
+class AnimalsState {
+    @Selector()
+    static getAnimals(state: string[]): string[] {
+        return state;
+    }
+
+    @Action({ type: 'AddAnimal' })
+    addAnimal(ctx: any, action: any): void {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "animals.state.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Angular reference output (from full-compiled-output.js):
+    //   __decorate([Action({type:'AddAnimal'})], AnimalsState.prototype, "addAnimal", null);
+    //   __decorate([Selector()], AnimalsState, "getAnimals", null);
+    //   AnimalsState = __decorate([State({...}), Injectable()], AnimalsState);
+
+    // Instance method → prototype, null
+    assert!(
+        result.code.contains("__decorate([Action({ type: \"AddAnimal\" })], AnimalsState.prototype, \"addAnimal\", null)"),
+        "Instance method should match Angular reference output. Got:\n{}",
+        result.code
+    );
+
+    // Static method → class directly, null
+    assert!(
+        result.code.contains("__decorate([Selector()], AnimalsState, \"getAnimals\", null)"),
+        "Static method should match Angular reference output. Got:\n{}",
+        result.code
+    );
+
+    // Instance __decorate calls should come before static ones (TypeScript ordering)
+    let instance_pos = result.code.find("AnimalsState.prototype").unwrap();
+    let static_pos = result.code.find("AnimalsState, \"getAnimals\"").unwrap();
+    assert!(
+        instance_pos < static_pos,
+        "Instance member __decorate should come before static. Got:\n{}",
+        result.code
+    );
+
+    // Class __decorate should include both State and Injectable in source order
+    let class_decorate = result.code.find("AnimalsState = __decorate(").unwrap();
+    let class_section = &result.code[class_decorate..];
+    assert!(
+        class_section.contains("State(") && class_section.contains("Injectable()"),
+        "Class __decorate should include both decorators. Got:\n{}",
+        result.code
+    );
+
+    // No raw decorators
+    assert!(
+        !result.code.contains("@State")
+            && !result.code.contains("@Injectable")
+            && !result.code.contains("@Selector")
+            && !result.code.contains("@Action"),
+        "No raw decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_reference_animals_state", result.code);
+}
+
+#[test]
+fn test_jit_reference_ordering() {
+    // Reference: OrderTestState from Angular's actual JIT output
+    // Tests that instance members are emitted before static members,
+    // each group in source order. This matches TypeScript's emit behavior.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+import { State, Action, Selector } from '@ngxs/store';
+
+@State({ name: 'order', defaults: {} })
+@Injectable()
+class OrderTestState {
+    @Action({ type: 'First' })
+    instanceFirst(ctx: any): void {}
+
+    @Selector()
+    static staticSecond(state: any): any { return state; }
+
+    @Action({ type: 'Third' })
+    instanceThird(ctx: any): void {}
+
+    @Selector()
+    static staticFourth(state: any): any { return state; }
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "order.state.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Angular reference output ordering (from decorate-patterns-output.js):
+    //   __decorate([Action({type:'First'})], OrderTestState.prototype, "instanceFirst", null);
+    //   __decorate([Action({type:'Third'})], OrderTestState.prototype, "instanceThird", null);
+    //   __decorate([Selector()], OrderTestState, "staticSecond", null);
+    //   __decorate([Selector()], OrderTestState, "staticFourth", null);
+    //   OrderTestState = __decorate([State({...}), Injectable()], OrderTestState);
+
+    let first_pos = result.code.find("\"instanceFirst\"").unwrap();
+    let third_pos = result.code.find("\"instanceThird\"").unwrap();
+    let second_pos = result.code.find("\"staticSecond\"").unwrap();
+    let fourth_pos = result.code.find("\"staticFourth\"").unwrap();
+    let class_pos = result.code.find("OrderTestState = __decorate(").unwrap();
+
+    // Instance members first (in source order)
+    assert!(first_pos < third_pos, "instanceFirst before instanceThird");
+    // Then static members (in source order)
+    assert!(third_pos < second_pos, "instance group before static group");
+    assert!(second_pos < fourth_pos, "staticSecond before staticFourth");
+    // Class decorator last
+    assert!(fourth_pos < class_pos, "member decorators before class decorator");
+
+    insta::assert_snapshot!("jit_reference_ordering", result.code);
+}
+
+#[test]
+fn test_jit_reference_decorate_patterns() {
+    // Reference: TestDecoratePatternsService from Angular's actual JIT output
+    // Tests property/method/static/getter/setter decorator patterns
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable } from '@angular/core';
+
+function CustomPropDecorator(): any { return () => {}; }
+function CustomMethodDecorator(): any { return () => {}; }
+
+@Injectable()
+class TestDecoratePatternsService {
+    @CustomPropDecorator()
+    myProp: string = 'hello';
+
+    @CustomMethodDecorator()
+    myMethod(): void {}
+
+    @CustomMethodDecorator()
+    static myStaticMethod(): void {}
+
+    @CustomPropDecorator()
+    get myGetter(): string { return ''; }
+
+    @CustomPropDecorator()
+    set mySetter(val: string) {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "patterns.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Angular reference output (from decorate-patterns-output.js):
+    //   __decorate([CustomPropDecorator()], X.prototype, "myProp", void 0);
+    //   __decorate([CustomMethodDecorator()], X.prototype, "myMethod", null);
+    //   __decorate([CustomPropDecorator()], X.prototype, "myGetter", null);
+    //   __decorate([CustomPropDecorator()], X.prototype, "mySetter", null);
+    //   __decorate([CustomMethodDecorator()], X, "myStaticMethod", null);
+
+    // Property → void 0
+    assert!(
+        result.code.contains("__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, \"myProp\", void 0)"),
+        "Property decorator should use void 0 (Angular reference). Got:\n{}",
+        result.code
+    );
+
+    // Method → null
+    assert!(
+        result.code.contains("__decorate([CustomMethodDecorator()], TestDecoratePatternsService.prototype, \"myMethod\", null)"),
+        "Method decorator should use null (Angular reference). Got:\n{}",
+        result.code
+    );
+
+    // Static method → class, null
+    assert!(
+        result.code.contains("__decorate([CustomMethodDecorator()], TestDecoratePatternsService, \"myStaticMethod\", null)"),
+        "Static method should use class directly (Angular reference). Got:\n{}",
+        result.code
+    );
+
+    // Getter → null (accessor, not property)
+    assert!(
+        result.code.contains("__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, \"myGetter\", null)"),
+        "Getter should use null (Angular reference). Got:\n{}",
+        result.code
+    );
+
+    // Setter → null (accessor, not property)
+    assert!(
+        result.code.contains("__decorate([CustomPropDecorator()], TestDecoratePatternsService.prototype, \"mySetter\", null)"),
+        "Setter should use null (Angular reference). Got:\n{}",
+        result.code
+    );
+
+    // Ordering: instance members first (myProp, myMethod, myGetter, mySetter), then static
+    let prop_pos = result.code.find("\"myProp\"").unwrap();
+    let method_pos = result.code.find("\"myMethod\"").unwrap();
+    let getter_pos = result.code.find("\"myGetter\"").unwrap();
+    let setter_pos = result.code.find("\"mySetter\"").unwrap();
+    let static_pos = result.code.find("\"myStaticMethod\"").unwrap();
+
+    assert!(prop_pos < static_pos, "instance before static");
+    assert!(method_pos < static_pos, "instance before static");
+    assert!(getter_pos < static_pos, "instance before static");
+    assert!(setter_pos < static_pos, "instance before static");
+
+    insta::assert_snapshot!("jit_reference_decorate_patterns", result.code);
+}
+
+#[test]
+fn test_jit_reference_angular_member_decorators() {
+    // Reference: MyService from Angular's actual JIT output
+    // Angular member decorators go into propDecorators, constructor params into ctorParameters
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable, Inject, Optional, Input, Output, ViewChild, HostListener, HostBinding, ContentChild } from '@angular/core';
+
+@Injectable()
+class MyService {
+    @Input()
+    myInput: string = '';
+
+    @Output()
+    myOutput: any;
+
+    @ViewChild('ref')
+    myViewChild: any;
+
+    @HostBinding('class.active')
+    isActive: boolean = false;
+
+    @HostListener('click', ['$event'])
+    onClick(event: Event): void {}
+
+    @ContentChild('content')
+    myContent: any;
+
+    constructor(
+        @Inject('TOKEN') private token: string,
+        @Optional() private optService: any,
+    ) {}
+
+    normalMethod(): void {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result = transform_angular_file(&allocator, "my.service.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // Angular reference: propDecorators should contain all Angular member decorators
+    // From full-compiled-output.js:
+    //   static propDecorators = {
+    //       myInput: [{ type: Input }],
+    //       myOutput: [{ type: Output }],
+    //       myViewChild: [{ type: ViewChild, args: ['ref',] }],
+    //       isActive: [{ type: HostBinding, args: ['class.active',] }],
+    //       onClick: [{ type: HostListener, args: ['click', ['$event'],] }],
+    //       myContent: [{ type: ContentChild, args: ['content',] }]
+    //   };
+
+    assert!(
+        result.code.contains("propDecorators"),
+        "Should have propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("type: Input"), "propDecorators: Input. Got:\n{}", result.code);
+    assert!(result.code.contains("type: Output"), "propDecorators: Output. Got:\n{}", result.code);
+    assert!(
+        result.code.contains("type: ViewChild"),
+        "propDecorators: ViewChild. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: HostBinding"),
+        "propDecorators: HostBinding. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: HostListener"),
+        "propDecorators: HostListener. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("type: ContentChild"),
+        "propDecorators: ContentChild. Got:\n{}",
+        result.code
+    );
+
+    // Angular reference: ctorParameters should contain constructor param types and decorators
+    // From full-compiled-output.js:
+    //   static ctorParameters = () => [
+    //       { type: String, decorators: [{ type: Inject, args: ['TOKEN',] }] },
+    //       { type: undefined, decorators: [{ type: Optional }] }
+    //   ];
+    assert!(
+        result.code.contains("ctorParameters"),
+        "Should have ctorParameters. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("type: Inject"), "ctorParameters: Inject. Got:\n{}", result.code);
+    assert!(
+        result.code.contains("type: Optional"),
+        "ctorParameters: Optional. Got:\n{}",
+        result.code
+    );
+
+    // No raw Angular decorators should remain
+    assert!(
+        !result.code.contains("@Input")
+            && !result.code.contains("@Output")
+            && !result.code.contains("@ViewChild")
+            && !result.code.contains("@HostBinding")
+            && !result.code.contains("@HostListener")
+            && !result.code.contains("@ContentChild")
+            && !result.code.contains("@Inject")
+            && !result.code.contains("@Optional"),
+        "No raw Angular decorator syntax should remain. Got:\n{}",
+        result.code
+    );
+
+    // No __decorate calls for Angular member decorators (they go in propDecorators instead)
+    // Only the class __decorate([Injectable()], ...) should exist
+    let decorate_count = result.code.matches("__decorate(").count();
+    assert!(
+        decorate_count == 1,
+        "Should have exactly 1 __decorate call (class only, not members). Got {} calls:\n{}",
+        decorate_count,
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_reference_angular_member_decorators", result.code);
+}
+
 // =========================================================================
 // Source map tests
 // =========================================================================
@@ -6907,7 +9484,7 @@ export abstract class BaseProvider {
 fn test_sourcemap_aot_mode() {
     // Issue #99: transformAngularFile should return a source map when sourcemap: true
     let allocator = Allocator::default();
-    let source = r#"import { Component } from '@angular/core';
+    let source = r"import { Component } from '@angular/core';
 
 @Component({
     selector: 'app-test',
@@ -6916,7 +9493,7 @@ fn test_sourcemap_aot_mode() {
 })
 export class TestComponent {
 }
-"#;
+";
 
     let options = ComponentTransformOptions { sourcemap: true, ..Default::default() };
 
@@ -6945,7 +9522,7 @@ export class TestComponent {
 fn test_sourcemap_jit_mode() {
     // Issue #99: JIT mode should also return a source map when sourcemap: true
     let allocator = Allocator::default();
-    let source = r#"import { Component } from '@angular/core';
+    let source = r"import { Component } from '@angular/core';
 
 @Component({
     selector: 'app-test',
@@ -6954,7 +9531,7 @@ fn test_sourcemap_jit_mode() {
 })
 export class TestComponent {
 }
-"#;
+";
 
     let options = ComponentTransformOptions { sourcemap: true, jit: true, ..Default::default() };
 
@@ -6975,7 +9552,7 @@ export class TestComponent {
 fn test_sourcemap_disabled_by_default() {
     // When sourcemap is false (default), map should be None
     let allocator = Allocator::default();
-    let source = r#"import { Component } from '@angular/core';
+    let source = r"import { Component } from '@angular/core';
 
 @Component({
     selector: 'app-test',
@@ -6984,7 +9561,7 @@ fn test_sourcemap_disabled_by_default() {
 })
 export class TestComponent {
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "app.component.ts", source, None, None);
 
@@ -6995,7 +9572,7 @@ export class TestComponent {
 fn test_sourcemap_with_external_template() {
     // Source map should work with resolved external templates
     let allocator = Allocator::default();
-    let source = r#"import { Component } from '@angular/core';
+    let source = r"import { Component } from '@angular/core';
 
 @Component({
     selector: 'app-test',
@@ -7004,7 +9581,7 @@ fn test_sourcemap_with_external_template() {
 })
 export class TestComponent {
 }
-"#;
+";
 
     let mut templates = std::collections::HashMap::new();
     templates.insert("./app.html".to_string(), "<h1>Hello World</h1>".to_string());
@@ -7030,10 +9607,10 @@ export class TestComponent {
 fn test_sourcemap_no_angular_classes() {
     // A file with no Angular classes should still return a source map if requested
     let allocator = Allocator::default();
-    let source = r#"export class PlainService {
+    let source = r"export class PlainService {
     getData() { return 42; }
 }
-"#;
+";
 
     let options = ComponentTransformOptions { sourcemap: true, ..Default::default() };
 
@@ -7054,7 +9631,7 @@ fn test_sourcemap_no_angular_classes() {
 #[test]
 fn test_dts_component_basic() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -7063,7 +9640,7 @@ import { Component } from '@angular/core';
   template: '<p>Hello</p>'
 })
 export class HelloComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "hello.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7100,7 +9677,7 @@ export class HelloComponent {}
 #[test]
 fn test_dts_component_with_inputs_outputs() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Input, Output, EventEmitter } from '@angular/core';
 
 @Component({
@@ -7113,7 +9690,7 @@ export class UserComponent {
   @Input({ required: true, alias: 'userId' }) id!: number;
   @Output() clicked = new EventEmitter<void>();
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "user.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7144,7 +9721,7 @@ export class UserComponent {
 #[test]
 fn test_dts_component_non_standalone() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -7153,7 +9730,7 @@ import { Component } from '@angular/core';
   template: '<p>Legacy</p>'
 })
 export class LegacyComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "legacy.component.ts", source, None, None);
     assert!(!result.has_errors());
@@ -7170,7 +9747,7 @@ export class LegacyComponent {}
 #[test]
 fn test_dts_component_with_export_as() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 
 @Component({
@@ -7180,7 +9757,7 @@ import { Component } from '@angular/core';
   template: '<ng-content></ng-content>'
 })
 export class TooltipComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "tooltip.component.ts", source, None, None);
     assert!(!result.has_errors());
@@ -7196,7 +9773,7 @@ export class TooltipComponent {}
 #[test]
 fn test_dts_directive() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Input, Output, EventEmitter } from '@angular/core';
 
 @Directive({
@@ -7208,7 +9785,7 @@ export class HighlightDirective {
   @Input() color: string = 'yellow';
   @Output() highlighted = new EventEmitter<boolean>();
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "highlight.directive.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7251,7 +9828,7 @@ export class HighlightDirective {
 #[test]
 fn test_dts_pipe() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Pipe, PipeTransform } from '@angular/core';
 
 @Pipe({
@@ -7263,7 +9840,7 @@ export class CapitalizePipe implements PipeTransform {
     return value.charAt(0).toUpperCase() + value.slice(1);
   }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "capitalize.pipe.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7291,7 +9868,7 @@ export class CapitalizePipe implements PipeTransform {
 #[test]
 fn test_dts_pipe_no_name() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Pipe, PipeTransform } from '@angular/core';
 
 @Pipe({
@@ -7302,7 +9879,7 @@ export class MyPipe implements PipeTransform {
     return value;
   }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "my.pipe.ts", source, None, None);
 
@@ -7321,7 +9898,7 @@ export class MyPipe implements PipeTransform {
 #[test]
 fn test_dts_ng_module() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { NgModule } from '@angular/core';
 import { CommonModule } from '@angular/common';
 
@@ -7331,7 +9908,7 @@ import { CommonModule } from '@angular/common';
   exports: [MyComponent]
 })
 export class MyModule {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "my.module.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7375,7 +9952,7 @@ export class MyModule {}
 #[test]
 fn test_dts_injectable() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Injectable } from '@angular/core';
 
 @Injectable({
@@ -7384,7 +9961,7 @@ import { Injectable } from '@angular/core';
 export class DataService {
   getData() { return []; }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "data.service.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7411,7 +9988,7 @@ export class DataService {
 #[test]
 fn test_dts_generic_injectable() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Injectable } from '@angular/core';
 
 @Injectable({
@@ -7420,7 +9997,7 @@ import { Injectable } from '@angular/core';
 export class GenericService<T, U> {
   getData(): T | U { return null!; }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "generic.service.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7449,14 +10026,14 @@ export class GenericService<T, U> {
 #[test]
 fn test_dts_generic_pipe() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Pipe, PipeTransform } from '@angular/core';
 
 @Pipe({ name: 'genericPipe', standalone: true })
 export class GenericPipe<T> implements PipeTransform {
   transform(value: T): T { return value; }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "generic.pipe.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7483,7 +10060,7 @@ export class GenericPipe<T> implements PipeTransform {
 #[test]
 fn test_dts_generic_directive() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Input } from '@angular/core';
 
 @Directive({
@@ -7494,7 +10071,7 @@ export class GenericDirective<T, U> {
   @Input() value!: T;
   @Input() extra!: U;
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "generic.directive.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7522,12 +10099,12 @@ export class GenericDirective<T, U> {
 #[test]
 fn test_dts_generic_ng_module() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { NgModule } from '@angular/core';
 
 @NgModule({})
 export class GenericModule<T> {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "generic.module.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7561,7 +10138,7 @@ export class GenericModule<T> {}
 #[test]
 fn test_dts_multiple_classes_in_file() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Injectable, Pipe, PipeTransform } from '@angular/core';
 
 @Injectable({ providedIn: 'root' })
@@ -7578,7 +10155,7 @@ export class MyPipe implements PipeTransform {
   template: '<p>{{value | myPipe}}</p>'
 })
 export class MultiComponent {}
-"#;
+";
 
     let result = transform_angular_file(&allocator, "multi.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7601,11 +10178,11 @@ export class MultiComponent {}
 #[test]
 fn test_dts_no_declarations_for_plain_class() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 export class PlainClass {
   doStuff() { return 42; }
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "plain.ts", source, None, None);
 
@@ -7619,7 +10196,7 @@ export class PlainClass {
 #[test]
 fn test_dts_component_with_signal_input() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, input } from '@angular/core';
 
 @Component({
@@ -7631,7 +10208,7 @@ export class SignalComponent {
   name = input<string>('default');
   required = input.required<number>();
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "signal.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7650,7 +10227,7 @@ export class SignalComponent {
 #[test]
 fn test_dts_component_ctor_deps_with_attribute() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Attribute } from '@angular/core';
 import { MyService } from './my.service';
 
@@ -7665,7 +10242,7 @@ export class TestComponent {
     @Attribute('title') title: string
   ) {}
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7683,7 +10260,7 @@ export class TestComponent {
 #[test]
 fn test_dts_component_ctor_deps_with_optional() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Optional } from '@angular/core';
 import { MyService } from './my.service';
 
@@ -7697,7 +10274,7 @@ export class TestComponent {
     @Optional() private svc: MyService
   ) {}
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7715,7 +10292,7 @@ export class TestComponent {
 #[test]
 fn test_dts_component_ctor_deps_no_flags() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component } from '@angular/core';
 import { MyService } from './my.service';
 
@@ -7727,7 +10304,7 @@ import { MyService } from './my.service';
 export class TestComponent {
   constructor(private svc: MyService) {}
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7744,7 +10321,7 @@ export class TestComponent {
 #[test]
 fn test_dts_directive_ctor_deps_with_optional_and_host() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Optional, Host } from '@angular/core';
 import { MyService } from './my.service';
 import { OtherService } from './other.service';
@@ -7759,7 +10336,7 @@ export class TestDirective {
     private other: OtherService
   ) {}
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.directive.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7815,7 +10392,7 @@ export class LayoutComponent {}
 #[test]
 fn test_dts_component_with_input_transform() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Input, booleanAttribute } from '@angular/core';
 
 @Component({
@@ -7827,7 +10404,7 @@ export class TestComponent {
   @Input({transform: booleanAttribute}) disabled: boolean = false;
   @Input() name: string = '';
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7853,7 +10430,7 @@ export class TestComponent {
 #[test]
 fn test_dts_directive_with_input_transform() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Directive, Input, booleanAttribute } from '@angular/core';
 
 @Directive({
@@ -7864,7 +10441,7 @@ export class TestDirective {
   @Input({transform: booleanAttribute}) disabled: boolean = false;
   @Input() name: string = '';
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.directive.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -7890,7 +10467,7 @@ export class TestDirective {
 #[test]
 fn test_dts_signal_input_with_transform_no_accept_type() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, input, booleanAttribute } from '@angular/core';
 
 @Component({
@@ -7901,7 +10478,7 @@ import { Component, input, booleanAttribute } from '@angular/core';
 export class TestComponent {
   disabled = input(false, {transform: booleanAttribute});
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
     assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
@@ -8331,6 +10908,61 @@ fn test_property_singleton_interpolation_with_sanitizer_angular_v19() {
     insta::assert_snapshot!("property_singleton_interpolation_with_sanitizer_v19", js);
 }
 
+#[test]
+fn test_iframe_sensitive_attr_validation_legacy_versions() {
+    // Upstream resolve_sanitizers.ts falls back to ɵɵvalidateIframeAttribute for
+    // security-sensitive iframe attributes that got no sanitizer. It existed on
+    // versions before the iframe attributeNoBinding schema keys (removed in
+    // 19.2.17 / 20.3.15 / 21.0.2).
+    for version in [AngularVersion::new(19, 0, 0), AngularVersion::new(21, 0, 1)] {
+        let js = compile_template_to_js_with_version(
+            r#"<iframe [sandbox]="expr"></iframe>"#,
+            "TestComponent",
+            Some(version),
+        );
+        assert!(
+            js.contains("ɵɵvalidateIframeAttribute"),
+            "v{version:?} should emit ɵɵvalidateIframeAttribute for iframe [sandbox]. Got:\n{js}"
+        );
+    }
+    // Once the schema covers iframe|sandbox as attributeNoBinding, the generic
+    // ɵɵvalidateAttribute is used instead.
+    for version in [AngularVersion::new(19, 2, 17), AngularVersion::new(21, 0, 2)] {
+        let js = compile_template_to_js_with_version(
+            r#"<iframe [sandbox]="expr"></iframe>"#,
+            "TestComponent",
+            Some(version),
+        );
+        assert!(
+            js.contains("ɵɵvalidateAttribute"),
+            "v{version:?} should emit ɵɵvalidateAttribute for iframe [sandbox]. Got:\n{js}"
+        );
+        assert!(
+            !js.contains("ɵɵvalidateIframeAttribute"),
+            "v{version:?} should not emit the legacy iframe validator. Got:\n{js}"
+        );
+    }
+    // The validator only applies to iframes and only to the sensitive attrs.
+    let js = compile_template_to_js_with_version(
+        r#"<div [sandbox]="expr"></div>"#,
+        "TestComponent",
+        Some(AngularVersion::new(21, 0, 1)),
+    );
+    assert!(
+        !js.contains("ɵɵvalidateIframeAttribute"),
+        "Non-iframe host should not get the iframe validator. Got:\n{js}"
+    );
+    let js = compile_template_to_js_with_version(
+        r#"<iframe [title]="expr"></iframe>"#,
+        "TestComponent",
+        Some(AngularVersion::new(21, 0, 1)),
+    );
+    assert!(
+        !js.contains("ɵɵvalidateIframeAttribute"),
+        "Non-sensitive attribute should not get the iframe validator. Got:\n{js}"
+    );
+}
+
 // ============================================================================
 // Host Directive Alias Tests
 // ============================================================================
@@ -8342,7 +10974,7 @@ fn test_property_singleton_interpolation_with_sanitizer_angular_v19() {
 #[test]
 fn test_host_directives_with_inputs_outputs() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Directive, EventEmitter, Input, Output } from '@angular/core';
 
 @Directive({})
@@ -8365,7 +10997,7 @@ export class HostDir {
 })
 export class MyComponent {
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
 
@@ -8397,7 +11029,7 @@ export class MyComponent {
 #[test]
 fn test_host_directives_with_host_aliases() {
     let allocator = Allocator::default();
-    let source = r#"
+    let source = r"
 import { Component, Directive, EventEmitter, Input, Output } from '@angular/core';
 
 @Directive({})
@@ -8420,7 +11052,7 @@ export class HostDir {
 })
 export class MyComponent {
 }
-"#;
+";
 
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
 
@@ -8445,4 +11077,4092 @@ export class MyComponent {
     );
 
     insta::assert_snapshot!("host_directives_with_host_aliases", result.code);
+}
+
+// =============================================================================
+// Issue #203: useFactory with block-body functions silently dropped in providers
+// =============================================================================
+
+#[test]
+fn test_use_factory_block_body_arrow_preserved() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, inject } from '@angular/core';
+
+const MY_TOKEN = 'MY_TOKEN';
+
+@Component({
+    selector: 'my-component',
+    template: '<div>hello</div>',
+    providers: [
+        {
+            provide: MY_TOKEN,
+            useFactory: () => {
+                const config = inject(AppConfig);
+                if (config.useMock) {
+                    return new MockService();
+                }
+                return new RealService(config);
+            }
+        }
+    ]
+})
+export class MyComponent {}
+";
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert_eq!(result.component_count, 1);
+
+    // The key assertion: the block-body arrow function should be preserved intact.
+    // Before the fix, `const config = inject(AppConfig)` and `if (config.useMock) { ... }`
+    // were silently dropped, leaving only `return new RealService(config)`.
+    assert!(
+        result.code.contains("const config = inject(AppConfig)"),
+        "Block-body arrow: const declaration should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("if (config.useMock)"),
+        "Block-body arrow: if statement should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("return new MockService()"),
+        "Block-body arrow: return inside if should be preserved. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("return new RealService(config)"),
+        "Block-body arrow: final return should be preserved. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_use_factory_expression_body_arrow_still_works() {
+    // Verify that expression-body arrows (which already worked) are not regressed
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, inject } from '@angular/core';
+
+const MY_TOKEN = 'MY_TOKEN';
+
+@Component({
+    selector: 'my-component',
+    template: '<div>hello</div>',
+    providers: [
+        {
+            provide: MY_TOKEN,
+            useFactory: () => new RealService(inject(AppConfig))
+        }
+    ]
+})
+export class MyComponent {}
+";
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(
+        result.code.contains("new RealService(inject(AppConfig))"),
+        "Expression-body arrow should be preserved. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_providers_with_function_expression_preserved() {
+    // function() expressions should also be preserved
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, inject } from '@angular/core';
+
+const MY_TOKEN = 'MY_TOKEN';
+
+@Component({
+    selector: 'my-component',
+    template: '<div>hello</div>',
+    providers: [
+        {
+            provide: MY_TOKEN,
+            useFactory: function() { return new RealService(); }
+        }
+    ]
+})
+export class MyComponent {}
+";
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(
+        result.code.contains("function()"),
+        "function expression should be preserved. Got:\n{}",
+        result.code
+    );
+}
+
+// =============================================================================
+// Regression: @Inject(TOKEN) on pipe constructor parameters
+// =============================================================================
+// The `extract_param_dependency` function in `pipe/decorator.rs` previously did
+// not handle the `@Inject(TOKEN)` decorator, so the token was silently taken
+// from the TypeScript type annotation instead. When the type was an interface
+// (erased at runtime) this left the DI token undefined, which Angular 20's
+// `assertDefined(token)` guard rejects immediately. See commit b2dd390.
+
+/// `@Inject(TOKEN)` on a pipe constructor param must produce a factory that
+/// injects the TOKEN identifier, not the erased type annotation.
+#[test]
+fn test_pipe_factory_uses_inject_token_over_interface_type() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Pipe, PipeTransform, Inject, InjectionToken } from '@angular/core';
+
+export interface Config {
+    locale: string;
+}
+
+export const CONFIG = new InjectionToken<Config>('CONFIG');
+
+@Pipe({ name: 'localized', standalone: true })
+export class LocalizedPipe implements PipeTransform {
+    constructor(@Inject(CONFIG) private config: Config) {}
+    transform(value: string): string { return value; }
+}
+";
+
+    let result = transform_angular_file(&allocator, "localized.pipe.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+
+    // Factory must inject CONFIG (the @Inject token), not Config (the interface type).
+    assert!(
+        factory_section.contains("CONFIG"),
+        "Pipe factory should inject the @Inject(CONFIG) token. Factory:\n{factory_section}"
+    );
+    assert!(
+        !factory_section.contains("directiveInject(Config)")
+            && !factory_section.contains("ɵɵinject(Config)"),
+        "Pipe factory must NOT inject the erased interface type 'Config'. Factory:\n{factory_section}"
+    );
+}
+
+/// When `@Inject(TOKEN)` is used alongside modifier decorators (`@Optional`,
+/// `@SkipSelf`), the factory must still pick up the TOKEN and forward the
+/// correct DI flags.
+#[test]
+fn test_pipe_factory_inject_token_with_optional_skip_self() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Pipe, PipeTransform, Inject, Optional, SkipSelf, InjectionToken } from '@angular/core';
+
+export const MY_TOKEN = new InjectionToken<string>('MY_TOKEN');
+
+@Pipe({ name: 'tagged', standalone: true })
+export class TaggedPipe implements PipeTransform {
+    constructor(
+        @Optional() @SkipSelf() @Inject(MY_TOKEN) private tag: string | null,
+    ) {}
+    transform(value: string): string { return value; }
+}
+";
+
+    let result = transform_angular_file(&allocator, "tagged.pipe.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+
+    // MY_TOKEN must be present in the factory as the DI token.
+    assert!(
+        factory_section.contains("directiveInject(MY_TOKEN"),
+        "Pipe factory should inject MY_TOKEN. Factory:\n{factory_section}"
+    );
+
+    // The DI flag bitmask must include Optional (8) | SkipSelf (4). Angular's
+    // pipe compilation also ORs in ForPipe (16), yielding 28. We only require
+    // that both Optional and SkipSelf bits are set.
+    let flags = factory_section
+        .split("directiveInject(MY_TOKEN,")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .expect("Factory should encode numeric DI flags");
+    assert!(
+        flags & 8 != 0 && flags & 4 != 0,
+        "Pipe factory flags should include Optional (8) and SkipSelf (4). Got: {flags}. Factory:\n{factory_section}"
+    );
+}
+
+/// Without `@Inject`, the factory must still fall back to the type annotation
+/// so that plain class-typed dependencies continue to resolve correctly.
+#[test]
+fn test_pipe_factory_without_inject_still_uses_type_annotation() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Pipe, PipeTransform } from '@angular/core';
+
+export class Logger {
+    log(msg: string): void {}
+}
+
+@Pipe({ name: 'logged', standalone: true })
+export class LoggedPipe implements PipeTransform {
+    constructor(private logger: Logger) {}
+    transform(value: string): string { return value; }
+}
+";
+
+    let result = transform_angular_file(&allocator, "logged.pipe.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+
+    assert!(
+        factory_section.contains("Logger"),
+        "Pipe factory should fall back to the type annotation (Logger). Factory:\n{factory_section}"
+    );
+}
+
+// ============================================================================
+// outputFromObservable tests
+// ============================================================================
+
+#[test]
+fn test_output_from_observable_simple() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, EventEmitter } from '@angular/core';
+import { outputFromObservable } from '@angular/core/rxjs-interop';
+
+@Component({
+    selector: 'test-comp',
+    standalone: true,
+    template: '',
+})
+export class TestComponent {
+    readonly queryChanged = outputFromObservable(new EventEmitter<string>());
+}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"ɵɵdefineComponent("#)
+            && normalized.contains(r#"outputs:{queryChanged:"queryChanged"}"#),
+        "outputFromObservable property should appear in outputs:{{}} inside ɵɵdefineComponent.\nCode:\n{}",
+        result.code
+    );
+    insta::assert_snapshot!("output_from_observable_simple", result.code);
+}
+
+#[test]
+fn test_output_from_observable_property_reference() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { outputFromObservable } from '@angular/core/rxjs-interop';
+
+@Component({
+    selector: 'test-comp',
+    standalone: true,
+    template: '',
+})
+export class TestComponent {
+    readonly valueChanged = outputFromObservable(this.someService.value$);
+}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"ɵɵdefineComponent("#)
+            && normalized.contains(r#"outputs:{valueChanged:"valueChanged"}"#),
+        "outputFromObservable with property reference should appear in outputs:{{}} inside ɵɵdefineComponent.\nCode:\n{}",
+        result.code
+    );
+    insta::assert_snapshot!("output_from_observable_property_reference", result.code);
+}
+
+#[test]
+fn test_output_from_observable_piped() {
+    // Regression: the reported real-world case — complex piped observable as argument.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+import { outputFromObservable } from '@angular/core/rxjs-interop';
+
+@Component({
+    selector: 'test-comp',
+    standalone: true,
+    template: '',
+})
+export class TestComponent {
+    readonly queryChanged = outputFromObservable(
+        this.dataService.value$.pipe(
+            skip(1),
+            debounceTime(300),
+        ),
+    );
+}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"ɵɵdefineComponent("#)
+            && normalized.contains(r#"outputs:{queryChanged:"queryChanged"}"#),
+        "outputFromObservable with piped observable should appear in outputs:{{}} inside ɵɵdefineComponent.\nCode:\n{}",
+        result.code
+    );
+    insta::assert_snapshot!("output_from_observable_piped", result.code);
+}
+
+#[test]
+fn test_output_from_observable_with_alias() {
+    // The alias option is the second argument; the class property name maps to the alias binding name.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, EventEmitter } from '@angular/core';
+import { outputFromObservable } from '@angular/core/rxjs-interop';
+
+@Component({
+    selector: 'test-comp',
+    standalone: true,
+    template: '',
+})
+export class TestComponent {
+    readonly _clicked = outputFromObservable(new EventEmitter<void>(), { alias: 'clicked' });
+}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    // Class property name '_clicked' must map to binding name 'clicked' (the alias value).
+    assert!(
+        normalized.contains(r#"ɵɵdefineComponent("#)
+            && normalized.contains(r#"outputs:{_clicked:"clicked"}"#),
+        "outputFromObservable alias should become the binding property name in outputs:{{}}.\nCode:\n{}",
+        result.code
+    );
+    // Also verify the class property name itself is NOT used as the binding name.
+    assert!(
+        !normalized.contains(r#"outputs:{_clicked:"_clicked"}"#),
+        "Class property name '_clicked' should NOT be used as binding name when alias is set.\nCode:\n{}",
+        result.code
+    );
+    insta::assert_snapshot!("output_from_observable_with_alias", result.code);
+}
+
+#[test]
+fn test_output_from_observable_mixed_with_output() {
+    // Both output() and outputFromObservable() in the same class must both appear in outputs.
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, EventEmitter, output } from '@angular/core';
+import { outputFromObservable } from '@angular/core/rxjs-interop';
+
+@Component({
+    selector: 'test-comp',
+    standalone: true,
+    template: '',
+})
+export class TestComponent {
+    readonly clicked = output<void>();
+    readonly queryChanged = outputFromObservable(new EventEmitter<string>());
+}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"ɵɵdefineComponent("#)
+            && normalized.contains(r#"outputs:{clicked:"clicked",queryChanged:"queryChanged"}"#),
+        "Both output() and outputFromObservable() must appear in outputs:{{}} inside ɵɵdefineComponent.\nCode:\n{}",
+        result.code
+    );
+    insta::assert_snapshot!("output_from_observable_mixed_with_output", result.code);
+}
+
+/// Host attribute key referencing a same-file `const` must emit `hostAttrs` in
+/// `ɵɵdefineDirective`, matching the official Angular compiler.
+#[test]
+fn host_attribute_identifier_key_emits_host_attrs() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+export const MARKER_ATTR = 'data-marker';
+
+@Directive({
+    selector: '[marker]',
+    host: { [MARKER_ATTR]: '' },
+})
+export class MarkerDirective {}
+"#;
+    let result = transform_angular_file(&allocator, "marker.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"hostAttrs:["data-marker",""]"#),
+        "Expected hostAttrs:[\"data-marker\",\"\"] in directive definition.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Host attribute value referencing a same-file `const` must resolve and emit
+/// `hostAttrs` with the resolved string.
+#[test]
+fn host_attribute_identifier_value_emits_host_attrs() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+const BTN_TYPE = 'submit';
+
+@Directive({
+    selector: '[d]',
+    host: { type: BTN_TYPE },
+})
+export class D {}
+"#;
+    let result = transform_angular_file(&allocator, "d.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"hostAttrs:["type","submit"]"#),
+        "Expected hostAttrs:[\"type\",\"submit\"] in directive definition.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// An unresolved identifier in a computed host key must be silently dropped —
+/// matching existing behavior for any unrecognized host metadata.
+#[test]
+fn host_attribute_unknown_identifier_dropped() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+@Directive({
+    selector: '[d]',
+    host: { [UNRESOLVED]: '' },
+})
+export class D {}
+"#;
+    let result = transform_angular_file(&allocator, "d.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        !normalized.contains("hostAttrs:"),
+        "Unresolved identifier must not produce hostAttrs entry.\nCode:\n{}",
+        result.code
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #286: `${...}` template-literal interpolation in decorator metadata.
+//
+// Angular's partial evaluator constant-folds template literals whose `${...}`
+// expressions reference same-file `const`-bound string values. OXC must match
+// this behavior for `template:`, `selector:`, `styles:`, etc. — otherwise an
+// AOT component silently never matches its tag (or fails to compile at all).
+// ---------------------------------------------------------------------------
+
+/// `template:` may be a template literal interpolating a module-level `const`.
+/// The interpolation must be folded so the component emits a real `ɵcmp` with
+/// the resolved template.
+#[test]
+fn component_template_literal_const_interpolation_in_template() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const twBtn = `px-4 py-2 rounded`;
+
+@Component({
+    selector: 'app-btn',
+    template: `<button class="${twBtn}">x</button>`,
+    standalone: true,
+})
+export class BtnComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "btn.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The component MUST have a real definition emitted.
+    assert!(
+        result.code.contains("ɵɵdefineComponent("),
+        "Expected ɵɵdefineComponent in output (component must be compiled, not skipped).\nCode:\n{}",
+        result.code
+    );
+
+    // The resolved class attribute must reach the output. Angular's template
+    // compiler tokenizes the class string into a `consts: [[1, ...]]` array
+    // (AttributeMarker.Classes == 1), so we check for the tokenized form.
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"consts:[[1,"px-4","py-2","rounded"]]"#),
+        "Expected resolved class attribute tokens in compiled output.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `selector:` may be a template literal interpolating a module-level `const`.
+/// The interpolation must be folded so the selector matches its tag at runtime.
+#[test]
+fn component_template_literal_const_interpolation_in_selector() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const PREFIX = 'app';
+
+@Component({
+    selector: `${PREFIX}-btn`,
+    template: '<button>x</button>',
+    standalone: true,
+})
+export class BtnComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "btn.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"selectors:[["app-btn"]]"#),
+        "Expected selectors:[[\"app-btn\"]] from folded `${{PREFIX}}-btn`.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `@Directive` selector must also resolve template-literal interpolation.
+#[test]
+fn directive_template_literal_const_interpolation_in_selector() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+const NAME = 'highlight';
+
+@Directive({
+    selector: `[${NAME}]`,
+})
+export class HighlightDirective {}
+"#;
+    let result = transform_angular_file(&allocator, "highlight.directive.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"selectors:[[""#) && normalized.contains(r#""highlight""#),
+        "Expected resolved selector containing \"highlight\" attribute in directive definition.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Multiple `${...}` interpolations in a single template literal must all fold.
+#[test]
+fn component_template_literal_multiple_const_interpolations() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const A = 'hello';
+const B = 'world';
+
+@Component({
+    selector: 'app-multi',
+    template: `<span>${A} ${B}!</span>`,
+    standalone: true,
+})
+export class MultiComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "multi.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("ɵɵdefineComponent("),
+        "Expected ɵɵdefineComponent in output.\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("hello world!"),
+        "Expected folded text \"hello world!\" in compiled template.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Chained consts: a const whose initializer interpolates another const must
+/// still resolve when referenced from decorator metadata.
+#[test]
+fn component_chained_const_template_literal_interpolation() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const PREFIX = 'app';
+const TAG = `${PREFIX}-chained`;
+
+@Component({
+    selector: TAG,
+    template: '<span>x</span>',
+    standalone: true,
+})
+export class ChainedComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "chained.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"selectors:[["app-chained"]]"#),
+        "Expected selectors:[[\"app-chained\"]] from chained const resolution.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `styles:` array elements may contain `${...}` interpolations referencing
+/// same-file consts; they must fold like `template:` does.
+#[test]
+fn component_styles_template_literal_const_interpolation() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const COLOR = 'red';
+
+@Component({
+    selector: 'app-s',
+    template: '<span>x</span>',
+    styles: [`:host { color: ${COLOR}; }`],
+    standalone: true,
+})
+export class StyledComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "styled.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("color: red"),
+        "Expected folded `color: red` in styles output.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// JIT mode: `templateUrl` may be a template literal interpolating a
+/// module-level `const`. The rewriter must fold and emit the
+/// `angular:jit:template:file;...` import with the resolved path.
+#[test]
+fn jit_template_url_template_literal_const_interpolation() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const DIR = './cmp';
+
+@Component({
+    selector: 'app-root',
+    templateUrl: `${DIR}/x.html`,
+    standalone: true,
+})
+export class AppComponent {}
+"#;
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "app.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("angular:jit:template:file;./cmp/x.html"),
+        "JIT output should import folded template path via angular:jit:template:file.\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("templateUrl"),
+        "JIT output should replace templateUrl with template.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// JIT mode: `templateUrl` may be a bare identifier referencing a same-file
+/// string `const`. Must also fold.
+#[test]
+fn jit_template_url_const_identifier() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const TPL = './app.html';
+
+@Component({
+    selector: 'app-root',
+    templateUrl: TPL,
+    standalone: true,
+})
+export class AppComponent {}
+"#;
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "app.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("angular:jit:template:file;./app.html"),
+        "JIT output should import resolved template path via angular:jit:template:file.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// JIT mode: `styleUrl` may be a template literal interpolating a `const`.
+#[test]
+fn jit_style_url_template_literal_const_interpolation() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const DIR = './cmp';
+
+@Component({
+    selector: 'app-root',
+    template: '<h1>x</h1>',
+    styleUrl: `${DIR}/x.css`,
+})
+export class AppComponent {}
+"#;
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "app.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("angular:jit:style:file;./cmp/x.css"),
+        "JIT output should import folded style path via angular:jit:style:file.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// JIT mode: `styleUrls:` array elements may be template literals
+/// interpolating a `const`. Each element must fold individually.
+#[test]
+fn jit_style_urls_template_literal_const_interpolation() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+const DIR = './cmp';
+
+@Component({
+    selector: 'app-root',
+    template: '<h1>x</h1>',
+    styleUrls: [`${DIR}/a.css`, './b.css'],
+})
+export class AppComponent {}
+"#;
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "app.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("angular:jit:style:file;./cmp/a.css"),
+        "JIT output should import folded first style path.\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("angular:jit:style:file;./b.css"),
+        "JIT output should also import the literal second style path.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// An interpolated `${...}` whose identifier is NOT a known const must NOT
+/// crash and must NOT produce a partial/garbage selector — the field is
+/// dropped (same fallback as today for any unresolvable identifier).
+///
+/// Scope: this test asserts ONLY on the `ɵcmp` selectors field. Since #299
+/// turned `emit_class_metadata` on by default, the raw `${UNRESOLVED}-tag`
+/// template literal is intentionally preserved verbatim inside
+/// `ɵsetClassMetadata(..., [{ type: Component, args: [...] }], ...)` to
+/// mirror ngc's behavior — that's metadata for runtime tooling and is not
+/// the compiled selector itself.
+#[test]
+fn component_template_literal_unresolved_identifier_drops_field() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: `${UNRESOLVED}-tag`,
+    template: '<span>x</span>',
+    standalone: true,
+})
+export class UnresolvedComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "u.component.ts", source, None, None);
+    // Must not crash.
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The unresolved interpolation must not appear inside the `ɵcmp`'s
+    // `selectors:` slot — that's the compiled selector that actually drives
+    // template matching.
+    let cmp_start = result.code.find("ɵɵdefineComponent({").expect("ɵcmp missing");
+    let cmp_section = &result.code[cmp_start..];
+    let cmp_end = cmp_section.find("})").expect("ɵcmp not terminated");
+    let cmp_def = &cmp_section[..cmp_end];
+    assert!(
+        !cmp_def.contains("${UNRESOLVED}-tag"),
+        "Unresolved interpolation must not leak verbatim into ɵcmp.\nɵcmp:\n{cmp_def}"
+    );
+    // And the compiled selector must fall back to the default tag, matching
+    // ngc's behavior when a metadata interpolation can't be resolved.
+    assert!(
+        cmp_def.contains(r#"selectors:[["ng-component"]]"#),
+        "Selector should fall back to `ng-component`.\nɵcmp:\n{cmp_def}"
+    );
+}
+
+// =============================================================================
+// Issue #287: TDZ-safe hoisting of consts referenced by emitted Ivy definitions
+// =============================================================================
+// When `@Component` metadata references a `const` (or other binding) declared
+// *after* the class, the emitted Ivy definition (`ɵcmp` static field) evaluates
+// the providers array eagerly in the class body. Because the const is still in
+// the temporal dead zone at that point, this throws `ReferenceError: Cannot
+// access 'TOKEN' before initialization` at module load.
+//
+// Angular's official compiler hoists such consts above the class declaration.
+// These tests pin that behavior.
+
+/// A `const` referenced by `providers` and declared after the class must be
+/// hoisted above the class so the eagerly-evaluated `ɵɵProvidersFeature` does
+/// not hit the TDZ at class-init time.
+#[test]
+fn component_providers_const_after_class_is_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 1 }] })
+export class TestComponent {}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The const TOKEN must appear before `class TestComponent` in the output
+    // so it is initialized before the static `ɵcmp` field evaluates providers.
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` must be hoisted above `class TestComponent`. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+
+    // Must only appear once: the original must have been deleted from its
+    // original location.
+    let count = result.code.matches("const TOKEN").count();
+    assert_eq!(
+        count, 1,
+        "`const TOKEN` should appear exactly once (original deleted). Got {count}.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `viewProviders` is also evaluated eagerly via `ɵɵProvidersFeature` — consts
+/// it references must be hoisted too.
+#[test]
+fn component_view_providers_const_after_class_is_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'x',
+    template: '',
+    viewProviders: [{ provide: VIEW_TOKEN, useValue: 2 }],
+})
+export class TestComponent {}
+const VIEW_TOKEN = 'view-tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result.code.find("const VIEW_TOKEN").unwrap_or_else(|| {
+        panic!("Expected `const VIEW_TOKEN` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "`const VIEW_TOKEN` must be hoisted above `class TestComponent`. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Multiple distinct providers consts after the class — all referenced by
+/// metadata — must be hoisted, preserving their original relative order.
+#[test]
+fn component_multiple_provider_consts_after_class_are_hoisted_in_order() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'x',
+    template: '',
+    providers: [
+        { provide: TOKEN_A, useValue: 1 },
+        { provide: TOKEN_B, useValue: 2 },
+    ],
+})
+export class TestComponent {}
+const TOKEN_A = 'a';
+const TOKEN_B = 'b';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let a_pos = result.code.find("const TOKEN_A").expect("TOKEN_A missing");
+    let b_pos = result.code.find("const TOKEN_B").expect("TOKEN_B missing");
+    let class_pos = result.code.find("class TestComponent").expect("class missing");
+    assert!(
+        a_pos < class_pos && b_pos < class_pos,
+        "Both consts must be hoisted above the class. \
+         a@{a_pos} b@{b_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        a_pos < b_pos,
+        "Relative order of consts must be preserved (A before B).\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `useFactory` referencing a const declared later still hoists the const,
+/// because the const is captured in the providers array argument which
+/// `ɵɵProvidersFeature` evaluates at class-init time. Note: identifiers
+/// referenced *inside* the factory's arrow-function body fire lazily when the
+/// factory is invoked, so they don't need hoisting — only top-level metadata
+/// references do.
+#[test]
+fn component_use_factory_dependency_const_is_hoisted_when_referenced_at_top_level() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'x',
+    template: '',
+    providers: [{ provide: TOKEN, useFactory: () => 'val', deps: [DEP_TOKEN] }],
+})
+export class TestComponent {}
+const TOKEN = 'tok';
+const DEP_TOKEN = 'dep';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").expect("class missing");
+    let token_pos = result.code.find("const TOKEN").expect("TOKEN missing");
+    let dep_pos = result.code.find("const DEP_TOKEN").expect("DEP_TOKEN missing");
+    assert!(token_pos < class_pos, "TOKEN (provider key) must be hoisted.\nCode:\n{}", result.code);
+    assert!(
+        dep_pos < class_pos,
+        "DEP_TOKEN (deps array entry) must be hoisted.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Two `@Component` classes in the same file that both reference the same
+/// later-declared const must hoist it exactly once, ahead of the earliest
+/// referencing class.
+#[test]
+fn component_shared_provider_const_is_hoisted_once_for_multiple_classes() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'a', template: '', providers: [{ provide: SHARED, useValue: 1 }] })
+export class A {}
+@Component({ selector: 'b', template: '', providers: [{ provide: SHARED, useValue: 2 }] })
+export class B {}
+const SHARED = 'shared';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let count = result.code.matches("const SHARED").count();
+    assert_eq!(count, 1, "`const SHARED` should appear exactly once.\nCode:\n{}", result.code);
+
+    let shared_pos = result.code.find("const SHARED").unwrap();
+    let a_pos = result.code.find("class A").unwrap();
+    let b_pos = result.code.find("class B").unwrap();
+    assert!(
+        shared_pos < a_pos && shared_pos < b_pos,
+        "const must be hoisted above both classes.\nshared@{shared_pos} a@{a_pos} b@{b_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Identifiers referenced *only* inside a factory function body fire when
+/// the factory is invoked, never at class-definition time. They do NOT need
+/// to be hoisted. This guards against over-hoisting that could break code
+/// that relies on the original declaration order (e.g. a const initialized
+/// using values not yet computed at module load).
+#[test]
+fn component_const_referenced_only_inside_factory_body_is_not_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'x',
+    template: '',
+    providers: [{ provide: 'k', useFactory: () => LAZY_VALUE }],
+})
+export class TestComponent {}
+const LAZY_VALUE = 'lazy';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let lazy_pos = result.code.find("const LAZY_VALUE").expect("LAZY_VALUE missing");
+    let class_pos = result.code.find("class TestComponent").expect("class missing");
+    assert!(
+        lazy_pos > class_pos,
+        "Const referenced only inside the factory body should NOT be hoisted.\n\
+         lazy@{lazy_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A const declared *before* the class must NOT be moved — only post-class
+/// declarations need hoisting. The compiler must not pointlessly rewrite
+/// already-valid code.
+#[test]
+fn component_provider_const_before_class_is_not_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const TOKEN = 'tok';
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 1 }] })
+export class TestComponent {}
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The const must still appear once (we did not duplicate it).
+    let count = result.code.matches("const TOKEN").count();
+    assert_eq!(count, 1, "`const TOKEN` should still appear once.\nCode:\n{}", result.code);
+
+    // And it must come before the class (its original position).
+    let token_pos = result.code.find("const TOKEN").unwrap();
+    let class_pos = result.code.find("class TestComponent").unwrap();
+    assert!(token_pos < class_pos, "Order should be preserved.\nCode:\n{}", result.code);
+}
+
+/// A third-party `@Service` decorator (NOT imported from `@angular/core`) must
+/// not trigger hoisting. `Service` is a common name in non-Angular DI
+/// frameworks, and reordering such a class's referenced declarations would
+/// change that class's runtime evaluation order. The hoist filter verifies the
+/// `@Service` import resolves to `@angular/core` before acting. (PR #360 review)
+#[test]
+fn third_party_service_decorator_does_not_hoist_referenced_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Service } from './di';
+@Service(CONFIG)
+export class MyService {}
+const CONFIG = { name: 'svc' };
+"#;
+    let result = transform_angular_file(&allocator, "my.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The const must stay where the author wrote it — after the class.
+    let config_pos = result.code.find("const CONFIG").expect("CONFIG missing");
+    let class_pos = result.code.find("class MyService").expect("class missing");
+    assert!(
+        class_pos < config_pos,
+        "Third-party @Service must NOT hoist `const CONFIG` above the class. \
+         class@{class_pos} config@{config_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// The companion to the above: a genuine `@angular/core` `@Service` whose
+/// metadata references a later-declared const still hoists it, so the
+/// import-aware gate does not regress real Angular services.
+#[test]
+fn angular_core_service_decorator_hoists_referenced_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Service } from '@angular/core';
+@Service({ autoProvided: FLAG })
+export class MyService {}
+const FLAG = false;
+"#;
+    let result = transform_angular_file(&allocator, "my.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let flag_pos = result.code.find("const FLAG").expect("FLAG missing");
+    let class_pos = result.code.find("class MyService").expect("class missing");
+    assert!(
+        flag_pos < class_pos,
+        "@angular/core @Service must hoist `const FLAG` above the class. \
+         flag@{flag_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// When two bindings from the *same*
+/// multi-declarator statement (`const A = 1, B = 2;`) are referenced by
+/// different decorated classes, the hoist plan keys entries by binding name,
+/// producing two `HoistEntry` values that share the same `stmt_start` but
+/// carry different `insert_at` targets. The dedup loop in `collect_hoist_edits`
+/// keeps whichever entry HashMap iteration visits first and drops the other —
+/// so the chosen `insert_at` is nondeterministic, and can land *after* the
+/// earliest referencing class. That leaves the earlier class still inside the
+/// TDZ of the hoisted statement.
+///
+/// Scenario:
+///   * `class A` (decorated) references `B`.
+///   * `class C` (decorated) references `A`.
+///   * Both classes are declared *before* `const A = 1, B = 2;`.
+///
+/// The correct behavior is to hoist the shared statement to *above the
+/// earliest* referencing class (class A here), so both `A` and `B` are
+/// initialized before either decorator runs.
+#[test]
+fn component_shared_multideclarator_const_hoists_above_earliest_referencer() {
+    let allocator = Allocator::default();
+    // `Acomp` references `Bval` in its decorator metadata.
+    // `Ccomp` references `Aval` in its decorator metadata.
+    // The const declaring both `Aval` and `Bval` is declared *after* both
+    // classes, so both must be hoisted above the earliest class (`Acomp`).
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({
+    selector: 'a-comp',
+    template: '',
+    providers: [{ provide: 'k', useValue: Bval }],
+})
+export class Acomp {}
+@Component({
+    selector: 'c-comp',
+    template: '',
+    providers: [{ provide: 'k', useValue: Aval }],
+})
+export class Ccomp {}
+const Aval = 1, Bval = 2;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    // The shared declaration must appear exactly once (original deleted, single
+    // hoisted copy emitted).
+    let const_count = result.code.matches("const Aval").count();
+    assert_eq!(
+        const_count, 1,
+        "`const Aval = 1, Bval = 2;` should appear exactly once. Got {const_count}.\nCode:\n{}",
+        result.code
+    );
+
+    let const_pos = result.code.find("const Aval").expect("`const Aval` must appear in the output");
+    let acomp_pos =
+        result.code.find("class Acomp").expect("`class Acomp` must appear in the output");
+    let ccomp_pos =
+        result.code.find("class Ccomp").expect("`class Ccomp` must appear in the output");
+
+    // The hoisted shared statement must precede BOTH classes — not just the
+    // later one (`Ccomp`). If the dedup logic picks `Ccomp`'s `insert_at`,
+    // the const will land between the two classes, leaving `Acomp` in the
+    // TDZ of `Bval`.
+    assert!(
+        const_pos < acomp_pos,
+        "`const Aval, Bval` must be hoisted above the *earliest* referencer (Acomp). \
+         const@{const_pos} Acomp@{acomp_pos} Ccomp@{ccomp_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        const_pos < ccomp_pos,
+        "`const Aval, Bval` must also be hoisted above Ccomp. \
+         const@{const_pos} Acomp@{acomp_pos} Ccomp@{ccomp_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Guards transitive TDZ deps: when decorator metadata references an
+/// aggregate binding (e.g. `providers: PROVIDERS`) and that aggregate's
+/// initializer transitively references *another* later-declared top-level
+/// binding (`TOKEN`), the hoister must pull both bindings above the class.
+///
+/// Without this, `PROVIDERS` gets moved above the class but `TOKEN` stays
+/// below, so `PROVIDERS`'s own initializer throws `ReferenceError: Cannot
+/// access 'TOKEN' before initialization` at module evaluation — strictly
+/// worse than before the hoist.
+#[test]
+fn component_provider_aggregate_const_pulls_in_transitive_tdz_dep() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: PROVIDERS })
+export class TestComponent {}
+const PROVIDERS = [{ provide: TOKEN, useValue: 1 }];
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let providers_pos = result.code.find("const PROVIDERS").unwrap_or_else(|| {
+        panic!("Expected `const PROVIDERS` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    // Both must be hoisted above the class.
+    assert!(
+        providers_pos < class_pos,
+        "`const PROVIDERS` must be hoisted above the class. \
+         providers@{providers_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (transitively referenced by PROVIDERS' initializer) \
+         must also be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+
+    // And `TOKEN` must come before `PROVIDERS` so PROVIDERS' initializer can
+    // actually read it at module load.
+    assert!(
+        token_pos < providers_pos,
+        "`const TOKEN` must precede `const PROVIDERS` in the hoisted region. \
+         token@{token_pos} providers@{providers_pos}\nCode:\n{}",
+        result.code
+    );
+
+    // Neither should be duplicated.
+    assert_eq!(
+        result.code.matches("const PROVIDERS").count(),
+        1,
+        "`const PROVIDERS` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// When `providers: PROVIDERS` references a `const PROVIDERS = makeProviders()`
+/// whose initializer *calls* a later-declared `function makeProviders()`, and
+/// that function reads another later-declared `const TOKEN`, the hoister must
+/// also pull `TOKEN` above the class — otherwise the hoisted `PROVIDERS`
+/// initializer invokes `makeProviders()` before `TOKEN` is initialized and
+/// throws `ReferenceError: Cannot access 'TOKEN' before initialization`.
+#[test]
+fn component_provider_const_via_function_call_pulls_in_transitive_tdz_dep() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: PROVIDERS })
+class TestComponent {}
+const TOKEN = 'tok';
+const PROVIDERS = makeProviders();
+function makeProviders() { return [{ provide: TOKEN }]; }
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let providers_pos = result.code.find("const PROVIDERS").unwrap_or_else(|| {
+        panic!("Expected `const PROVIDERS` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    // Both must be hoisted above the class.
+    assert!(
+        providers_pos < class_pos,
+        "`const PROVIDERS` must be hoisted above the class. \
+         providers@{providers_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (transitively read by makeProviders() at module init) \
+         must also be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+
+    // And `TOKEN` must come before `PROVIDERS` so `makeProviders()` can read it
+    // when the hoisted `PROVIDERS` initializer evaluates at module load.
+    assert!(
+        token_pos < providers_pos,
+        "`const TOKEN` must precede `const PROVIDERS` in the hoisted region. \
+         token@{token_pos} providers@{providers_pos}\nCode:\n{}",
+        result.code
+    );
+
+    // Neither should be duplicated.
+    assert_eq!(
+        result.code.matches("const PROVIDERS").count(),
+        1,
+        "`const PROVIDERS` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `class.body.span.end` is the exclusive byte offset one past the closing
+/// `}`. A `VariableDeclaration` whose statement starts at *exactly* that
+/// offset (no whitespace between `}` and `const`) is positioned immediately
+/// after the class body and is still in the TDZ when the class's static
+/// fields evaluate. The hoist must move it; using `<=` for the
+/// "before-class" check accidentally skips this boundary case.
+#[test]
+fn component_provider_const_immediately_after_class_brace_is_hoisted() {
+    let allocator = Allocator::default();
+    // No whitespace at all between `}` and `const` — `const` starts at
+    // exactly `class.body.span.end`.
+    let source = "import { Component } from '@angular/core';\n\
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 1 }] })\n\
+export class TestComponent {}const TOKEN = 'tok';\n";
+
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "Boundary-case `const TOKEN` (decl at exactly class.body.span.end) must \
+         still be hoisted above the class. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once (original deleted).\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A top-level function referenced from decorator metadata as a *value*
+/// (e.g. `useFactory: makeFactory`) is NOT called at class-definition time —
+/// Angular's injector calls it later, when the provider is actually resolved.
+/// So later-declared bindings reachable only through that function's body
+/// must NOT be hoisted. Hoisting them would create a NEW TDZ that didn't
+/// exist in the original source.
+#[test]
+fn component_provider_useFactory_function_value_does_not_hoist_body_deps() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useFactory: makeFactory }] })
+class TestComponent {}
+function makeFactory() { return TOKEN; }
+const TOKEN = TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos > class_pos,
+        "`const TOKEN` must NOT be hoisted — `makeFactory` is stored as a value, not \
+         called at module load. Hoisting `TOKEN` above the class would TDZ on \
+         `TestComponent`. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `Expression::ChainExpression` (optional chaining, `TOKEN?.id` or `f?.()`)
+/// must contribute identifier references to the decorator-metadata symbol
+/// scan, so that the referenced top-level binding gets hoisted.
+#[test]
+fn component_provider_optional_chain_token_is_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN?.id, useValue: 1 }] })
+class TestComponent {}
+const TOKEN = { id: 'tok' };
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (referenced via `TOKEN?.id` in providers) must be \
+         hoisted above the class. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Top-level destructuring patterns must be indexed: `const { TOKEN } = X;`
+/// binds `TOKEN`, and decorator metadata referencing `TOKEN` must hoist that
+/// declaration above the class.
+#[test]
+fn component_provider_destructured_top_level_token_is_hoisted() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const TOKENS = { TOKEN: 'tok' };
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 1 }] })
+class TestComponent {}
+const { TOKEN } = TOKENS;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result.code.find("const { TOKEN }").unwrap_or_else(|| {
+        panic!("Expected `const {{ TOKEN }}` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "`const {{ TOKEN }}` (destructured from `TOKENS`) must be hoisted \
+         above the class. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const { TOKEN }").count(),
+        1,
+        "`const {{ TOKEN }}` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A multi-declarator `const TOKEN = 'tok', BACKREF = TestComponent;`
+/// statement is referenced (via `TOKEN`) in the decorator metadata. The
+/// statement's *other* declarator initializer references `TestComponent`
+/// itself, which lives below. Hoisting the whole statement above the class
+/// would put `BACKREF = TestComponent` ahead of `class TestComponent`,
+/// introducing a *new* TDZ on the class.
+///
+/// The safe-skip guard refuses to hoist a statement when any of its
+/// initializer symbols resolves to a top-level class declared at position
+/// `>= effective_start` of the class being protected.
+#[test]
+fn component_provider_multi_declarator_with_class_self_ref_skips_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 1 }] })
+class TestComponent {}
+const TOKEN = 'tok', BACKREF = TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    // The original `const TOKEN = 'tok', BACKREF = TestComponent;` statement
+    // must remain in its original position (below the class). It must NOT be
+    // duplicated/hoisted above the class.
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` must not be duplicated (no hoist + keep). \
+         Hoisting this multi-declarator statement would put \
+         `BACKREF = TestComponent` ahead of the class.\nCode:\n{}",
+        result.code
+    );
+    if let Some(token_pos) = result.code.find("const TOKEN") {
+        assert!(
+            token_pos > class_pos,
+            "`const TOKEN ... BACKREF = TestComponent` must NOT be hoisted \
+             above the class — that would introduce a new TDZ on `TestComponent`. \
+             token@{token_pos} class@{class_pos}\nCode:\n{}",
+            result.code
+        );
+    }
+}
+
+/// `providers: (() => [{ provide: TOKEN, useValue: 1 }])()` — the IIFE
+/// is invoked *eagerly* at class-definition time, so the references inside
+/// the arrow body must be treated as eager. The general lazy-bodies rule
+/// (skip arrow/function bodies) doesn't apply when the function is its own
+/// callee.
+#[test]
+fn component_provider_iife_metadata_hoists_inner_token() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: (() => [{ provide: TOKEN, useValue: 1 }])() })
+class TestComponent {}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (referenced inside an IIFE in `providers`) must be \
+         hoisted above the class — the IIFE runs eagerly. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `foo` is referenced as a value (`useFactory: foo`) in TestComponent's
+/// decorator metadata — NOT called there. The global `eagerly_called`
+/// closure adds `foo` because *another* top-level statement
+/// (`const X = foo()`) calls it. The BFS for TestComponent must not chase
+/// `foo`'s body just because some unrelated module-level statement happens
+/// to invoke `foo`. Otherwise it pulls in `TOKEN` and hoists
+/// `const TOKEN = TestComponent;` above the class → new TDZ on the class.
+///
+/// Per-class eagerly_called scoping (seeded only from THIS class's
+/// `decorator_called`) prevents this leak.
+#[test]
+fn component_provider_useFactory_value_does_not_chase_global_eager_caller() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+function foo() { return TOKEN; }
+const X = foo();
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useFactory: foo }] })
+class TestComponent {}
+const TOKEN = TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    // `const TOKEN = TestComponent;` must NOT be hoisted above the class —
+    // that would put `TestComponent` reference ahead of its own declaration.
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` must not be duplicated.\nCode:\n{}",
+        result.code
+    );
+    if let Some(token_pos) = result.code.find("const TOKEN") {
+        assert!(
+            token_pos > class_pos,
+            "`const TOKEN = TestComponent` must NOT be hoisted above the class \
+             — that would introduce a new TDZ on `TestComponent`. \
+             `foo` is referenced as a value in `useFactory: foo`, not called \
+             by this class's decorator metadata. \
+             token@{token_pos} class@{class_pos}\nCode:\n{}",
+            result.code
+        );
+    }
+}
+
+/// When a hoisted initializer eagerly calls a top-level function whose
+/// *parameter default expression* reads a later-declared binding, the
+/// param-default reference is just as TDZ-relevant as a body reference:
+/// defaults evaluate at call time, before the function body runs.
+///
+/// Here, the BFS sees `PROVIDERS = makeProviders()`, marks `makeProviders`
+/// as eagerly called, and must chase BOTH `makeProviders`'s body refs AND
+/// the refs inside its parameter default `token = TOKEN`. Otherwise `TOKEN`
+/// is left below the class and the hoisted `const PROVIDERS = makeProviders()`
+/// throws `ReferenceError: Cannot access 'TOKEN' before initialization` when
+/// the parameter default fires.
+#[test]
+fn component_provider_eager_call_chases_param_default_refs() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: PROVIDERS })
+class TestComponent {}
+const PROVIDERS = makeProviders();
+function makeProviders(token = TOKEN) { return [{ provide: token }]; }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let providers_pos = result.code.find("const PROVIDERS").unwrap_or_else(|| {
+        panic!("Expected `const PROVIDERS` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read by makeProviders's parameter default at call time) \
+         must be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        providers_pos < class_pos,
+        "`const PROVIDERS` must be hoisted above the class. \
+         providers@{providers_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos < providers_pos,
+        "`const TOKEN` must precede `const PROVIDERS` so the parameter default \
+         `token = TOKEN` can read it when `makeProviders()` runs at module init. \
+         token@{token_pos} providers@{providers_pos}\nCode:\n{}",
+        result.code
+    );
+
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const PROVIDERS").count(),
+        1,
+        "`const PROVIDERS` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A destructuring binding `const { TOKEN = FALLBACK } = {}` introduces
+/// `TOKEN` (used in decorator metadata) but its initializer is `{}`, so the
+/// `FALLBACK` default fires when the destructuring statement evaluates.
+/// The hoister must chase defaults inside the binding pattern, otherwise
+/// `FALLBACK` stays below the class and the hoisted destructuring throws
+/// `ReferenceError: Cannot access 'FALLBACK' before initialization` at
+/// runtime.
+#[test]
+fn component_destructured_default_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: TOKEN, useValue: 0 }] })
+class TestComponent {}
+const { TOKEN = FALLBACK } = {};
+const FALLBACK = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let fallback_pos = result.code.find("const FALLBACK").unwrap_or_else(|| {
+        panic!("Expected `const FALLBACK` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result.code.find("const { TOKEN").unwrap_or_else(|| {
+        panic!("Expected `const {{ TOKEN ...` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        fallback_pos < token_pos,
+        "`const FALLBACK` must precede `const {{ TOKEN = FALLBACK }} = {{}}` so the \
+         destructuring default can read it. fallback@{fallback_pos} token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos < class_pos,
+        "`const {{ TOKEN ... }}` must be hoisted above the class. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        fallback_pos < class_pos,
+        "`const FALLBACK` must also be hoisted above the class. \
+         fallback@{fallback_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+
+    assert_eq!(
+        result.code.matches("const FALLBACK").count(),
+        1,
+        "`const FALLBACK` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const { TOKEN").count(),
+        1,
+        "destructuring statement should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `provideThing` is eagerly called from the decorator. Its body contains an
+/// IIFE `(() => [TOKEN])()` whose body executes at the call site, so the
+/// `TOKEN` reference is TDZ-relevant. `FunctionBodyIdentVisitor` must walk
+/// IIFE callee bodies the same way `collect_expr_symbols` does, or `TOKEN`
+/// is left below the class and the eagerly-called function throws at module
+/// init.
+#[test]
+fn component_eager_fn_body_iife_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [provideThing()] })
+class TestComponent {}
+function provideThing() { return (() => [TOKEN])(); }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside an IIFE in the body of an eagerly-called \
+         function) must be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `make` is eagerly invoked from the decorator. Inside `make`, a *local*
+/// function declaration `inner` is defined and immediately called. `inner`'s
+/// body reads a later-declared top-level `const TOKEN`, so `TOKEN` is
+/// TDZ-relevant: at module load, the hoisted decorator-eval runs
+/// `make() → inner() → TOKEN` before the const initializer fires.
+///
+/// `FunctionBodyIdentVisitor::visit_function` must descend into named nested
+/// `Function` nodes so the locally-declared `inner` contributes its body
+/// references (and its own callees) to the enclosing function's eager
+/// surface. Without that, the BFS never observes that `make()` transitively
+/// reads `TOKEN` and the const stays below the class.
+#[test]
+fn component_eager_fn_body_local_fn_decl_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() {
+  function inner() { return TOKEN; }
+  return inner();
+}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside a locally-declared function called from \
+         the body of an eagerly-called function) must be hoisted above the \
+         class to avoid TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `make` is eagerly invoked from the decorator. Inside `make`, a *local*
+/// arrow expression is assigned to a `const inner` binding and then
+/// immediately called via `inner()`. `inner`'s body reads a later-declared
+/// top-level `const TOKEN`, so `TOKEN` is TDZ-relevant: at module load, the
+/// hoisted decorator-eval runs `make() → inner() → TOKEN` before the const
+/// initializer fires.
+///
+/// Unlike a *named* nested function (handled by walking through
+/// `visit_function`), arrows assigned to local bindings need a separate
+/// indexing step: `FunctionBodyIdentVisitor` must record arrow-valued local
+/// bindings inside the function body it walks, then fold those bodies in at
+/// each call site so calls to local arrows transitively contribute their
+/// reads to the enclosing eager surface.
+#[test]
+fn component_eager_fn_body_local_arrow_binding_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() {
+  const inner = () => TOKEN;
+  return inner();
+}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside a local arrow binding called from the \
+         body of an eagerly-called function) must be hoisted above the class \
+         to avoid TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Sibling of `component_eager_fn_body_local_arrow_binding_chases_late_const`
+/// that locks in laziness: when a local arrow binding is stored in a provider
+/// (`useFactory: lazy`) but is NEVER called inside the enclosing function's
+/// body, the arrow's body refs must NOT force a hoist via the local-arrow
+/// indexing. The hoist might still happen because other analysis paths treat
+/// the provider shape as eager, but the transform must at minimum not error.
+#[test]
+fn component_eager_fn_body_lazy_local_arrow_does_not_force_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() {
+  const lazy = () => TOKEN;
+  return [{ provide: 'tok', useFactory: lazy }];
+}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+}
+
+/// Laziness sibling for *named* nested function declarations: inside an
+/// eagerly-called `make()`, a locally-declared `function unused()` reads
+/// `TOKEN`, but the function is never invoked. `make()` returns `[]`, so no
+/// eager read of `TOKEN` actually happens at decorator-eval time. The
+/// transform must NOT fold `unused`'s body into the eager surface — doing so
+/// would falsely hoist `TOKEN` above the class even though no value-passed
+/// reference fires.
+///
+/// The original source places `const TOKEN` after the class. With correct
+/// laziness, the transform leaves that ordering intact.
+#[test]
+fn component_eager_fn_body_uncalled_nested_fn_decl_does_not_force_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() {
+  function unused() { return TOKEN; }
+  return [];
+}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < token_pos,
+        "`const TOKEN` must NOT be hoisted: `unused` is declared but never \
+         called, so its body refs are lazy. class@{class_pos} \
+         token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// JS function declarations are hoisted inside their enclosing scope, so a
+/// call to `inner()` can appear in source *before* the `function inner()`
+/// declaration and still resolve at runtime. The visitor walks in source
+/// order, so it sees `return inner();` before it indexes `inner`. The
+/// fold-at-call-site path must therefore pre-index nested function
+/// declarations within each function body / block before walking the
+/// statements — otherwise the call site cannot resolve `inner` and `TOKEN`
+/// stays unhoisted.
+#[test]
+fn component_eager_fn_body_hoisted_fn_decl_call_still_chases() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() {
+  return inner();
+  function inner() { return TOKEN; }
+}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read by a hoisted nested function declaration called \
+         from above its source position inside an eagerly-called function) \
+         must be hoisted above the class to avoid TDZ. token@{token_pos} \
+         class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// The safe-skip guard must refuse to hoist a `var TOKEN = make()` initializer
+/// when the eagerly-called `make()`'s body reads a later-declared top-level
+/// class. Without the fix, hoisting `var TOKEN = make()` above
+/// `class TestComponent` invents a fresh TDZ on the class: `make()` runs at
+/// the hoisted initializer's evaluation time and reads `TestComponent` before
+/// the class binding is initialized.
+///
+/// The user's existing TDZ on `TOKEN` is NOT our problem to fix — we must
+/// just not introduce a NEW class TDZ. So we only assert that `class
+/// TestComponent` still precedes `var TOKEN`.
+#[test]
+fn component_eager_fn_body_class_ref_blocks_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class TestComponent {}
+var TOKEN = make();
+function make() { return TestComponent; }
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < token_pos,
+        "`var TOKEN = make()` must NOT be hoisted above the class because \
+         `make()`'s body reads `TestComponent`. Hoisting would invent a fresh \
+         class TDZ. class@{class_pos} token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("var TOKEN").count(),
+        1,
+        "`var TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A decorator-metadata `AssignmentExpression` (`(cached = TOKEN)`) carries
+/// identifier references on both its `left` and `right`. The
+/// `collect_expr_symbols` walker must not silently drop these — otherwise
+/// `TOKEN` never enters the BFS and stays declared below the class, while
+/// the class's emitted Ivy definition reads `TOKEN` eagerly.
+#[test]
+fn component_assignment_expression_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+let cached;
+@Component({ selector: 'x', template: '', providers: [(cached = TOKEN)] })
+class TestComponent {}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read by an AssignmentExpression in decorator \
+         metadata) must be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Transitive dependency cascade. The BFS pops `TOKEN` whose
+/// only directly-called function is `make()`; the closure of
+/// `init_called_symbols` brings in nothing class-relevant from `make`'s
+/// body (it just calls `BACKREF` whose binding is a non-function const).
+/// So the safe-skip guard at `TOKEN`'s site passes — `TOKEN`'s statement
+/// is planned. The BFS then pushes `make`'s body refs onto the worklist,
+/// pops `BACKREF`, and *its* guard detects `BACKREF = TestComponent` reading
+/// a later class — so `BACKREF` is skipped. But `TOKEN`'s plan entry is
+/// still there, leaving the runtime broken: hoisted `var TOKEN = make()`
+/// invokes `make()` which reads not-yet-initialized `BACKREF`, which the
+/// guard correctly identified would read `TestComponent` if it ran.
+///
+/// Required: when a dependency is guard-skipped, every transitively
+/// dependent already-planned statement must be un-planned too. Without
+/// the fix, `var TOKEN` lands above `class TestComponent` in the output.
+#[test]
+fn component_eager_fn_body_transitive_class_ref_unplans_chain() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class TestComponent {}
+var TOKEN = make();
+function make() { return BACKREF; }
+const BACKREF = TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+    let backref_pos = result.code.find("const BACKREF").unwrap_or_else(|| {
+        panic!("Expected `const BACKREF` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        class_pos < token_pos,
+        "`var TOKEN = make()` must NOT be hoisted above the class because \
+         its transitive dep `BACKREF` reads `TestComponent`. class@{class_pos} \
+         token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        class_pos < backref_pos,
+        "`const BACKREF = TestComponent` must NOT be hoisted above the class. \
+         class@{class_pos} backref@{backref_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Function-valued `const`/`let` bindings hide eager class
+/// reads. The BFS pops `TOKEN` whose `init_called_symbols = {make}`.
+/// `make` is a `const` arrow, not a function decl — so it's missing from
+/// `fn_body_*` maps. The closure expansion finds nothing; the guard
+/// passes; `TOKEN` gets hoisted above the class. At runtime: hoisted
+/// `make()` reads `TestComponent` in TDZ.
+///
+/// Required: top-level `const`/`let`/`var` bindings whose initializer is
+/// *directly* an `ArrowFunctionExpression` / `FunctionExpression` (after
+/// peeling parens / TS wrappers) must be indexed into `fn_body_*` maps
+/// keyed by the binding symbol, so the existing safe-skip guard catches
+/// the transitive class read.
+#[test]
+fn component_eager_fn_value_const_arrow_class_ref_blocks_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class TestComponent {}
+var TOKEN = make();
+const make = () => TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < token_pos,
+        "`var TOKEN = make()` must NOT be hoisted above the class because \
+         the `const make = () => TestComponent` arrow body reads the class. \
+         class@{class_pos} token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Member-call shapes `fn.call(...)` / `fn.apply(...)` aren't
+/// recognized as eager calls. `record_direct_callee` peels parens / TS
+/// wrappers but stops at `StaticMemberExpression`, so `make.call(null)`
+/// records nothing in `called`. The guard's `stmt_called` is empty, the
+/// transitive class-ref check never inspects `make`'s body, and `TOKEN`
+/// gets hoisted above the class. At runtime: hoisted `make.call(null)`
+/// reads `TestComponent` in TDZ.
+///
+/// Required: extend `record_direct_callee` (or a wrapper) to recognize
+/// the static call shapes `fn.call(...)`, `fn.apply(...)`, and
+/// `fn.bind(...)()` on top-level function symbols.
+#[test]
+fn component_eager_member_call_class_ref_blocks_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class TestComponent {}
+var TOKEN = make.call(null);
+function make() { return TestComponent; }
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < token_pos,
+        "`var TOKEN = make.call(null)` must NOT be hoisted above the class \
+         because `make()`'s body reads `TestComponent`. class@{class_pos} \
+         token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Cross-class `insert_at` ordering. Two
+/// `@Component`-decorated classes (C1 first, C2 second) with an
+/// undecorated `class Mid` between them. C1 plans `var TOKEN = make()` at
+/// `insert_at = pos_C1`; its BFS chases `make`'s body to `X` but the
+/// safe-skip guard rejects `X` for C1 because `X = Mid` reads class `Mid`
+/// which is declared *after* C1. C2's BFS reaches `X` independently (via
+/// `useValue: X`) and the safe-skip passes for C2 (Mid is declared
+/// *before* C2). So `X` lands in the plan at `insert_at = pos_C2 >
+/// pos_C1`.
+///
+/// The cascade un-planning loop previously treated "X is in plan" as a
+/// safe dep — but X's `insert_at` is *later* than TOKEN's, so at runtime
+/// hoisted TOKEN runs before hoisted X and `make()` TDZ-reads `X`. The
+/// fix changes the cascade check to "dep planned at an `insert_at` ≤ S's
+/// `insert_at`" (drop S otherwise).
+///
+/// We assert `class C1` precedes `var TOKEN = make()`: TOKEN must NOT be
+/// hoisted because its dep X can't be hoisted to the same insertion
+/// position. (TOKEN's user-authored TDZ on X persists — not our problem;
+/// we just must not introduce a fresh hoist-induced TDZ between the two
+/// hoisted statements.)
+#[test]
+fn component_cascade_cross_class_insert_order_unplans_dependent() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'a', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class C1 {}
+var TOKEN = make();
+function make() { return X; }
+class Mid {}
+@Component({ selector: 'b', template: '', providers: [{ provide: 'y', useValue: X }] })
+class C2 {}
+const X = Mid;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let c1_pos = result
+        .code
+        .find("class C1")
+        .unwrap_or_else(|| panic!("Expected `class C1` to be present.\nCode:\n{}", result.code));
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        c1_pos < token_pos,
+        "`var TOKEN = make()` must NOT be hoisted above `class C1` because \
+         its transitive dep `X` is only planned at `insert_at` for \
+         `class C2`, which is *later* in source. Hoisting TOKEN above C1 \
+         leaves it running before the hoisted X lands. c1@{c1_pos} \
+         token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Per-S eager-call set. Class A uses
+/// `makeRef` as a value (`useFactory: makeRef`); class B *calls* `make()`
+/// (`providers: [make()]`). The cascade pass currently uses
+/// `combined_eagerly_called` (the union across all classes) so `make` —
+/// only eagerly invoked from B — over-expands A's `makeRef` statement
+/// closure through `make`'s body refs. A's safe hoist gets dropped even
+/// though A never calls `make`.
+///
+/// With the fix, the cascade computes a per-S eager-call set from
+/// `info.init_called_symbols` closed under `fn_body_called_symbols`. A's
+/// statement `const makeRef = make;` calls nothing, so its eager set is
+/// empty and the closure doesn't chase `make`'s body. A's `makeRef` hoist
+/// survives.
+#[test]
+fn component_cascade_value_only_ref_does_not_over_expand() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'a', template: '', providers: [{ provide: 'x', useFactory: makeRef }] })
+class A {}
+@Component({ selector: 'b', template: '', providers: [make()] })
+class B {}
+const makeRef = make;
+function make() { return BACKREF; }
+const BACKREF = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let a_pos = result
+        .code
+        .find("class A")
+        .unwrap_or_else(|| panic!("Expected `class A` to be present.\nCode:\n{}", result.code));
+    let make_ref_pos = result.code.find("const makeRef").unwrap_or_else(|| {
+        panic!("Expected `const makeRef` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        make_ref_pos < a_pos,
+        "`const makeRef = make;` must be hoisted above `class A` because A \
+         only references `makeRef` as a value — A never *calls* `make`, so \
+         `make`'s body refs are irrelevant to A's safe-skip. The cascade \
+         must compute a per-S eager-call set so `make`'s eager evaluation \
+         from class B doesn't bleed into A's closure. makeRef@{make_ref_pos} \
+         a@{a_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Multi-declarator function-valued bindings.
+/// `index_fn_valued_binding` currently only runs when
+/// `decl.declarations.len() == 1`. The shape
+/// `const make = () => TestComponent, other = 0;` skips indexing, so
+/// `make`'s arrow body is never visible to the safe-skip guard. An eager
+/// caller (`var TOKEN = make()`) then hoists above the class and TDZ-reads
+/// `TestComponent` at runtime.
+///
+/// The fix lifts the indexing into the per-declarator loop so each
+/// declarator with a plain identifier binding and a direct arrow/function
+/// initializer gets indexed regardless of how many siblings share the
+/// statement. Assert `class TestComponent` precedes `var TOKEN`.
+#[test]
+fn component_multi_declarator_fn_valued_binding_blocks_caller_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: [{ provide: 'x', useValue: TOKEN }] })
+class TestComponent {}
+var TOKEN = make();
+const make = () => TestComponent, other = 0;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let token_pos = result
+        .code
+        .find("var TOKEN")
+        .unwrap_or_else(|| panic!("Expected `var TOKEN` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < token_pos,
+        "`var TOKEN = make()` must NOT be hoisted above the class because \
+         the multi-declarator binding `const make = () => TestComponent, \
+         other = 0;` declares `make` whose arrow body reads `TestComponent`. \
+         class@{class_pos} token@{token_pos}\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A top-level `const make = () => DEP`
+/// populates BOTH `symbol_to_stmt[make]` (binding) AND
+/// `fn_body_symbol_refs[make]` (because `index_fn_valued_binding` indexes
+/// arrow/function-valued bindings as if they were function declarations).
+/// When the BFS pops `make` and `eagerly_called.contains(&make)` (because
+/// decorator metadata called `make()`), the `if let Some(&stmt_start) =
+/// symbol_to_stmt.get(&make)` branch fires first and plans `make`'s
+/// statement — then the `else if eagerly_called.contains(&symbol)` body-
+/// chase NEVER runs. Result: `TOKEN`, which `make`'s arrow body reads, is
+/// never pushed onto the worklist and stays declared below the class. At
+/// runtime, hoisted `makeProviders()` reads `TOKEN` in TDZ.
+///
+/// Required: when the BFS pops a symbol that has BOTH a `symbol_to_stmt`
+/// entry AND a `fn_body_symbol_refs` entry, AND is in `eagerly_called`,
+/// the binding-planning branch must ALSO chase the function body refs —
+/// the symbol acts as both a binding AND a function.
+///
+/// Assert: `const TOKEN` appears before `const makeProviders` in output,
+/// and `const makeProviders` appears before `class TestComponent` — the
+/// chase must reach `TOKEN` so it gets hoisted too.
+#[test]
+fn component_eager_fn_valued_const_chases_body_refs() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: makeProviders() })
+class TestComponent {}
+const makeProviders = () => [{ provide: TOKEN, useValue: 0 }];
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let make_pos = result.code.find("const makeProviders").unwrap_or_else(|| {
+        panic!("Expected `const makeProviders` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < make_pos,
+        "`const TOKEN` (read inside `makeProviders`'s arrow body which is \
+         eagerly invoked by decorator metadata) must be hoisted above \
+         `const makeProviders`. token@{token_pos} make@{make_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        make_pos < class_pos,
+        "`const makeProviders` must be hoisted above `class TestComponent`. \
+         make@{make_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Locks in symmetric per-stmt eager-call
+/// reasoning between the cascade un-planning pass and `topological_order`.
+/// The cascade was changed to compute a per-S `stmt_called` (closure of
+/// `init_called_symbols` under `fn_body_called_symbols`); the topo sort
+/// was still passing the global `combined_eagerly_called`. The asymmetry
+/// can in principle create spurious dependency edges between planned
+/// statements; in practice the cycle-break path is contrived. This test
+/// is a regression guardrail: build a case where class A only references
+/// `makeRef = make` as a value and class B eagerly calls `make()`. The
+/// cascade decides A's hoist is safe; the topological sort must emit A's
+/// statement in an order consistent with the cascade's view (i.e. not
+/// reorder or drop it).
+///
+/// Locks in symmetric per-stmt eager-call reasoning between cascade and
+/// topological_order.
+#[test]
+fn component_topo_uses_per_stmt_eager_set() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'a', template: '', providers: [{ provide: 'x', useFactory: makeRef }] })
+class A {}
+@Component({ selector: 'b', template: '', providers: [make()] })
+class B {}
+const makeRef = make;
+function make() { return BACKREF; }
+const BACKREF = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let make_ref_pos = result.code.find("const makeRef").unwrap_or_else(|| {
+        panic!("Expected `const makeRef` to be present.\nCode:\n{}", result.code)
+    });
+    let a_pos = result
+        .code
+        .find("class A")
+        .unwrap_or_else(|| panic!("Expected `class A` to be present.\nCode:\n{}", result.code));
+
+    // The cascade pass already proves A is safe to hoist; symmetric topo
+    // must agree — `const makeRef` must precede `class A`.
+    assert!(
+        make_ref_pos < a_pos,
+        "`const makeRef = make;` must be hoisted above `class A` — A only \
+         references `makeRef` as a value. The topological sort must reason \
+         against the same per-stmt eager-call set the cascade used, so the \
+         global `make` eager-call (from class B) doesn't introduce a \
+         spurious edge that reorders A's hoist. makeRef@{make_ref_pos} \
+         a@{a_pos}\nCode:\n{}",
+        result.code
+    );
+    // Basic ordering invariant: a single `const makeRef` survives.
+    assert_eq!(
+        result.code.matches("const makeRef").count(),
+        1,
+        "`const makeRef` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// A function-valued `const`
+/// binding whose ARROW BODY reads a top-level class can escape BOTH the
+/// safe-skip guard AND the cascade un-planning when the binding ITSELF
+/// is eagerly called from a decorator.
+///
+/// Trace:
+/// - `decorator_called = {make}`. Per-class `eagerly_called = {make}`.
+/// - BFS pops `make`. `symbol_to_stmt[make]` is present → enter the
+///   binding branch.
+/// - Safe-skip guard inspects `info.init_symbols` (refs in the
+///   *initializer expression*). For `const make = () => TestComponent;`,
+///   the initializer is an `ArrowFunctionExpression` — `collect_expr_symbols`
+///   treats arrow bodies as lazy, so `init_symbols = {}` and
+///   `init_called_symbols = {}`. Guard passes.
+/// - Plan adds `const make = () => TestComponent;`. The Round-5 fix then
+///   chases `fn_body_symbol_refs[make] = {TestComponent}`, pushing
+///   `TestComponent` onto the worklist. BFS pops `TestComponent` — it's
+///   a class, not a binding, not in `eagerly_called` — falls through.
+///
+/// Result: `make` is hoisted above the class. At Ivy decorator-eval time,
+/// hoisted `make()` reads `TestComponent` in TDZ → ReferenceError.
+///
+/// Fix: the safe-skip guard must also include the body refs of every
+/// fn-valued binding declared by this statement whose binding symbol is
+/// in the per-class `eagerly_called` set — those body refs fire when the
+/// binding is invoked at module load.
+///
+/// Assert: `class TestComponent` precedes `const make` in the output —
+/// `make`'s hoisting must be blocked because its body reads
+/// `TestComponent`.
+#[test]
+fn component_eager_fn_valued_const_reading_class_blocks_hoist() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+const make = () => TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let make_pos = result
+        .code
+        .find("const make")
+        .unwrap_or_else(|| panic!("Expected `const make` to be present.\nCode:\n{}", result.code));
+
+    assert!(
+        class_pos < make_pos,
+        "`class TestComponent` must precede `const make` — `make`'s arrow \
+         body reads `TestComponent`, and the decorator eagerly invokes \
+         `make()`. Hoisting `make` above the class introduces a fresh TDZ \
+         on `TestComponent`. class@{class_pos} make@{make_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const make").count(),
+        1,
+        "`const make` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Round 6 transitive variant: the cascade un-planning loop must also
+/// consult fn-valued bindings' body refs.
+///
+/// Trace:
+/// - `@Component({ providers: make() }) class TestComponent {}`.
+/// - `const make = () => BACKREF;` — guard passes (arrow body lazy),
+///   `make` planned.
+/// - Body chase pushes `BACKREF`. BFS pops `BACKREF`. Its stmt's
+///   `init_symbols = {TestComponent}` → safe-skip blocks. `BACKREF` is
+///   NOT planned.
+/// - Cascade pass for `make`: `info.init_symbols = {}` (arrow body lazy),
+///   so `expand_through_functions(init_symbols={}, …)` returns empty
+///   closure. The cascade never sees that `make`'s body reads `BACKREF`,
+///   which isn't planned → cascade doesn't drop `make`.
+/// - Result: `make` is hoisted above the class, `BACKREF` stays below;
+///   at runtime hoisted `make()` reads `BACKREF` in TDZ.
+///
+/// Fix: the cascade un-planning loop's closure seed must include each
+/// fn-valued binding's symbol (so `expand_through_functions` descends
+/// into its body), gated by `combined_eagerly_called` — only when the
+/// binding's symbol is actually eagerly invoked somewhere.
+///
+/// Assert: `class TestComponent` precedes BOTH `const make` and
+/// `const BACKREF` in the output — neither got hoisted.
+#[test]
+fn component_eager_fn_valued_const_transitive_class_ref_unplans() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+const make = () => BACKREF;
+const BACKREF = TestComponent;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+    let make_pos = result
+        .code
+        .find("const make")
+        .unwrap_or_else(|| panic!("Expected `const make` to be present.\nCode:\n{}", result.code));
+    let backref_pos = result.code.find("const BACKREF").unwrap_or_else(|| {
+        panic!("Expected `const BACKREF` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        class_pos < make_pos,
+        "`class TestComponent` must precede `const make` — `make`'s arrow \
+         body reads `BACKREF` which transitively reads `TestComponent`. \
+         Hoisting `make` introduces a TDZ. class@{class_pos} \
+         make@{make_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        class_pos < backref_pos,
+        "`class TestComponent` must precede `const BACKREF` — `BACKREF` \
+         directly reads `TestComponent`. The original guard already \
+         blocks `BACKREF`'s hoist; this assertion locks that in. \
+         class@{class_pos} backref@{backref_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const make").count(),
+        1,
+        "`const make` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const BACKREF").count(),
+        1,
+        "`const BACKREF` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Top-level class declarations' constructor
+/// bodies are NOT indexed into `fn_body_symbol_refs` /
+/// `fn_body_called_symbols`. When a hoisted initializer eagerly invokes
+/// `new ClassName()`, the constructor body runs at module load — and any
+/// later-declared top-level binding it reads will TDZ-throw.
+///
+/// Trace:
+/// - `@Component({ providers: PROVIDERS }) class TestComponent {}`
+/// - `class S { constructor() { TOKEN; } }` declared above.
+/// - `const PROVIDERS = [new S()];` below the decorated class.
+/// - `const TOKEN = 1;` below `PROVIDERS`.
+///
+/// BFS pops `PROVIDERS`: `init_symbols = {S}`, `init_called_symbols = {S}`
+/// (recorded by `record_direct_callee` on `new S()`). Without class
+/// indexing, the closure of `init_called_symbols` under
+/// `fn_body_called_symbols` stays `{S}` and `fn_body_symbol_refs.get(&S)`
+/// is empty. Safe-skip guard passes. `PROVIDERS` is planned. BFS chases
+/// `S` (transitive): not in `symbol_to_stmt`, not in `eagerly_called`
+/// (since `S` is a class, not a function decl) → nothing happens. `TOKEN`
+/// never enters the worklist; it stays below the class. At runtime,
+/// hoisted `new S()` reads `TOKEN` in TDZ.
+///
+/// Fix: index every top-level class declaration's constructor body (and
+/// eager class parts) into `fn_body_symbol_refs` / `fn_body_called_symbols`.
+/// Then `S` becomes `eagerly_called` once `PROVIDERS`'s
+/// `init_called_symbols` is folded in, and the BFS chases the class
+/// "body" refs (which include `TOKEN`).
+///
+/// Assert: `const TOKEN` precedes `const PROVIDERS` AND `const PROVIDERS`
+/// precedes `class TestComponent` — both transitively hoisted.
+#[test]
+fn component_eager_new_class_constructor_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+class S { constructor() { TOKEN; } }
+@Component({ selector: 'x', template: '', providers: PROVIDERS })
+class TestComponent {}
+const PROVIDERS = [new S()];
+const TOKEN = 1;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let providers_pos = result.code.find("const PROVIDERS").unwrap_or_else(|| {
+        panic!("Expected `const PROVIDERS` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < providers_pos,
+        "`const TOKEN` (read inside `class S`'s constructor body which is \
+         eagerly invoked by `new S()` in `PROVIDERS`) must be hoisted above \
+         `const PROVIDERS`. token@{token_pos} providers@{providers_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        providers_pos < class_pos,
+        "`const PROVIDERS` must be hoisted above `class TestComponent`. \
+         providers@{providers_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const PROVIDERS").count(),
+        1,
+        "`const PROVIDERS` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `E::ClassExpression(_) => {}` in
+/// `collect_expr_symbols` drops the eager parts of a class expression —
+/// the `super_class` expression, computed keys, static field initializers,
+/// and static blocks. Those fire when the class expression is *defined*,
+/// not lazily when its methods run.
+///
+/// Trace:
+/// - `@Component({ providers: PROVIDERS }) class TestComponent {}`
+/// - `const PROVIDERS = [class extends BASE {}];`
+/// - `const BASE = class {};`
+///
+/// Without the fix, `PROVIDERS`'s `init_symbols` is empty (class expr is
+/// opaque), so `BASE` never enters the worklist. `PROVIDERS` is hoisted
+/// above `TestComponent` but `BASE` stays below — at runtime, hoisted
+/// `[class extends BASE {}]` evaluates and reads `BASE` in TDZ.
+///
+/// Fix: walk `super_class`, computed keys on all members, static field
+/// initializers, static accessor initializers, and static blocks.
+///
+/// Assert: `const BASE` precedes `const PROVIDERS` AND `const PROVIDERS`
+/// precedes `class TestComponent`.
+#[test]
+fn component_class_expr_super_class_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: PROVIDERS })
+class TestComponent {}
+const PROVIDERS = [class extends BASE {}];
+const BASE = class {};
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let base_pos = result
+        .code
+        .find("const BASE")
+        .unwrap_or_else(|| panic!("Expected `const BASE` to be present.\nCode:\n{}", result.code));
+    let providers_pos = result.code.find("const PROVIDERS").unwrap_or_else(|| {
+        panic!("Expected `const PROVIDERS` to be present.\nCode:\n{}", result.code)
+    });
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        base_pos < providers_pos,
+        "`const BASE` (read by `class extends BASE {{}}` inside `PROVIDERS`) \
+         must be hoisted above `const PROVIDERS`. base@{base_pos} \
+         providers@{providers_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        providers_pos < class_pos,
+        "`const PROVIDERS` must be hoisted above `class TestComponent`. \
+         providers@{providers_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const BASE").count(),
+        1,
+        "`const BASE` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const PROVIDERS").count(),
+        1,
+        "`const PROVIDERS` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `make()` is eagerly invoked by the decorator. Inside `make`'s body an
+/// inline class expression `class extends TOKEN {}` evaluates eagerly, so the
+/// `super_class` reference to `TOKEN` should flow into the eager-evaluation
+/// set. `FunctionBodyIdentVisitor::visit_class` is a no-op which silently
+/// drops these refs unless it walks the class's eager parts via
+/// `walk_class_eager_parts`.
+#[test]
+fn component_eager_fn_body_inline_class_extends_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+function make() { return class extends TOKEN {}; }
+const TOKEN = class {};
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read by `class extends TOKEN {{}}` inside the body of \
+         an eagerly-called function) must be hoisted above the class to avoid \
+         TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// `(cond ? makeA : makeB)()` invokes one of `makeA`/`makeB`. Both branches
+/// can run, so `record_direct_callee` must descend into the consequent and
+/// alternate of a `ConditionalExpression` callee and add both identifiers to
+/// `called`. Without this, neither callee body is chased and `TOKEN` stays
+/// declared below the class.
+#[test]
+fn component_eager_conditional_callee_chases_both_branches() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const cond = true;
+@Component({ selector: 'x', template: '', providers: (cond ? makeA : makeB)() })
+class TestComponent {}
+function makeA() { return TOKEN; }
+function makeB() { return TOKEN; }
+const TOKEN = 1;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside both branches of a conditional callee \
+         `(cond ? makeA : makeB)()`) must be hoisted above the class to avoid \
+         TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Inside an eagerly-called function `outer()`, a tagged template
+/// `` tag`hello` `` invokes `tag`. `FunctionBodyIdentVisitor` must override
+/// `visit_tagged_template_expression` and record the tag as a callee
+/// (direct/indirect/bind) — otherwise the default walk adds `tag` to `out`
+/// only, `tag` never enters `eagerly_called`, and the late `TOKEN` reference
+/// inside `tag`'s body is never chased.
+#[test]
+fn component_eager_fn_body_tagged_template_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: outer() })
+class TestComponent {}
+function outer() { return tag`hello`; }
+function tag(_strings: TemplateStringsArray) { return TOKEN; }
+const TOKEN = 1;
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside the body of a tagged-template tag invoked \
+         from an eagerly-called function) must be hoisted above the class to \
+         avoid TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Decorator metadata uses a tagged template whose tag is produced by
+/// `.bind` / `.call` / `.apply`. The tag function fires at class-definition
+/// time, so its body refs must enter the eagerly-called closure — same
+/// treatment `E::CallExpression` / `E::NewExpression` already get.
+#[test]
+fn component_tagged_template_bind_tag_chases_late_const() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make.bind(null)`hello` })
+class TestComponent {}
+function make() { return [{ provide: TOKEN, useValue: 0 }]; }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside `make`'s body, called via a `.bind`-tagged \
+         template in decorator metadata) must be hoisted above the class to avoid \
+         TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// An eagerly-called function-valued binding declared *before* the
+/// decorated class is itself already initialized — but the function body
+/// it stores still fires when the decorator calls it, and that body's
+/// later-declared reads (`TOKEN` below) are TDZ-relevant. The BFS used
+/// to skip the body chase entirely when the binding's stmt_start was
+/// before the class's body end, leaving `TOKEN` unhoisted and the
+/// emitted Ivy definition throwing at module load.
+#[test]
+fn component_pre_class_fn_valued_binding_chases_body_refs() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const make = () => [{ provide: TOKEN, useValue: 0 }];
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside the body of a pre-class fn-valued binding \
+         called by the decorator) must be hoisted above the class to avoid TDZ. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Decorator metadata invokes a `.call`-style indirect callee whose
+/// receiver is a conditional expression: `(cond ? makeA : makeB).call(null)`.
+/// `record_indirect_callee` must descend through the conditional/logical/
+/// sequence wrapper to reach the underlying identifiers — otherwise neither
+/// `makeA` nor `makeB` enters the eagerly-called closure and `TOKEN` (read
+/// from their bodies) is left unhoisted.
+#[test]
+fn component_eager_indirect_callee_descends_through_conditional() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const cond = true;
+@Component({ selector: 'x', template: '', providers: (cond ? makeA : makeB).call(null) })
+class TestComponent {}
+function makeA() { return [{ provide: TOKEN, useValue: 0 }]; }
+function makeB() { return [{ provide: TOKEN, useValue: 1 }]; }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside both branches of a conditional indirect callee \
+         `(cond ? makeA : makeB).call(null)`) must be hoisted above the class to \
+         avoid TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Decorator metadata invokes a `.bind`-style callee whose receiver is a
+/// conditional expression: `(cond ? makeA : makeB).bind(null)()`.
+/// `record_bind_callee` must descend through the conditional/logical/
+/// sequence wrapper on the bind receiver to reach the underlying
+/// identifiers — otherwise neither `makeA` nor `makeB` enters the
+/// eagerly-called closure and `TOKEN` (read from their bodies) is left
+/// unhoisted.
+#[test]
+fn component_eager_bind_callee_descends_through_conditional() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+const cond = true;
+@Component({ selector: 'x', template: '', providers: (cond ? makeA : makeB).bind(null)() })
+class TestComponent {}
+function makeA() { return [{ provide: TOKEN, useValue: 0 }]; }
+function makeB() { return [{ provide: TOKEN, useValue: 1 }]; }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` (read inside both branches of a conditional bind callee \
+         `(cond ? makeA : makeB).bind(null)()`) must be hoisted above the class to \
+         avoid TDZ. token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+/// Both the cascade un-planning pass and the topological-precompute pass
+/// derive a per-statement `stmt_called` set. They must compute it with the
+/// SAME shape — seed with `init_called_symbols`, fold in fn-valued binding
+/// symbols (when eagerly called), then close under `fn_body_called_symbols`.
+/// If the two passes disagree, the topo edge expansion may miss a dependency
+/// edge through a fn-valued binding's body chain, leaving a hoisted
+/// dependent emitted before its dependee.
+///
+/// Engineered shape: `make = () => inner()` calls `inner()`, whose body
+/// reads `TOKEN`. The final emission order must place `const TOKEN` BEFORE
+/// the hoisted `const make = () => inner();` so that when `make()` runs at
+/// module load the eventual `TOKEN` read is initialized.
+#[test]
+fn component_topo_symmetric_eager_set_with_fn_valued_binding_chain() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '', providers: make() })
+class TestComponent {}
+const make = () => inner();
+function inner() { return TOKEN; }
+const TOKEN = 'tok';
+"#;
+    let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let token_pos = result
+        .code
+        .find("const TOKEN")
+        .unwrap_or_else(|| panic!("Expected `const TOKEN` to be present.\nCode:\n{}", result.code));
+    let make_pos = result
+        .code
+        .find("const make")
+        .unwrap_or_else(|| panic!("Expected `const make` to be present.\nCode:\n{}", result.code));
+    let class_pos = result.code.find("class TestComponent").unwrap_or_else(|| {
+        panic!("Expected `class TestComponent` to be present.\nCode:\n{}", result.code)
+    });
+
+    assert!(
+        token_pos < class_pos,
+        "`const TOKEN` must be hoisted above the class. \
+         token@{token_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        make_pos < class_pos,
+        "`const make` must be hoisted above the class. \
+         make@{make_pos} class@{class_pos}\nCode:\n{}",
+        result.code
+    );
+    assert!(
+        token_pos < make_pos,
+        "`const TOKEN` must precede `const make` so that `make()` (called at \
+         module load via the decorator) reads an initialized `TOKEN` through \
+         `inner()`. token@{token_pos} make@{make_pos}\nCode:\n{}",
+        result.code
+    );
+    assert_eq!(
+        result.code.matches("const TOKEN").count(),
+        1,
+        "`const TOKEN` should appear exactly once.\nCode:\n{}",
+        result.code
+    );
+}
+
+// =============================================================================
+// Regression tests for issue #288 — type-only constructor parameters
+// =============================================================================
+//
+// When a constructor parameter's type annotation comes from a type-only import
+// (`import type { X }` or `import { type X }`), TypeScript erases the import at
+// runtime. The Angular reference compiler responds with `ɵɵinvalidFactory()`
+// (`ValueUnavailableKind.TYPE_ONLY_IMPORT`) instead of an `ɵɵdirectiveInject(X)`
+// call that would crash with `token must be defined`.
+
+/// Issue #288: `import type { MyService }` constructor params must not emit a
+/// runtime DI token.
+///
+/// A type-only import is erased at runtime, so neither a namespace import for
+/// the module nor a `directiveInject(i1.MyService)` call may be generated. The
+/// factory body must instead be `ɵɵinvalidFactory()`.
+#[test]
+fn test_component_type_only_import_emits_invalid_factory() {
+    let allocator = Allocator::default();
+
+    let source = r"
+import { Component } from '@angular/core';
+import type { MyService } from './my-service';
+
+@Component({
+    selector: 'x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(private svc: MyService) {}
+}
+";
+
+    let result = transform_angular_file(&allocator, "x.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        !code.lines().any(|l| l.trim_start().starts_with("import * as ")
+            && (l.contains("'./my-service'") || l.contains("\"./my-service\""))),
+        "type-only import './my-service' must not be promoted to a runtime namespace import.\nOutput:\n{code}"
+    );
+
+    assert!(
+        !code.contains("i1.MyService"),
+        "Must not emit namespace-prefixed `i1.MyService` for a type-only import.\nOutput:\n{code}"
+    );
+    assert!(
+        !code.contains("directiveInject(MyService)"),
+        "Must not emit a bare `directiveInject(MyService)` for a type-only import.\nOutput:\n{code}"
+    );
+
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+    assert!(
+        factory_section.contains("ɵɵinvalidFactory()"),
+        "Type-only DI param must produce `ɵɵinvalidFactory()`. Factory:\n{factory_section}"
+    );
+}
+
+/// Issue #288: `import { type MyService }` (inline type specifier) must behave
+/// the same as a declaration-level `import type`.
+#[test]
+fn test_component_inline_type_specifier_emits_invalid_factory() {
+    let allocator = Allocator::default();
+
+    let source = r"
+import { Component } from '@angular/core';
+import { type MyService } from './my-service';
+
+@Component({
+    selector: 'x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(private svc: MyService) {}
+}
+";
+
+    let result = transform_angular_file(&allocator, "x.component.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        !code.contains("from './my-service'") && !code.contains("from \"./my-service\""),
+        "inline `type` specifier must not promote './my-service' to a runtime import.\nOutput:\n{code}"
+    );
+    assert!(
+        !code.contains("i1.MyService"),
+        "Must not emit namespace-prefixed `i1.MyService` for a type-only specifier.\nOutput:\n{code}"
+    );
+
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+    assert!(
+        factory_section.contains("ɵɵinvalidFactory()"),
+        "Inline `type` specifier DI param must produce `ɵɵinvalidFactory()`. Factory:\n{factory_section}"
+    );
+}
+
+/// Issue #288: directives with type-only DI tokens must also emit
+/// `ɵɵinvalidFactory()` instead of a runtime namespace reference.
+#[test]
+fn test_directive_type_only_import_emits_invalid_factory() {
+    let allocator = Allocator::default();
+
+    let source = r"
+import { Directive } from '@angular/core';
+import type { MyService } from './my-service';
+
+@Directive({
+    selector: '[appX]',
+    standalone: true,
+})
+export class XDirective {
+    constructor(private svc: MyService) {}
+}
+";
+
+    let result = transform_angular_file(&allocator, "x.directive.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        !code.lines().any(|l| l.trim_start().starts_with("import * as ")
+            && (l.contains("'./my-service'") || l.contains("\"./my-service\""))),
+        "type-only import './my-service' must not be promoted to a runtime namespace import.\nOutput:\n{code}"
+    );
+    assert!(
+        !code.contains("i1.MyService"),
+        "Must not emit namespace-prefixed `i1.MyService` for a type-only directive param.\nOutput:\n{code}"
+    );
+
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+    assert!(
+        factory_section.contains("ɵɵinvalidFactory()"),
+        "Directive type-only DI param must produce `ɵɵinvalidFactory()`. Factory:\n{factory_section}"
+    );
+}
+
+/// Issue #288: injectables (`@Injectable`) with type-only DI tokens must also
+/// emit `ɵɵinvalidFactory()`.
+#[test]
+fn test_injectable_type_only_import_emits_invalid_factory() {
+    let allocator = Allocator::default();
+
+    let source = r"
+import { Injectable } from '@angular/core';
+import type { MyDep } from './my-dep';
+
+@Injectable({ providedIn: 'root' })
+export class MyService {
+    constructor(private dep: MyDep) {}
+}
+";
+
+    let result = transform_angular_file(&allocator, "my-service.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+
+    assert!(
+        !code.lines().any(|l| l.trim_start().starts_with("import * as ")
+            && (l.contains("'./my-dep'") || l.contains("\"./my-dep\""))),
+        "type-only import './my-dep' must not be promoted to a runtime namespace import.\nOutput:\n{code}"
+    );
+
+    let factory_section =
+        code.split("ɵfac").nth(1).expect("Should have a factory definition (ɵfac)");
+    assert!(
+        factory_section.contains("ɵɵinvalidFactory()"),
+        "Injectable type-only DI param must produce `ɵɵinvalidFactory()`. Factory:\n{factory_section}"
+    );
+}
+
+/// Regression for https://github.com/voidzero-dev/oxc-angular-compiler/issues/291.
+///
+/// `transformAngularFile` must surface external `templateUrl` / `styleUrls`
+/// paths in `result.dependencies` so build tools (the Vite plugin in
+/// particular) can register them as watch dependencies.
+#[test]
+fn test_resource_dependencies_reported_when_resolved() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-x',
+    templateUrl: './x.html',
+    styleUrls: ['./x.css', './shared.css'],
+    standalone: true,
+})
+export class XComponent {}
+"#;
+
+    let mut templates = std::collections::HashMap::new();
+    templates.insert("./x.html".to_string(), "<div>x</div>".to_string());
+    let mut styles = std::collections::HashMap::new();
+    styles.insert("./x.css".to_string(), vec![".x{color:red}".to_string()]);
+    styles.insert("./shared.css".to_string(), vec![".shared{}".to_string()]);
+    let resources = ResolvedResources { templates, styles };
+
+    let result =
+        transform_angular_file(&allocator, "x.component.ts", source, None, Some(&resources));
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.dependencies.contains(&"./x.html".to_string()),
+        "templateUrl should appear in dependencies, got: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.contains(&"./x.css".to_string()),
+        "styleUrl ./x.css should appear in dependencies, got: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.contains(&"./shared.css".to_string()),
+        "styleUrl ./shared.css should appear in dependencies, got: {:?}",
+        result.dependencies
+    );
+}
+
+/// Regression for https://github.com/voidzero-dev/oxc-angular-compiler/issues/291.
+///
+/// External resource paths must be reported in `result.dependencies` even when
+/// no `ResolvedResources` map is supplied. Build tools call the compiler from
+/// their loader, and they need to know which sibling files to watch *before*
+/// they can pre-load and supply the resource contents. Returning an empty
+/// `dependencies` list when `resolvedResources` is `None` silently breaks HMR.
+#[test]
+fn test_resource_dependencies_reported_without_resolved_resources() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-x',
+    templateUrl: './x.html',
+    styleUrls: ['./x.css', './shared.css'],
+    standalone: true,
+})
+export class XComponent {}
+"#;
+
+    // No ResolvedResources passed — mirrors the path build tools hit on the
+    // first transform pass before they've discovered the sibling files.
+    let result = transform_angular_file(&allocator, "x.component.ts", source, None, None);
+
+    assert!(
+        result.dependencies.contains(&"./x.html".to_string()),
+        "templateUrl must be reported in dependencies even when unresolved, got: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.contains(&"./x.css".to_string())
+            && result.dependencies.contains(&"./shared.css".to_string()),
+        "styleUrls must be reported in dependencies even when unresolved, got: {:?}",
+        result.dependencies
+    );
+}
+
+/// styleUrls must be tracked even when the component uses an inline
+/// `template:` string. styles and templates are independent resource axes.
+#[test]
+fn test_inline_template_with_external_styles_reports_style_dependencies() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-x',
+    template: '<div>inline</div>',
+    styleUrl: './x.css',
+    standalone: true,
+})
+export class XComponent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "x.component.ts", source, None, None);
+    assert!(
+        result.dependencies.contains(&"./x.css".to_string()),
+        "styleUrl alongside an inline template must still appear in dependencies, got: {:?}",
+        result.dependencies
+    );
+}
+
+/// Regression for https://github.com/voidzero-dev/oxc-angular-compiler/issues/290.
+///
+/// A `@Component` template like `<div><span></div>` used to compile silently —
+/// `result.diagnostics` was empty even though `</div>` jumps past an unclosed
+/// `<span>`. The HTML parser now flags this exactly like Angular's reference
+/// parser, and the diagnostic must propagate all the way out to the file-level
+/// transform result so consumers (vite plugin, NAPI bindings) can surface it.
+#[test]
+fn test_malformed_template_surfaces_parse_diagnostic() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-bad',
+    template: '<div><span></div>',
+    standalone: true,
+})
+export class BadComponent {}
+"#;
+
+    let result = transform_angular_file(&allocator, "bad.component.ts", source, None, None);
+
+    assert!(
+        result.has_errors(),
+        "Malformed template must produce diagnostics, but `result.diagnostics` was empty. Output:\n{}",
+        result.code
+    );
+    let mentions_unclosed = result.diagnostics.iter().any(|d| {
+        let s = format!("{d}");
+        s.contains("Unexpected closing tag \"div\"")
+    });
+    assert!(
+        mentions_unclosed,
+        "Diagnostic should call out the unexpected closing tag, got: {:?}",
+        result.diagnostics
+    );
+}
+
+// =============================================================================
+// AOT @Service decorator (Angular v22+)
+// =============================================================================
+
+#[test]
+fn test_aot_service_decorator_basic() {
+    // A bare @Service() class should emit static ɵfac and static ɵprov.
+    // ɵprov uses ɵɵdefineService (not ɵɵdefineInjectable), and ɵfac is the
+    // deps-less constructor factory — @Service classes resolve DI via
+    // inject() calls inside the constructor body.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("ɵɵdefineService"),
+        "Should emit ɵɵdefineService. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("static ɵfac"), "Should emit static ɵfac. Got:\n{}", result.code);
+    assert!(
+        result.code.contains("static ɵprov"),
+        "Should emit static ɵprov. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("@Service"),
+        "Should remove the @Service decorator from source. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("autoProvided"),
+        "autoProvided is default-true, should not appear when not explicitly disabled. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("aot_service_decorator_basic", result.code);
+}
+
+#[test]
+fn test_aot_service_decorator_auto_provided_false() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service({ autoProvided: false })
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("autoProvided:false") || result.code.contains("autoProvided: false"),
+        "Should emit autoProvided: false. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("aot_service_decorator_auto_provided_false", result.code);
+}
+
+#[test]
+fn test_aot_service_decorator_custom_factory() {
+    // A user-supplied factory: should be wrapped in an arrow `() => factory()`.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+function makeCounter() { return { count: 0 }; }
+
+@Service({ factory: makeCounter })
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    // The factory entry should be an arrow wrapper, not a ɵfac delegation.
+    assert!(
+        result.code.contains("makeCounter()"),
+        "Should call user-supplied factory inside arrow wrapper. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("factory:CounterService.ɵfac")
+            && !result.code.contains("factory: CounterService.ɵfac"),
+        "ɵprov factory should not delegate to ɵfac when user supplied a custom factory. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("aot_service_decorator_custom_factory", result.code);
+}
+
+#[test]
+fn test_aot_service_decorator_inline_arrow_factory() {
+    // Upstream's service_with_factory compliance golden: an inline arrow
+    // factory becomes `factory: () => (() => new Alternate())()` — the user's
+    // arrow is preserved and called inside an outer wrapper.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+class Alternate {}
+
+@Service({ factory: () => new Alternate() })
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    // The user's arrow expression must appear inside the wrapper, called.
+    assert!(
+        result.code.contains("new Alternate()"),
+        "User's arrow body should appear in the emitted factory wrapper. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("aot_service_decorator_inline_arrow_factory", result.code);
+}
+
+#[test]
+fn test_aot_service_decorator_version_gated() {
+    // Targeting Angular < 22 should surface a diagnostic and leave the
+    // decorator unchanged (no ɵfac/ɵprov emitted).
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service()
+export class CounterService {}
+";
+
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    assert!(
+        result.has_errors(),
+        "Targeting v21 with @Service should produce a diagnostic. Got none.\n{}",
+        result.code
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Diagnostic should mention @Service and v22. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Should NOT emit ɵɵdefineService when version-gated out. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_service_decorator_collision_with_injectable() {
+    // Upstream service.ts:101-116 rejects @Service co-located with any other
+    // @angular/core decorator. We surface a diagnostic and skip emission.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service, Injectable } from '@angular/core';
+
+@Service()
+@Injectable()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+
+    assert!(
+        result.has_errors(),
+        "Combining @Service with another Angular decorator should produce a diagnostic. Got none.\n{}",
+        result.code
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| {
+            let s = d.to_string();
+            s.contains("@Service") && s.contains("Injectable")
+        }),
+        "Diagnostic should call out both @Service and the conflicting Injectable. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Should NOT emit ɵɵdefineService when the collision rule fires. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_service_decorator_collision_with_component() {
+    // The collision check must fire even when the co-located decorator is a
+    // primary (Component/Directive/Pipe/NgModule) branch. Without the
+    // pre-flight gate, the Component branch would win the dispatch race and
+    // silently compile the class as a component — leaving the @Service
+    // decorator removed inconsistently instead of surfacing the diagnostic.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service, Component } from '@angular/core';
+
+@Service()
+@Component({ selector: 'app-c', template: '' })
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+
+    assert!(
+        result.has_errors(),
+        "@Service + @Component should produce a collision diagnostic. Got none.\n{}",
+        result.code
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| {
+            let s = d.to_string();
+            s.contains("@Service") && s.contains("Component")
+        }),
+        "Diagnostic should call out @Service and Component. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineComponent"),
+        "Should NOT emit component definition when the collision rule fires. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Should NOT emit service definition when the collision rule fires. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_aliased_injectable_as_service_is_not_compiled_as_service() {
+    // `import { Injectable as Service }` aliases Injectable to the local
+    // name `Service`. The local-name-only gate would misclassify this as
+    // the v22 @Service decorator (and even emit `@Service requires v22` on
+    // pre-v22 targets). The fix consults the import's original exported
+    // name so only `import { Service }` from `@angular/core` qualifies.
+    //
+    // Note: this test asserts the negative claim only. Whether the class
+    // gets compiled as @Injectable via the aliased local name is a separate
+    // pre-existing concern of the Injectable branch.
+    let allocator = Allocator::default();
+    let source = r"
+import { Injectable as Service } from '@angular/core';
+
+@Service()
+export class CounterService {}
+";
+
+    // Target Angular v21 so a false-positive @Service classification would
+    // trip the v22 version gate.
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Aliased Injectable should not trip the @Service v22 gate. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Aliased Injectable must not be compiled via the @Service path. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_aliased_service_import_still_emits_definition() {
+    // The mirror case of the prior test: `import { Service as NgService }`
+    // still resolves to Angular's v22 @Service. The AOT dispatcher accepts
+    // the aliased decorator via the import-map gate, and the extractor
+    // must consume the resolved decorator (rather than re-searching for a
+    // literal `Service` name) so ɵfac/ɵprov are still emitted.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service as NgService } from '@angular/core';
+
+@NgService()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(
+        !result.has_errors(),
+        "Aliased @Service should compile without errors. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result.code.contains("ɵɵdefineService"),
+        "Aliased @Service must still emit ɵɵdefineService. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("ɵfac") && result.code.contains("ɵprov"),
+        "Aliased @Service must emit both ɵfac and ɵprov. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_namespace_service_import_emits_definition() {
+    // `import * as ng from '@angular/core'; @ng.Service()` is a valid v22
+    // service in upstream Angular. The AOT dispatcher must accept the
+    // namespace form (the JIT classifier already does), otherwise the
+    // class silently skips the service branch and is emitted without
+    // ɵfac/ɵprov.
+    let allocator = Allocator::default();
+    let source = r"
+import * as ng from '@angular/core';
+
+@ng.Service()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(
+        !result.has_errors(),
+        "Namespaced @ng.Service() should compile without errors. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result.code.contains("ɵɵdefineService"),
+        "Namespaced @ng.Service() must emit ɵɵdefineService. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_service_namespace_collision_preflight_ignores_third_party() {
+    // The collision preflight must use the import map to decide whether a
+    // namespace decorator like `@thirdParty.Component()` is actually an
+    // Angular decorator. Without this, an @Service class with an
+    // unrelated namespaced decorator would falsely trip the collision
+    // diagnostic and never get compiled.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+import * as thirdParty from 'some-other-lib';
+
+@Service()
+@thirdParty.Component()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+
+    assert!(
+        !result.diagnostics.iter().any(|d| {
+            let s = d.to_string();
+            s.contains("@Service") && s.contains("@Component")
+        }),
+        "Third-party namespace @Component must not trip the @Service collision diagnostic. \
+         Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result.code.contains("ɵɵdefineService"),
+        "Service compilation must still proceed despite the unrelated namespace decorator. \
+         Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_non_angular_service_decorator_is_ignored() {
+    // A `@Service()` from a non-Angular library must not be transformed —
+    // no ɵfac/ɵprov emission, no version-gate diagnostic.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from 'some-other-lib';
+
+@Service()
+export class CounterService {}
+";
+
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 0, 0)),
+        ..Default::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "counter.service.ts", source, Some(&options), None);
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.to_string().contains("@Service") && d.to_string().contains("v22")),
+        "Non-Angular @Service should not trigger the v22 diagnostic. Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Should NOT emit ɵɵdefineService for non-Angular @Service. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("@Service"),
+        "Source @Service decorator should be left intact when not from @angular/core. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_service_decorator_constructor_di_diagnostic() {
+    // Upstream service.ts:278-309 rejects @Service classes that declare
+    // constructor params, because the v22 @Service ɵfac is generated with
+    // empty deps — the params would silently be `undefined` at runtime.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service, ApplicationRef } from '@angular/core';
+
+@Service()
+export class CounterService {
+    constructor(appRef: ApplicationRef) {}
+}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+
+    assert!(
+        result.has_errors(),
+        "@Service with ctor params should surface a diagnostic. Got none.\n{}",
+        result.code
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| {
+            let s = d.to_string();
+            s.contains("@Service") && s.contains("constructor") && s.contains("inject")
+        }),
+        "Diagnostic should match upstream's wording (mentions @Service, constructor, inject). Got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        !result.code.contains("ɵɵdefineService"),
+        "Should NOT emit ɵɵdefineService when the ctor-DI rule fires. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_aot_service_decorator_explicit_auto_provided_true() {
+    // Upstream's explicitly_provided_service compliance golden: when the user
+    // writes @Service({autoProvided: true}), the ɵprov initializer must NOT
+    // contain `autoProvided` (it matches the runtime default), but the
+    // setClassMetadata `args` array must preserve the user's source value.
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service({ autoProvided: true })
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    // ɵprov must omit autoProvided when true (matches runtime default).
+    let prov_start = result.code.find("ɵɵdefineService").expect("should emit ɵɵdefineService");
+    let prov_end = result.code[prov_start..]
+        .find("})")
+        .map(|p| prov_start + p)
+        .expect("should close the defineService call");
+    let prov_chunk = &result.code[prov_start..=prov_end];
+    assert!(
+        !prov_chunk.contains("autoProvided"),
+        "ɵprov should omit autoProvided when user passed true. Got: {prov_chunk}"
+    );
+
+    // setClassMetadata must preserve the user's decorator args.
+    assert!(
+        result.code.contains("autoProvided:true") || result.code.contains("autoProvided: true"),
+        "setClassMetadata args should preserve user's autoProvided: true. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_dts_service() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Service } from '@angular/core';
+
+@Service()
+export class CounterService {}
+";
+
+    let result = transform_angular_file(&allocator, "counter.service.ts", source, None, None);
+    assert!(!result.has_errors(), "Should compile without errors: {:?}", result.diagnostics);
+
+    assert_eq!(result.dts_declarations.len(), 1);
+    let decl = &result.dts_declarations[0];
+    assert_eq!(decl.class_name, "CounterService");
+
+    assert!(
+        decl.members.contains("static ɵfac: i0.ɵɵFactoryDeclaration<CounterService, never>;"),
+        "Should contain ɵfac. Got:\n{}",
+        decl.members
+    );
+    // .d.ts reuses the InjectableDeclaration type per upstream
+    // service_compiler.ts:55 (createInjectableType).
+    assert!(
+        decl.members.contains("static ɵprov: i0.ɵɵInjectableDeclaration<CounterService>;"),
+        "Should contain ɵprov. Got:\n{}",
+        decl.members
+    );
 }

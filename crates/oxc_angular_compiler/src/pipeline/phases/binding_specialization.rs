@@ -16,12 +16,12 @@
 //! Special cases:
 //! - `ngNonBindable` attribute: marks element and removes binding
 //! - `animate.*` attributes: convert to animation bindings
-//! - `field` property: convert to control binding
+//! - `formField` property: emit both a regular property binding and a control binding
 //!
 //! Ported from Angular's `template/pipeline/src/phases/binding_specialization.ts`.
 
 use oxc_allocator::Box;
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ast::expression::{AbsoluteSourceSpan, AngularExpression, EmptyExpr, ParseSpan};
@@ -88,6 +88,10 @@ fn split_ns_name(name: &str) -> (Option<&str>, &str) {
 pub fn specialize_bindings(job: &mut ComponentCompilationJob<'_>) {
     let allocator = job.allocator;
     let mode = job.mode;
+    // v22 broadened control-property specialization beyond `formField`. Default to
+    // the latest behaviour when the target version is unknown.
+    let extended_controls =
+        job.angular_version.map_or(true, |v| v.supports_extended_control_properties());
 
     // First pass: Build element map from create operations
     let mut elements: FxHashMap<XrefId, ElementInfo> = FxHashMap::default();
@@ -112,12 +116,14 @@ pub fn specialize_bindings(job: &mut ComponentCompilationJob<'_>) {
     let mut all_non_bindable: Vec<XrefId> = Vec::new();
 
     // Process root view
-    let root_non_bindable = specialize_in_view(&mut job.root.update, allocator, &elements, mode);
+    let root_non_bindable =
+        specialize_in_view(&mut job.root.update, &allocator, &elements, mode, extended_controls);
     all_non_bindable.extend(root_non_bindable);
 
     // Process embedded views
     for view in job.views.values_mut() {
-        let view_non_bindable = specialize_in_view(&mut view.update, allocator, &elements, mode);
+        let view_non_bindable =
+            specialize_in_view(&mut view.update, &allocator, &elements, mode, extended_controls);
         all_non_bindable.extend(view_non_bindable);
     }
 
@@ -173,9 +179,9 @@ fn create_placeholder_expression<'a>(
 ) -> Box<'a, IrExpression<'a>> {
     let empty_expr = AngularExpression::Empty(Box::new_in(
         EmptyExpr { span: ParseSpan::new(0, 0), source_span: AbsoluteSourceSpan::new(0, 0) },
-        allocator,
+        &allocator,
     ));
-    Box::new_in(IrExpression::Ast(Box::new_in(empty_expr, allocator)), allocator)
+    Box::new_in(IrExpression::Ast(Box::new_in(empty_expr, &allocator)), &allocator)
 }
 
 /// Specializes bindings within a single view.
@@ -185,6 +191,7 @@ fn specialize_in_view<'a>(
     allocator: &'a oxc_allocator::Allocator,
     _elements: &FxHashMap<XrefId, ElementInfo>,
     mode: TemplateCompilationMode,
+    extended_controls: bool,
 ) -> Vec<XrefId> {
     // Track ops to remove (ngNonBindable)
     let mut to_remove: Vec<std::ptr::NonNull<UpdateOp<'a>>> = Vec::new();
@@ -300,21 +307,45 @@ fn specialize_in_view<'a>(
                             });
                             cursor.replace_current(new_op);
                         }
-                    } else if name.as_str() == "formField" {
-                        // Check for special "formField" property (control binding)
+                    } else if name.as_str() == "formField"
+                        || (extended_controls
+                            && matches!(
+                                name.as_str(),
+                                "formControl" | "formControlName" | "ngModel"
+                            ))
+                    {
+                        // A control property (`[formField]`, `[formControl]`,
+                        // `[formControlName]`, `[ngModel]`) still binds as a regular property,
+                        // but Angular also emits a separate control instruction
+                        // (`ɵɵcontrol()`) after the property update. `formField` is the v21
+                        // baseline; the rest were added in v22 (`extended_controls`).
                         if let Some(UpdateOp::Binding(binding)) = cursor.current_mut() {
                             let expression = std::mem::replace(
                                 &mut binding.expression,
                                 create_placeholder_expression(allocator),
                             );
-                            let new_op = UpdateOp::Control(ControlOp {
+                            let property_op = UpdateOp::Property(PropertyOp {
                                 base: UpdateOpBase { source_span, ..Default::default() },
                                 target,
                                 name: binding.name.clone(),
                                 expression,
+                                is_host: false, // Template mode
+                                security_context,
+                                sanitizer: None,
+                                is_structural: false,
+                                i18n_context: None,
+                                i18n_message: binding.i18n_message,
+                                binding_kind,
+                            });
+                            let control_op = UpdateOp::Control(ControlOp {
+                                base: UpdateOpBase { source_span, ..Default::default() },
+                                target,
+                                name: binding.name.clone(),
+                                expression: create_placeholder_expression(allocator),
                                 security_context,
                             });
-                            cursor.replace_current(new_op);
+                            cursor.replace_current(property_op);
+                            cursor.insert_after(control_op);
                         }
                     } else {
                         // Regular property binding
@@ -345,6 +376,7 @@ fn specialize_in_view<'a>(
                 BindingKind::TwoWayProperty => {
                     // Two-way property binding
                     if let Some(UpdateOp::Binding(binding)) = cursor.current_mut() {
+                        let name = binding.name.clone();
                         let expression = std::mem::replace(
                             &mut binding.expression,
                             create_placeholder_expression(allocator),
@@ -352,12 +384,26 @@ fn specialize_in_view<'a>(
                         let new_op = UpdateOp::TwoWayProperty(TwoWayPropertyOp {
                             base: UpdateOpBase { source_span, ..Default::default() },
                             target,
-                            name: binding.name.clone(),
+                            name: name.clone(),
                             expression,
                             security_context,
                             sanitizer: None,
                         });
                         cursor.replace_current(new_op);
+                        // Angular v22: a two-way `[(ngModel)]` is a control property, so it
+                        // also emits a control update instruction (`ɵɵcontrol()`) after the
+                        // two-way property update (paired with the `ɵɵcontrolCreate()` added
+                        // during ingest). Gated to v22+ via `extended_controls`.
+                        if extended_controls && name.as_str() == "ngModel" {
+                            let control_op = UpdateOp::Control(ControlOp {
+                                base: UpdateOpBase { source_span, ..Default::default() },
+                                target,
+                                name,
+                                expression: create_placeholder_expression(allocator),
+                                security_context,
+                            });
+                            cursor.insert_after(control_op);
+                        }
                     }
                 }
                 BindingKind::I18n | BindingKind::ClassName | BindingKind::StyleProperty => {

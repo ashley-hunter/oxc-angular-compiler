@@ -9,12 +9,13 @@ use std::path::Path;
 
 use oxc_allocator::{Allocator, Vec as OxcVec};
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, Declaration, ExportDefaultDeclarationKind, Expression,
-    ImportDeclarationSpecifier, ImportOrExportKind, ObjectPropertyKind, PropertyKey, Statement,
+    Argument, Declaration, ExportDefaultDeclarationKind, Expression, ImportDeclarationSpecifier,
+    ImportOrExportKind, ModuleExportName, ObjectPropertyKind, PropertyKey, Statement,
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_parser::Parser;
-use oxc_span::{GetSpan, Ident, SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::optimizer::{Edit, apply_edits, apply_edits_with_sourcemap};
@@ -26,27 +27,31 @@ use super::decorator::{
     extract_component_metadata, find_component_decorator, find_component_decorator_span,
 };
 use super::definition::{const_value_to_expression, generate_component_definitions};
+use super::hoist::{collect_hoist_edits, program_has_angular_decorated_class};
 use super::import_elision::{ImportElisionAnalyzer, import_elision_edits};
 use super::metadata::{AngularVersion, ComponentMetadata, HostMetadata};
 use super::namespace_registry::NamespaceRegistry;
 use crate::ast::expression::{BindingType, ParsedEventType};
 use crate::ast::r3::{R3BoundAttribute, R3BoundEvent, SecurityContext};
 use crate::class_metadata::{
-    R3ClassMetadata, build_ctor_params_metadata, build_decorator_metadata_array,
-    build_prop_decorators_metadata, compile_class_metadata,
+    R3ClassMetadata, R3DeferPerComponentDependency, build_ctor_params_metadata,
+    build_decorator_metadata_array, build_prop_decorators_metadata, compile_class_metadata,
+    compile_component_class_metadata,
 };
+use crate::directive::collect_string_consts;
 use crate::directive::{
     R3QueryMetadata, create_content_queries_function, create_view_queries_function,
     extract_content_queries, extract_directive_metadata, extract_view_queries,
-    find_directive_decorator_span, generate_directive_definitions,
+    find_directive_decorator, find_directive_decorator_span, generate_directive_definitions,
 };
 use crate::dts;
 use crate::injectable::{
-    extract_injectable_metadata, find_injectable_decorator_span,
+    extract_injectable_metadata, find_injectable_decorator, find_injectable_decorator_span,
     generate_injectable_definition_from_decorator,
 };
 use crate::ng_module::{
-    extract_ng_module_metadata, find_ng_module_decorator_span, generate_full_ng_module_definition,
+    extract_ng_module_metadata, find_ng_module_decorator, find_ng_module_decorator_span,
+    generate_full_ng_module_definition,
 };
 use crate::output::ast::{
     DeclareFunctionStmt, FunctionExpr, OutputExpression, OutputStatement, ReadPropExpr,
@@ -57,7 +62,8 @@ use crate::parser::ParseTemplateOptions;
 use crate::parser::expression::BindingParser;
 use crate::parser::html::{HtmlParser, remove_whitespaces};
 use crate::pipe::{
-    extract_pipe_metadata, find_pipe_decorator_span, generate_full_pipe_definition_from_decorator,
+    extract_pipe_metadata, find_pipe_decorator, find_pipe_decorator_span,
+    generate_full_pipe_definition_from_decorator,
 };
 use crate::pipeline::compilation::{DeferBlockDepsEmitMode, TemplateCompilationMode};
 use crate::pipeline::emit::{
@@ -67,6 +73,7 @@ use crate::pipeline::ingest::{
     HostBindingInput, IngestOptions, ingest_component, ingest_component_with_options,
     ingest_host_binding_with_version,
 };
+use crate::service::{extract_service_metadata, generate_service_definition_from_decorator};
 use crate::transform::HtmlToR3Transform;
 use crate::transform::html_to_r3::TransformOptions as R3TransformOptions;
 
@@ -102,6 +109,17 @@ pub struct TransformOptions {
     ///
     /// When `None`, assumes latest Angular version (v19+ behavior).
     pub angular_version: Option<AngularVersion>,
+
+    /// Override for the `legacyOptionalChaining` Angular compiler option.
+    ///
+    /// Controls how the safe-navigation operator (`?.`) in template expressions is
+    /// emitted. When `Some(true)`, always uses the legacy `== null ? null` ternary;
+    /// when `Some(false)`, always emits native optional chaining (yielding
+    /// `undefined`). When `None`, the default is derived from `angular_version`
+    /// (legacy for < v22, modern for >= v22, legacy when the version is unknown).
+    ///
+    /// See `angular/angular@2896c93cc1`.
+    pub legacy_optional_chaining: Option<bool>,
 
     // Component metadata overrides for template-only compilation.
     // These allow the build tool to pass component metadata when compiling
@@ -171,10 +189,12 @@ pub struct TransformOptions {
 
     /// Emit setClassMetadata() calls for TestBed support.
     ///
-    /// When true, generates `ɵɵsetClassMetadata()` calls wrapped in a dev-mode guard.
-    /// This preserves original decorator information for TestBed's recompilation APIs.
+    /// When true, generates `ɵɵsetClassMetadata()` calls wrapped in
+    /// `(typeof ngDevMode === "undefined" || ngDevMode) && …`. Production bundles
+    /// tree-shake the guarded call. Preserves original decorator information for
+    /// TestBed's recompilation APIs.
     ///
-    /// Default: false (metadata is dev-only and usually stripped in production)
+    /// Default: true — matches `ngc`, which always emits class metadata.
     pub emit_class_metadata: bool,
 
     /// Minify final component styles before emitting them into `styles: [...]`.
@@ -182,6 +202,13 @@ pub struct TransformOptions {
     /// This runs after Angular style encapsulation, so it applies to the same
     /// final CSS strings that are embedded in component definitions.
     pub minify_component_styles: bool,
+
+    /// Selects between full Ivy emit (`ɵɵdefine*`) and partial-declaration
+    /// emit (`ɵɵngDeclare*`).
+    ///
+    /// `Full` (default) targets applications; `Partial` targets library
+    /// builds, where consumers run the linker to expand declarations.
+    pub compilation_mode: crate::CompilationMode,
 }
 
 /// Input for host metadata when passed via TransformOptions.
@@ -211,8 +238,9 @@ impl Default for TransformOptions {
             jit: false,
             hmr: false,
             advanced_optimizations: false,
-            i18n_use_external_ids: true, // Angular's JIT default
-            angular_version: None,       // None means assume latest (v19+ behavior)
+            i18n_use_external_ids: true,    // Angular's JIT default
+            angular_version: None,          // None means assume latest (v19+ behavior)
+            legacy_optional_chaining: None, // None: derive default from angular_version
             // Metadata overrides default to None (use extracted/default values)
             selector: None,
             standalone: None,
@@ -229,9 +257,11 @@ impl Default for TransformOptions {
             tsconfig_path: None,
             // Resolved imports for host directives
             resolved_imports: None,
-            // Class metadata for TestBed support (disabled by default)
-            emit_class_metadata: false,
+            // Class metadata for TestBed support — matches ngc, which always emits
+            // it; production bundles strip the guarded call via tree-shaking.
+            emit_class_metadata: true,
             minify_component_styles: false,
+            compilation_mode: crate::CompilationMode::Full,
         }
     }
 }
@@ -310,18 +340,14 @@ impl TransformResult {
 
     /// Check if there are any errors.
     pub fn has_errors(&self) -> bool {
-        use miette::Diagnostic;
         use oxc_diagnostics::Severity;
-        self.diagnostics
-            .iter()
-            .any(|d| d.severity() == Some(Severity::Error) || d.severity().is_none())
+        self.diagnostics.iter().any(|d| d.severity == Severity::Error)
     }
 
     /// Check if there are any warnings.
     pub fn has_warnings(&self) -> bool {
-        use miette::Diagnostic;
         use oxc_diagnostics::Severity;
-        self.diagnostics.iter().any(|d| d.severity() == Some(Severity::Warning))
+        self.diagnostics.iter().any(|d| d.severity == Severity::Warning)
     }
 }
 
@@ -332,7 +358,7 @@ pub struct TemplateCompileOutput {
     pub code: String,
 
     /// Source map (if sourcemap option was enabled).
-    pub map: Option<oxc_sourcemap::SourceMap>,
+    pub map: Option<oxc_sourcemap::OwnedSourceMap>,
 }
 
 impl TemplateCompileOutput {
@@ -342,7 +368,7 @@ impl TemplateCompileOutput {
     }
 
     /// Create a new template compile output with code and source map.
-    pub fn with_source_map(code: String, map: Option<oxc_sourcemap::SourceMap>) -> Self {
+    pub fn with_source_map(code: String, map: Option<oxc_sourcemap::OwnedSourceMap>) -> Self {
         Self { code, map }
     }
 }
@@ -413,6 +439,15 @@ pub struct ImportInfo<'a> {
     /// Type-only imports are erased at runtime and should not generate namespace
     /// imports for `setClassMetadata()` type references.
     pub is_type_only: bool,
+    /// Original exported name on the source module, when it differs from the
+    /// local binding name. Used to build correct `import('./mod').then(m => m.X)`
+    /// chains for `@defer` dependency resolvers.
+    ///
+    /// - `import { Foo }` → `None` (export name equals local name)
+    /// - `import { Foo as Bar }` → `Some("Foo")` (use original exported name)
+    /// - `import Foo from "./mod"` → `Some("default")` (default export)
+    /// - `import * as ns from "./mod"` → `None` (namespace, not deferrable)
+    pub imported_name: Option<Ident<'a>>,
 }
 
 /// Map from local identifier name to its import information.
@@ -489,9 +524,23 @@ pub fn build_import_map<'a>(
                         .map(|resolved| Ident::from(allocator.alloc_str(resolved)))
                         .unwrap_or_else(|| default_source_module.clone().into());
 
+                    // `import { Foo as Bar }` → export name `Foo` for `i1.Foo` / @defer.
+                    // Path rewrite via `resolved_imports` does not change the export
+                    // name on the target (still `Foo`); only an extended API could
+                    // supply a different target export after a barrel rename.
+                    let imported_export_name = module_export_name_to_str(&spec.imported);
+                    let imported_name = imported_export_name
+                        .filter(|exported| *exported != local_name.as_str())
+                        .map(|exported| Ident::from(allocator.alloc_str(exported)));
+
                     import_map.insert(
                         local_name,
-                        ImportInfo { source_module, is_named_import: true, is_type_only },
+                        ImportInfo {
+                            source_module,
+                            is_named_import: true,
+                            is_type_only,
+                            imported_name,
+                        },
                     );
                 }
                 ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
@@ -511,6 +560,10 @@ pub fn build_import_map<'a>(
                             source_module,
                             is_named_import: true,
                             is_type_only: decl_is_type_only,
+                            // Default imports always resolve to `m.default` in
+                            // dynamic-import chains, regardless of the local
+                            // binding name.
+                            imported_name: Some(Ident::from("default")),
                         },
                     );
                 }
@@ -531,6 +584,7 @@ pub fn build_import_map<'a>(
                             source_module,
                             is_named_import: false,
                             is_type_only: decl_is_type_only,
+                            imported_name: None,
                         },
                     );
                 }
@@ -539,6 +593,17 @@ pub fn build_import_map<'a>(
     }
 
     import_map
+}
+
+/// Extract a `ModuleExportName` as a plain string slice when it's a textual
+/// name. Quoted-string export names (e.g., `import { "string-name" as foo }`)
+/// are not supported for deferrable resolution and return `None`.
+fn module_export_name_to_str<'a>(name: &ModuleExportName<'a>) -> Option<&'a str> {
+    match name {
+        ModuleExportName::IdentifierName(id) => Some(id.name.as_str()),
+        ModuleExportName::IdentifierReference(id) => Some(id.name.as_str()),
+        ModuleExportName::StringLiteral(_) => None,
+    }
 }
 
 /// Find the byte position (in the source) just after the last import statement.
@@ -565,6 +630,16 @@ fn resolve_factory_dep_namespaces<'a>(
         let name = &var.name;
         // Look up this identifier in the import map
         let Some(import_info) = import_map.get(name) else { continue };
+        if import_info.is_type_only {
+            // Type-only imports (`import type { X }` / `import { type X }`) are erased
+            // at runtime, so they cannot be used as DI tokens. Flag the dep so the
+            // factory collapses to `ɵɵinvalidFactory()` and avoid registering a
+            // namespace that would otherwise add a runtime import for the module.
+            // See issue #288.
+            dep.token = None;
+            dep.type_only_invalid = true;
+            continue;
+        }
         // Replace with namespace-prefixed reference: i1.Store instead of Store
         let namespace = namespace_registry.get_or_assign(&import_info.source_module);
         dep.token = Some(OutputExpression::ReadProp(oxc_allocator::Box::new_in(
@@ -572,15 +647,16 @@ fn resolve_factory_dep_namespaces<'a>(
                 receiver: oxc_allocator::Box::new_in(
                     OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                         ReadVarExpr { name: namespace, source_span: None },
-                        allocator,
+                        &allocator,
                     )),
-                    allocator,
+                    &allocator,
                 ),
-                name: name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: import_info.imported_name.clone().unwrap_or_else(|| name.clone()),
                 optional: false,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         )));
     }
 }
@@ -609,15 +685,16 @@ fn resolve_host_directive_namespaces<'a>(
                 receiver: oxc_allocator::Box::new_in(
                     OutputExpression::ReadVar(oxc_allocator::Box::new_in(
                         ReadVarExpr { name: namespace, source_span: None },
-                        allocator,
+                        &allocator,
                     )),
-                    allocator,
+                    &allocator,
                 ),
-                name: name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: import_info.imported_name.clone().unwrap_or_else(|| name.clone()),
                 optional: false,
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
     }
 }
@@ -667,6 +744,70 @@ fn find_last_import_end(program_body: &[Statement<'_>]) -> Option<usize> {
     last_import_end.map(|pos| pos as usize)
 }
 
+/// Build the `ɵsetClassMetadata(...)` declaration string for a non-`@Component`
+/// decorated class (`@Directive`/`@Pipe`/`@Injectable`/`@NgModule`).
+///
+/// Mirrors the `@Component` metadata block (without template/style inlining):
+/// emits the decorator metadata, `ctorParameters` (reflected from the class, with
+/// imported token types namespace-prefixed via the import map), and prop decorators
+/// (real `@Input`/`@Output`/query plus synthesized initializer-API). Returns an
+/// empty string when metadata emission is disabled. Matches ngc, which emits
+/// `setClassMetadata` for all decorated classes (needed for TestBed overrides).
+#[allow(clippy::too_many_arguments)]
+fn build_set_class_metadata_decls<'a>(
+    allocator: &'a Allocator,
+    class: &oxc_ast::ast::Class<'a>,
+    class_name: &str,
+    decorator: &oxc_ast::ast::Decorator<'a>,
+    options: &TransformOptions,
+    source: &'a str,
+    string_consts: &crate::directive::StringConsts<'a>,
+    import_map: &ImportMap<'a>,
+    namespace_registry: &mut NamespaceRegistry<'a>,
+) -> String {
+    if !options.emit_class_metadata || options.advanced_optimizations {
+        return String::new();
+    }
+
+    let type_expr = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+        ReadVarExpr { name: Ident::from(class_name), source_span: None },
+        &allocator,
+    ));
+    let class_metadata = R3ClassMetadata {
+        r#type: type_expr,
+        decorators: build_decorator_metadata_array(
+            &allocator,
+            &[decorator],
+            Some(source),
+            None,
+            None,
+            Some(string_consts),
+        ),
+        ctor_parameters: build_ctor_params_metadata(
+            &allocator,
+            class,
+            None,
+            namespace_registry,
+            import_map,
+            Some(source),
+        ),
+        prop_decorators: build_prop_decorators_metadata(
+            &allocator,
+            class,
+            Some(source),
+            namespace_registry,
+        ),
+    };
+    let metadata_expr = match options.compilation_mode {
+        crate::CompilationMode::Full => compile_class_metadata(allocator, &class_metadata),
+        crate::CompilationMode::Partial => {
+            crate::partial::compile_declare_class_metadata(allocator, &class_metadata)
+        }
+    };
+    let emitter = JsEmitter::new();
+    format!("{};", emitter.emit_expression(&metadata_expr))
+}
+
 // ============================================================================
 // JIT Compilation Transform
 // ============================================================================
@@ -678,6 +819,7 @@ enum AngularDecoratorKind {
     Directive,
     Pipe,
     Injectable,
+    Service,
     NgModule,
 }
 
@@ -685,8 +827,8 @@ enum AngularDecoratorKind {
 struct JitClassInfo {
     /// The class name.
     class_name: String,
-    /// Span of the decorator (including @).
-    decorator_span: Span,
+    /// Spans of ALL class-level decorators (including @) to be removed.
+    all_class_decorator_spans: std::vec::Vec<Span>,
     /// Start of the statement (includes export keyword if present).
     stmt_start: u32,
     /// Start of the class keyword.
@@ -701,10 +843,12 @@ struct JitClassInfo {
     is_abstract: bool,
     /// Constructor parameter info for ctorParameters.
     ctor_params: std::vec::Vec<JitCtorParam>,
-    /// Member decorator info for propDecorators.
+    /// Member decorator info for propDecorators (Angular decorators like @Input, @Output).
     member_decorators: std::vec::Vec<JitMemberDecorator>,
-    /// The modified decorator expression text for __decorate call.
-    decorator_text: String,
+    /// All class-level decorator expression texts for __decorate call, in source order.
+    all_class_decorator_texts: std::vec::Vec<String>,
+    /// Non-Angular member decorators that need __decorate() calls.
+    non_angular_member_decorators: std::vec::Vec<JitNonAngularMemberDecorator>,
 }
 
 /// Constructor parameter info for JIT ctorParameters generation.
@@ -731,9 +875,181 @@ struct JitMemberDecorator {
     decorators: std::vec::Vec<JitParamDecorator>,
 }
 
+/// A non-Angular member decorator that needs to be lowered via __decorate().
+struct JitNonAngularMemberDecorator {
+    /// The member name.
+    member_name: String,
+    /// Whether the member is static.
+    is_static: bool,
+    /// Whether this is a property (field) vs a method/accessor.
+    /// TypeScript uses `void 0` for properties and `null` for methods/accessors.
+    is_property: bool,
+    /// The decorator expression texts (e.g., "Selector()", "Action(AddTodo)").
+    decorator_texts: std::vec::Vec<String>,
+}
+
+/// Whether the class declares its own constructor with at least one parameter.
+///
+/// Used by the `@Service` handler to catch the common-but-broken pattern of
+/// declaring constructor-based DI on a service: upstream service.ts:278-309
+/// surfaces a diagnostic because `@Service` ɵfac is generated with empty
+/// deps, so those parameters would silently become `undefined` at runtime.
+///
+/// Unlike upstream, we don't walk to base classes — that requires cross-file
+/// resolution that oxc doesn't perform. Upstream's LOCAL compilation mode
+/// also skips that walk, and our single-file transform is closer to LOCAL
+/// mode than to a full reflector.
+fn class_has_own_constructor_params(class: &oxc_ast::ast::Class<'_>) -> bool {
+    use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
+    class.body.body.iter().any(|element| {
+        if let ClassElement::MethodDefinition(method) = element {
+            method.kind == MethodDefinitionKind::Constructor
+                && !method.value.params.items.is_empty()
+        } else {
+            false
+        }
+    })
+}
+
+/// Return the `@Service` decorator on a class iff the `Service` identifier
+/// resolves to `@angular/core` via the import map. Returns `None` for a bare
+/// `@Service()` from a third-party library.
+///
+/// `Service` is a common export name in DI containers and web frameworks, so
+/// matching by name alone would misclassify unrelated decorators. Mirrors
+/// the gate in [`find_angular_decorator`].
+fn find_angular_service_decorator<'a>(
+    class: &'a oxc_ast::ast::Class<'a>,
+    import_map: &ImportMap<'a>,
+) -> Option<&'a oxc_ast::ast::Decorator<'a>> {
+    for decorator in &class.decorators {
+        let Expression::CallExpression(call) = &decorator.expression else { continue };
+        let from_angular_core = match &call.callee {
+            Expression::Identifier(id) => {
+                is_angular_core_export(import_map, id.name.as_str(), "Service")
+            }
+            // Namespace form `@ns.Service()`: accept when `ns` is a
+            // namespace import from `@angular/core`. Without this, AOT
+            // would silently skip namespaced services that the JIT path
+            // already classifies correctly.
+            Expression::StaticMemberExpression(member) => {
+                member.property.name.as_str() == "Service"
+                    && match &member.object {
+                        Expression::Identifier(ns) => {
+                            is_angular_core_namespace(import_map, ns.name.as_str())
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        if from_angular_core {
+            return Some(decorator);
+        }
+    }
+    None
+}
+
+/// Whether `local_name` resolves to the named `@angular/core` export.
+///
+/// Matches when the import is from `@angular/core` AND the original exported
+/// name equals `exported_name` — so `import { Injectable as Service }` does
+/// not pass `is_angular_core_export(.., "Service", "Service")` even though
+/// the local binding is `Service`. Bare `import { Service }` (no alias)
+/// passes because `imported_name` is `None`, meaning the local name and the
+/// exported name agree.
+pub(crate) fn is_angular_core_export(
+    import_map: &ImportMap<'_>,
+    local_name: &str,
+    exported_name: &str,
+) -> bool {
+    let Some(info) = import_map.get(&Ident::from(local_name)) else { return false };
+    if info.source_module.as_str() != "@angular/core" {
+        return false;
+    }
+    match &info.imported_name {
+        Some(imported) => imported.as_str() == exported_name,
+        None => local_name == exported_name,
+    }
+}
+
+/// Whether `local_name` is a namespace import (`import * as ns from ...`)
+/// from `@angular/core`. Used to validate namespace-style decorator calls
+/// like `@ns.Service()` — without this check, any third-party namespace
+/// `Service` decorator would classify as the Angular v22 decorator.
+pub(crate) fn is_angular_core_namespace(import_map: &ImportMap<'_>, local_name: &str) -> bool {
+    import_map
+        .get(&Ident::from(local_name))
+        .map(|info| info.source_module.as_str() == "@angular/core" && !info.is_named_import)
+        .unwrap_or(false)
+}
+
+/// Return the name of the first non-`Service` `@angular/core` decorator on
+/// the class, if any. Used to enforce upstream's collision rule (see
+/// `service.ts:101-116`): `@Service` cannot coexist with another Angular
+/// decorator on the same class.
+fn find_conflicting_angular_decorator<'a>(
+    class: &'a oxc_ast::ast::Class<'a>,
+    import_map: &ImportMap<'a>,
+) -> Option<&'a str> {
+    const ANGULAR_DECORATORS: &[&str] =
+        &["Component", "Directive", "Pipe", "Injectable", "NgModule"];
+
+    for decorator in &class.decorators {
+        let name = match &decorator.expression {
+            Expression::CallExpression(call) => match &call.callee {
+                Expression::Identifier(id) => id.name.as_str(),
+                Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if !ANGULAR_DECORATORS.contains(&name) {
+            continue;
+        }
+        // Verify the import resolves to @angular/core for both identifier
+        // and namespace callees. Without the namespace lookup, an unrelated
+        // `@thirdParty.Component()` on an @Service class would falsely
+        // trigger the collision preflight and block valid services.
+        let is_angular = if let Expression::CallExpression(call) = &decorator.expression {
+            match &call.callee {
+                Expression::Identifier(id) => import_map
+                    .get(&Ident::from(id.name.as_str()))
+                    .map(|info| info.source_module.as_str() == "@angular/core")
+                    .unwrap_or(false),
+                Expression::StaticMemberExpression(member) => match &member.object {
+                    Expression::Identifier(ns) => {
+                        is_angular_core_namespace(import_map, ns.name.as_str())
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if is_angular {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Find any Angular decorator on a class and return its kind and the decorator reference.
+///
+/// For the `Service` identifier specifically, the import map is consulted so a
+/// bare `@Service()` from a non-Angular library doesn't shadow a real Angular
+/// decorator that follows it on the same class. `Service` is common enough as a
+/// library export name (DI containers, web frameworks) that name-only matching
+/// would cause the JIT pipeline to either misclassify the class or, on
+/// pre-v22 targets, emit a misleading diagnostic and skip the sibling
+/// `@Component`/`@Injectable`/etc. Other Angular decorator names are unique
+/// enough in practice that the same check isn't applied to them — and doing so
+/// would regress namespace-style usage like `@core.Component()` where the
+/// identifier isn't directly in the import map.
 fn find_angular_decorator<'a>(
     class: &'a oxc_ast::ast::Class<'a>,
+    import_map: &ImportMap<'a>,
 ) -> Option<(AngularDecoratorKind, &'a oxc_ast::ast::Decorator<'a>)> {
     for decorator in &class.decorators {
         if let Expression::CallExpression(call) = &decorator.expression {
@@ -742,13 +1058,40 @@ fn find_angular_decorator<'a>(
                 Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
                 _ => None,
             };
-            match name {
-                Some("Component") => return Some((AngularDecoratorKind::Component, decorator)),
-                Some("Directive") => return Some((AngularDecoratorKind::Directive, decorator)),
-                Some("Pipe") => return Some((AngularDecoratorKind::Pipe, decorator)),
-                Some("Injectable") => return Some((AngularDecoratorKind::Injectable, decorator)),
-                Some("NgModule") => return Some((AngularDecoratorKind::NgModule, decorator)),
-                _ => {}
+            let kind = match name {
+                Some("Component") => Some(AngularDecoratorKind::Component),
+                Some("Directive") => Some(AngularDecoratorKind::Directive),
+                Some("Pipe") => Some(AngularDecoratorKind::Pipe),
+                Some("Injectable") => Some(AngularDecoratorKind::Injectable),
+                Some("Service") => Some(AngularDecoratorKind::Service),
+                Some("NgModule") => Some(AngularDecoratorKind::NgModule),
+                _ => None,
+            };
+
+            if matches!(kind, Some(AngularDecoratorKind::Service)) {
+                let from_angular_core = match &call.callee {
+                    Expression::Identifier(id) => {
+                        is_angular_core_export(import_map, id.name.as_str(), "Service")
+                    }
+                    // Namespace form `@ns.Service()`: verify `ns` is a
+                    // namespace import from `@angular/core`. Without this,
+                    // any `@third.Service()` from a third-party namespace
+                    // import would classify as the v22 decorator.
+                    Expression::StaticMemberExpression(member) => match &member.object {
+                        Expression::Identifier(ns) => {
+                            is_angular_core_namespace(import_map, ns.name.as_str())
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !from_angular_core {
+                    continue;
+                }
+            }
+
+            if let Some(k) = kind {
+                return Some((k, decorator));
             }
         }
     }
@@ -824,38 +1167,72 @@ fn extract_jit_ctor_params(
     params
 }
 
-/// Extract Angular member decorators for JIT propDecorators generation.
+/// Angular field decorators that go into `static propDecorators`.
+/// Matches Angular's official `FIELD_DECORATORS` constant from `@angular/compiler-cli`.
+const ANGULAR_FIELD_DECORATORS: &[&str] = &[
+    "Input",
+    "Output",
+    "HostBinding",
+    "HostListener",
+    "ViewChild",
+    "ViewChildren",
+    "ContentChild",
+    "ContentChildren",
+];
+
+/// All Angular decorator names from `@angular/core`.
+/// Any decorator with one of these names is treated as Angular and excluded from
+/// non-Angular `__decorate()` lowering. Angular identifies decorators by import source;
+/// we use names since they're unique to `@angular/core`.
+const ANGULAR_DECORATOR_NAMES: &[&str] = &[
+    // Field decorators (→ propDecorators)
+    "Input",
+    "Output",
+    "HostBinding",
+    "HostListener",
+    "ViewChild",
+    "ViewChildren",
+    "ContentChild",
+    "ContentChildren",
+    // Parameter decorators (→ ctorParameters)
+    "Inject",
+    "Optional",
+    "Self",
+    "SkipSelf",
+    "Host",
+    "Attribute",
+    // Class decorators (→ class __decorate)
+    "Component",
+    "Directive",
+    "Pipe",
+    "Injectable",
+    "Service",
+    "NgModule",
+];
+
+/// Extract all member decorators for JIT transformation in a single pass.
 ///
-/// Collects all Angular-relevant decorators from class properties/methods
-/// (excluding constructor) so they can be emitted as a `static propDecorators` property.
-fn extract_jit_member_decorators(
+/// Returns two collections:
+/// - Angular field decorators → emitted as `static propDecorators = { ... }`
+/// - Non-Angular decorators → emitted as `__decorate([...], target, "name", desc)` calls
+fn extract_all_jit_member_decorators(
     source: &str,
     class: &oxc_ast::ast::Class<'_>,
-) -> std::vec::Vec<JitMemberDecorator> {
+) -> (std::vec::Vec<JitMemberDecorator>, std::vec::Vec<JitNonAngularMemberDecorator>) {
     use oxc_ast::ast::{ClassElement, MethodDefinitionKind, PropertyKey};
 
-    const ANGULAR_MEMBER_DECORATORS: &[&str] = &[
-        "Input",
-        "Output",
-        "HostBinding",
-        "HostListener",
-        "ViewChild",
-        "ViewChildren",
-        "ContentChild",
-        "ContentChildren",
-    ];
-
-    let mut result: std::vec::Vec<JitMemberDecorator> = std::vec::Vec::new();
+    let mut angular_members: std::vec::Vec<JitMemberDecorator> = std::vec::Vec::new();
+    let mut non_angular_members: std::vec::Vec<JitNonAngularMemberDecorator> = std::vec::Vec::new();
 
     for element in &class.body.body {
-        let (member_name, decorators) = match element {
+        let (member_name, is_static, is_property, decorators, initializer) = match element {
             ClassElement::PropertyDefinition(prop) => {
                 let name = match &prop.key {
                     PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, &prop.decorators)
+                (name, prop.r#static, true, &prop.decorators, prop.value.as_ref())
             }
             ClassElement::MethodDefinition(method) => {
                 if method.kind == MethodDefinitionKind::Constructor {
@@ -866,7 +1243,7 @@ fn extract_jit_member_decorators(
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, &method.decorators)
+                (name, method.r#static, false, &method.decorators, None)
             }
             ClassElement::AccessorProperty(accessor) => {
                 let name = match &accessor.key {
@@ -874,12 +1251,15 @@ fn extract_jit_member_decorators(
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                (name, &accessor.decorators)
+                (name, accessor.r#static, false, &accessor.decorators, None)
             }
             _ => continue,
         };
 
         let mut angular_decs: std::vec::Vec<JitParamDecorator> = std::vec::Vec::new();
+        let mut non_angular_texts: std::vec::Vec<String> = std::vec::Vec::new();
+        let mut explicit_field_decorators: rustc_hash::FxHashSet<String> =
+            rustc_hash::FxHashSet::default();
 
         for decorator in decorators {
             let (dec_name, call_args) = match &decorator.expression {
@@ -902,17 +1282,318 @@ fn extract_jit_member_decorators(
                 _ => continue,
             };
 
-            if ANGULAR_MEMBER_DECORATORS.contains(&dec_name.as_str()) {
+            if ANGULAR_FIELD_DECORATORS.contains(&dec_name.as_str()) {
+                // Angular field decorator → goes into propDecorators
+                explicit_field_decorators.insert(dec_name.clone());
                 angular_decs.push(JitParamDecorator { name: dec_name, args: call_args });
+            } else if !ANGULAR_DECORATOR_NAMES.contains(&dec_name.as_str()) {
+                // Non-Angular decorator → goes into __decorate() call
+                let expr_start = decorator.expression.span().start;
+                let expr_end = decorator.expression.span().end;
+                non_angular_texts.push(source[expr_start as usize..expr_end as usize].to_string());
             }
+            // Angular non-field decorators (e.g. @Inject on a member) are silently dropped
+            // since they have no meaningful effect on members.
+        }
+
+        // Signal initializer-API lowering: synthesize @Input / @Output / @ViewChild / etc.
+        // decorators from `input()`, `output()`, `model()`, `viewChild*()`, `contentChild*()`
+        // initializers so the runtime JIT facade can discover them via `propDecorators`.
+        // Mirrors `packages/compiler-cli/src/ngtsc/transform/jit/src/initializer_api_transforms/`.
+        // When an explicit matching decorator already exists, the explicit one wins.
+        if let Some(init) = initializer {
+            let synthesized = synthesize_signal_api_decorators(
+                source,
+                init,
+                &member_name,
+                &explicit_field_decorators,
+            );
+            angular_decs.extend(synthesized);
         }
 
         if !angular_decs.is_empty() {
-            result.push(JitMemberDecorator { member_name, decorators: angular_decs });
+            angular_members.push(JitMemberDecorator {
+                member_name: member_name.clone(),
+                decorators: angular_decs,
+            });
+        }
+
+        if !non_angular_texts.is_empty() {
+            non_angular_members.push(JitNonAngularMemberDecorator {
+                member_name,
+                is_static,
+                is_property,
+                decorator_texts: non_angular_texts,
+            });
         }
     }
 
-    result
+    (angular_members, non_angular_members)
+}
+
+/// Strip `as`/`satisfies`/parenthesized wrappers around an initializer expression,
+/// mirroring ngc's `tryParseInitializerApi` (e.g. `x = input(0) as any`, `x = (input(0))`).
+fn unwrap_jit_initializer<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
+    match expr {
+        Expression::TSAsExpression(e) => unwrap_jit_initializer(&e.expression),
+        Expression::TSSatisfiesExpression(e) => unwrap_jit_initializer(&e.expression),
+        Expression::ParenthesizedExpression(e) => unwrap_jit_initializer(&e.expression),
+        _ => expr,
+    }
+}
+
+/// Recognized initializer API kinds. Used to dispatch synthesis.
+#[derive(Debug, Clone, Copy)]
+enum InitializerApiKind {
+    Input,
+    InputRequired,
+    Output,
+    OutputFromObservable,
+    Model,
+    ModelRequired,
+    ViewChild,
+    ViewChildRequired,
+    ViewChildren,
+    ContentChild,
+    ContentChildRequired,
+    ContentChildren,
+}
+
+/// Identify which initializer API a call expression represents.
+///
+/// Handles three call shapes:
+/// - bare identifier: `input(...)`, `output(...)`
+/// - `.required` member: `input.required(...)`, `model.required(...)`
+/// - namespaced: `core.input(...)`, `core.viewChild.required(...)`
+fn classify_initializer_api(callee: &Expression<'_>) -> Option<InitializerApiKind> {
+    fn match_name(name: &str) -> Option<InitializerApiKind> {
+        match name {
+            "input" => Some(InitializerApiKind::Input),
+            "output" => Some(InitializerApiKind::Output),
+            "outputFromObservable" => Some(InitializerApiKind::OutputFromObservable),
+            "model" => Some(InitializerApiKind::Model),
+            "viewChild" => Some(InitializerApiKind::ViewChild),
+            "viewChildren" => Some(InitializerApiKind::ViewChildren),
+            "contentChild" => Some(InitializerApiKind::ContentChild),
+            "contentChildren" => Some(InitializerApiKind::ContentChildren),
+            _ => None,
+        }
+    }
+    fn required_variant(base: InitializerApiKind) -> Option<InitializerApiKind> {
+        match base {
+            InitializerApiKind::Input => Some(InitializerApiKind::InputRequired),
+            InitializerApiKind::Model => Some(InitializerApiKind::ModelRequired),
+            InitializerApiKind::ViewChild => Some(InitializerApiKind::ViewChildRequired),
+            InitializerApiKind::ContentChild => Some(InitializerApiKind::ContentChildRequired),
+            _ => None,
+        }
+    }
+
+    match callee {
+        Expression::Identifier(id) => match_name(id.name.as_str()),
+        Expression::StaticMemberExpression(member) => {
+            // `<base>.required` — find the underlying base API and promote it.
+            if member.property.name == "required" {
+                let base = match &member.object {
+                    Expression::Identifier(id) => match_name(id.name.as_str())?,
+                    Expression::StaticMemberExpression(inner) => {
+                        // Namespaced: `core.input.required`
+                        match_name(inner.property.name.as_str())?
+                    }
+                    _ => return None,
+                };
+                required_variant(base)
+            } else {
+                // Namespaced: `core.input(...)`. The outer property *is* the function name.
+                match &member.object {
+                    Expression::Identifier(_) => match_name(member.property.name.as_str()),
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Namespace alias under which `@angular/core` is imported when JIT synthesis needs
+/// to reference decorator names that the user didn't import (e.g. `Input` for a
+/// `@Component` that uses `input()` but didn't import the capital-letter decorator).
+///
+/// Matches ngc's `createSyntheticAngularCoreDecoratorAccess`, which emits
+/// `i0.Input` / `i0.Output` / etc. backed by `import * as i0 from "@angular/core"`.
+/// Without this prefixing, the synthesized `static propDecorators` would reference
+/// an undefined identifier and throw `ReferenceError` at module-evaluation time.
+pub(crate) const JIT_ANGULAR_CORE_NS: &str = "i0";
+
+/// Inspect a property initializer; if it matches a recognized signal initializer API,
+/// return the synthesized `propDecorators` entries that JIT runtime needs.
+///
+/// `existing` contains the names of explicit field decorators already present on the
+/// property (e.g. `Input`, `Output`); we skip synthesis when the user-authored decorator
+/// already covers the binding (matches upstream behavior — explicit decorator wins).
+///
+/// Synthesized decorator names are namespace-prefixed (e.g. `i0.Input`) — see
+/// [`JIT_ANGULAR_CORE_NS`]. The caller is responsible for emitting the matching
+/// `import * as i0 from "@angular/core"` when any synthesis occurred.
+fn synthesize_signal_api_decorators(
+    source: &str,
+    initializer: &Expression<'_>,
+    field_name: &str,
+    existing: &rustc_hash::FxHashSet<String>,
+) -> std::vec::Vec<JitParamDecorator> {
+    let unwrapped = unwrap_jit_initializer(initializer);
+    let Expression::CallExpression(call) = unwrapped else { return std::vec::Vec::new() };
+    let Some(kind) = classify_initializer_api(&call.callee) else { return std::vec::Vec::new() };
+
+    match kind {
+        InitializerApiKind::Input | InitializerApiKind::InputRequired => {
+            if existing.contains("Input") {
+                return std::vec::Vec::new();
+            }
+            let required = matches!(kind, InitializerApiKind::InputRequired);
+            // input(initial, options?) → options is args[1]; input.required(options?) → args[0].
+            let options_index = if required { 0 } else { 1 };
+            let alias = extract_string_option(call, options_index, "alias")
+                .unwrap_or_else(|| field_name.to_string());
+            let args = format!(
+                "{{ isSignal: true, alias: \"{alias}\", required: {required}, transform: undefined }}",
+                alias = escape_js_string(&alias),
+                required = required,
+            );
+            std::vec::Vec::from([JitParamDecorator {
+                name: format!("{JIT_ANGULAR_CORE_NS}.Input"),
+                args: Some(args),
+            }])
+        }
+        InitializerApiKind::Output | InitializerApiKind::OutputFromObservable => {
+            if existing.contains("Output") {
+                return std::vec::Vec::new();
+            }
+            // output(options?) → args[0]; outputFromObservable(source, options?) → args[1].
+            let options_index =
+                if matches!(kind, InitializerApiKind::OutputFromObservable) { 1 } else { 0 };
+            let alias = extract_string_option(call, options_index, "alias")
+                .unwrap_or_else(|| field_name.to_string());
+            let args = format!("\"{}\"", escape_js_string(&alias));
+            std::vec::Vec::from([JitParamDecorator {
+                name: format!("{JIT_ANGULAR_CORE_NS}.Output"),
+                args: Some(args),
+            }])
+        }
+        InitializerApiKind::Model | InitializerApiKind::ModelRequired => {
+            // model() is two bindings — block if either @Input or @Output is already present.
+            if existing.contains("Input") || existing.contains("Output") {
+                return std::vec::Vec::new();
+            }
+            let required = matches!(kind, InitializerApiKind::ModelRequired);
+            // Same arg layout as input.
+            let options_index = if required { 0 } else { 1 };
+            let alias = extract_string_option(call, options_index, "alias")
+                .unwrap_or_else(|| field_name.to_string());
+            let input_args = format!(
+                "{{ isSignal: true, alias: \"{alias}\", required: {required}, transform: undefined }}",
+                alias = escape_js_string(&alias),
+                required = required,
+            );
+            let output_args = format!("\"{}Change\"", escape_js_string(&alias));
+            std::vec::Vec::from([
+                JitParamDecorator {
+                    name: format!("{JIT_ANGULAR_CORE_NS}.Input"),
+                    args: Some(input_args),
+                },
+                JitParamDecorator {
+                    name: format!("{JIT_ANGULAR_CORE_NS}.Output"),
+                    args: Some(output_args),
+                },
+            ])
+        }
+        InitializerApiKind::ViewChild
+        | InitializerApiKind::ViewChildRequired
+        | InitializerApiKind::ViewChildren
+        | InitializerApiKind::ContentChild
+        | InitializerApiKind::ContentChildRequired
+        | InitializerApiKind::ContentChildren => {
+            // Any existing query decorator blocks all query synthesis on this field.
+            const QUERY_DECS: &[&str] =
+                &["ViewChild", "ViewChildren", "ContentChild", "ContentChildren"];
+            if QUERY_DECS.iter().any(|d| existing.contains(*d)) {
+                return std::vec::Vec::new();
+            }
+            let decorator_name = match kind {
+                InitializerApiKind::ViewChild | InitializerApiKind::ViewChildRequired => {
+                    "ViewChild"
+                }
+                InitializerApiKind::ViewChildren => "ViewChildren",
+                InitializerApiKind::ContentChild | InitializerApiKind::ContentChildRequired => {
+                    "ContentChild"
+                }
+                InitializerApiKind::ContentChildren => "ContentChildren",
+                _ => unreachable!(),
+            };
+            // Mirror ngc query lowering: positional args carry over; isSignal is folded into
+            // the options object (spreading the existing options if present).
+            let Some(locator_arg) = call.arguments.first() else { return std::vec::Vec::new() };
+            let locator_text = source
+                [locator_arg.span().start as usize..locator_arg.span().end as usize]
+                .to_string();
+            let options_text = if let Some(opts_arg) = call.arguments.get(1) {
+                let opts_src =
+                    &source[opts_arg.span().start as usize..opts_arg.span().end as usize];
+                format!("{{ ...{}, isSignal: true }}", opts_src)
+            } else {
+                "{ isSignal: true }".to_string()
+            };
+            let args = format!("{locator_text}, {options_text}");
+            std::vec::Vec::from([JitParamDecorator {
+                name: format!("{JIT_ANGULAR_CORE_NS}.{decorator_name}"),
+                args: Some(args),
+            }])
+        }
+    }
+}
+
+/// Returns `true` when any field of any JIT class has a synthesized decorator
+/// (signal API lowering) that references the `@angular/core` namespace. Used to
+/// gate the emission of `import * as i0 from "@angular/core"`.
+fn jit_classes_need_angular_core_namespace(jit_classes: &[JitClassInfo]) -> bool {
+    let prefix = format!("{JIT_ANGULAR_CORE_NS}.");
+    jit_classes.iter().any(|info| {
+        info.member_decorators
+            .iter()
+            .any(|m| m.decorators.iter().any(|d| d.name.starts_with(&prefix)))
+    })
+}
+
+/// Pull a string option (e.g. `alias`) from the object literal at `args[options_index]`.
+/// Returns `None` if the argument isn't an object literal or the option is missing/non-string.
+fn extract_string_option(
+    call: &oxc_ast::ast::CallExpression<'_>,
+    options_index: usize,
+    option_name: &str,
+) -> Option<String> {
+    let arg = call.arguments.get(options_index)?;
+    let Argument::ObjectExpression(obj) = arg else { return None };
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(prop) = prop else { continue };
+        let key_matches = match &prop.key {
+            PropertyKey::StaticIdentifier(id) => id.name.as_str() == option_name,
+            PropertyKey::StringLiteral(s) => s.value.as_str() == option_name,
+            _ => false,
+        };
+        if !key_matches {
+            continue;
+        }
+        if let Expression::StringLiteral(s) = &prop.value {
+            return Some(s.value.to_string());
+        }
+    }
+    None
+}
+
+/// Minimal JS-string escape for values embedded in synthesized propDecorator text.
+/// Property names are TS identifiers or string literals, so only `\` and `"` matter.
+fn escape_js_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Build the propDecorators static property text for JIT member decorator metadata.
@@ -1026,12 +1707,18 @@ fn build_ctor_parameters_text(params: &[JitCtorParam]) -> Option<String> {
 /// - `templateUrl: './path'` → `template: __NG_CLI_RESOURCE__N`
 /// - `styleUrl: './path'` → `styles: [__NG_CLI_RESOURCE__N]`
 /// - `styleUrls: ['./a', './b']` → `styles: [__NG_CLI_RESOURCE__N, __NG_CLI_RESOURCE__M]`
-fn build_jit_decorator_text(
+///
+/// `consts` and `allocator` enable folding the same identifier and template-
+/// literal interpolation shapes as the AOT metadata extraction path (e.g.
+/// `` templateUrl: `${DIR}/x.html` `` with a same-file `const DIR = '...'`).
+fn build_jit_decorator_text<'a>(
+    allocator: &'a Allocator,
     source: &str,
-    decorator: &oxc_ast::ast::Decorator<'_>,
+    decorator: &oxc_ast::ast::Decorator<'a>,
     decorator_kind: AngularDecoratorKind,
     resource_counter: &mut u32,
     resource_imports: &mut std::vec::Vec<(String, String)>, // (import_name, specifier)
+    consts: &crate::directive::StringConsts<'a>,
 ) -> String {
     let expr_start = decorator.expression.span().start as usize;
     let expr_end = decorator.expression.span().end as usize;
@@ -1068,10 +1755,14 @@ fn build_jit_decorator_text(
 
             match key_name {
                 Some("templateUrl") => {
-                    // Extract the URL string value
-                    if let Expression::StringLiteral(s) = &prop.value {
+                    // Resolve the URL through the same const/template-literal
+                    // folder used by AOT extraction so JIT and AOT accept the
+                    // same metadata shapes.
+                    if let Some(url) =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts)
+                    {
                         let import_name = format!("__NG_CLI_RESOURCE__{}", *resource_counter);
-                        let specifier = format!("angular:jit:template:file;{}", s.value.as_str());
+                        let specifier = format!("angular:jit:template:file;{}", url.as_str());
                         resource_imports.push((import_name.clone(), specifier));
 
                         // Replace the entire property: `templateUrl: './app.html'` → `template: __NG_CLI_RESOURCE__0`
@@ -1084,9 +1775,11 @@ fn build_jit_decorator_text(
                 }
                 Some("styleUrl") => {
                     // Single style URL
-                    if let Expression::StringLiteral(s) = &prop.value {
+                    if let Some(url) =
+                        crate::directive::extract_string_value(allocator, &prop.value, consts)
+                    {
                         let import_name = format!("__NG_CLI_RESOURCE__{}", *resource_counter);
-                        let specifier = format!("angular:jit:style:file;{}", s.value.as_str());
+                        let specifier = format!("angular:jit:style:file;{}", url.as_str());
                         resource_imports.push((import_name.clone(), specifier));
 
                         let prop_start = prop.span.start as usize - expr_start;
@@ -1097,15 +1790,22 @@ fn build_jit_decorator_text(
                     }
                 }
                 Some("styleUrls") => {
-                    // Array of style URLs
+                    // Array of style URLs — fold each element through the same
+                    // resolver so `${DIR}/a.css`-style entries are accepted.
                     if let Expression::ArrayExpression(arr) = &prop.value {
                         let mut style_refs = std::vec::Vec::new();
                         for elem in &arr.elements {
-                            if let ArrayExpressionElement::StringLiteral(s) = elem {
+                            // ArrayExpressionElement variants that can hold a
+                            // value expression all carry one — funnel them
+                            // through `as_expression()` and let the resolver
+                            // decide which shapes fold.
+                            let Some(elem_expr) = elem.as_expression() else { continue };
+                            if let Some(url) =
+                                crate::directive::extract_string_value(allocator, elem_expr, consts)
+                            {
                                 let import_name =
                                     format!("__NG_CLI_RESOURCE__{}", *resource_counter);
-                                let specifier =
-                                    format!("angular:jit:style:file;{}", s.value.as_str());
+                                let specifier = format!("angular:jit:style:file;{}", url.as_str());
                                 resource_imports.push((import_name.clone(), specifier));
                                 style_refs.push(import_name);
                                 *resource_counter += 1;
@@ -1140,6 +1840,128 @@ fn build_jit_decorator_text(
     result
 }
 
+/// Collect names of constructor parameters that have modifiers (parameter properties).
+/// These will generate field declarations in oxc 0.129.0 which we need to remove.
+fn collect_parameter_property_names(
+    program: &oxc_ast::ast::Program,
+) -> rustc_hash::FxHashSet<String> {
+    use oxc_ast::ast::{ClassElement, Statement};
+    use rustc_hash::FxHashSet;
+
+    let mut names = FxHashSet::default();
+
+    fn visit_class(class: &oxc_ast::ast::Class, names: &mut FxHashSet<String>) {
+        for element in &class.body.body {
+            if let ClassElement::MethodDefinition(method) = element {
+                if method.kind.is_constructor() {
+                    for param in &method.value.params.items {
+                        if param.accessibility.is_some() || param.readonly || param.r#override {
+                            if let Some(ident) = param.pattern.get_identifier_name() {
+                                names.insert(ident.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for stmt in &program.body {
+        match stmt {
+            Statement::ClassDeclaration(class_decl) => {
+                visit_class(class_decl, &mut names);
+            }
+            Statement::ExportDeclaration(export) => {
+                if let oxc_ast::ast::Declaration::ClassDeclaration(class_decl) = &export.declaration
+                {
+                    visit_class(class_decl, &mut names);
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl) =
+                    &export.declaration
+                {
+                    visit_class(class_decl, &mut names);
+                }
+            }
+            Statement::VariableDeclaration(var_decl) => {
+                // Handle: let AppComponent = class AppComponent { ... }
+                for declarator in &var_decl.declarations {
+                    if let Some(oxc_ast::ast::Expression::ClassExpression(class_expr)) =
+                        &declarator.init
+                    {
+                        visit_class(class_expr, &mut names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    names
+}
+
+/// Remove field declarations that were generated from parameter properties.
+/// oxc 0.129.0 generates field declarations for parameter properties, but we don't want them in JIT mode.
+fn remove_parameter_property_fields(
+    program: &mut oxc_ast::ast::Program,
+    param_names: &rustc_hash::FxHashSet<String>,
+) {
+    use oxc_ast::ast::{ClassElement, Statement};
+
+    fn visit_class(class: &mut oxc_ast::ast::Class, param_names: &rustc_hash::FxHashSet<String>) {
+        class.body.body.retain(|element| {
+            if let ClassElement::PropertyDefinition(prop) = element {
+                // Remove field if it:
+                // 1. Has no initializer
+                // 2. Has no decorators
+                // 3. Matches a parameter property name
+                if prop.value.is_none() && prop.decorators.is_empty() {
+                    if let oxc_ast::ast::PropertyKey::StaticIdentifier(ident) = &prop.key {
+                        if param_names.contains(ident.name.as_str()) {
+                            return false; // Remove this field
+                        }
+                    }
+                }
+            }
+            true // Keep this element
+        });
+    }
+
+    for stmt in &mut program.body {
+        match stmt {
+            Statement::ClassDeclaration(class_decl) => {
+                visit_class(class_decl, param_names);
+            }
+            Statement::ExportDeclaration(export) => {
+                if let oxc_ast::ast::Declaration::ClassDeclaration(class_decl) =
+                    &mut export.declaration
+                {
+                    visit_class(class_decl, param_names);
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl) =
+                    &mut export.declaration
+                {
+                    visit_class(class_decl, param_names);
+                }
+            }
+            Statement::VariableDeclaration(var_decl) => {
+                // Handle: let AppComponent = class AppComponent { ... }
+                for declarator in &mut var_decl.declarations {
+                    if let Some(oxc_ast::ast::Expression::ClassExpression(class_expr)) =
+                        &mut declarator.init
+                    {
+                        visit_class(class_expr, param_names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Transform an Angular TypeScript file in JIT (Just-In-Time) compilation mode.
 ///
 /// Strip TypeScript syntax from JIT output using oxc_transformer.
@@ -1149,11 +1971,39 @@ fn build_jit_decorator_text(
 fn strip_typescript(allocator: &Allocator, path: &str, code: &str) -> String {
     let source_type = SourceType::from_path(path).unwrap_or_default();
     let parser_ret = Parser::new(allocator, code, source_type).parse();
-    if parser_ret.panicked {
+    if parser_ret.fatal_error {
         return code.to_string();
     }
 
     let mut program = parser_ret.program;
+
+    // Collect parameter property names before oxc transforms them.
+    // In oxc 0.129.0, parameter properties generate field declarations which we need to remove.
+    let param_property_names = collect_parameter_property_names(&program);
+
+    // An import whose specifiers all carry inline `type` modifiers has no runtime
+    // bindings. Promote it to `import type` so `only_remove_type_imports` elides
+    // the whole statement instead of leaving a bare side-effect import behind.
+    // This intentionally diverges from tsc's verbatimModuleSyntax (which keeps
+    // `import {}` for side effects) to match Angular CLI's esbuild pipeline;
+    // side effects need an explicit `import 'mod'`, which is left untouched.
+    for stmt in &mut program.body {
+        if let Statement::ImportDeclaration(import_decl) = stmt
+            && import_decl.import_kind == ImportOrExportKind::Value
+            && import_decl.specifiers.as_ref().is_some_and(|specs| {
+                !specs.is_empty()
+                    && specs.iter().all(|spec| {
+                        matches!(
+                            spec,
+                            ImportDeclarationSpecifier::ImportSpecifier(s)
+                                if s.import_kind.is_type()
+                        )
+                    })
+            })
+        {
+            import_decl.import_kind = ImportOrExportKind::Type;
+        }
+    }
 
     let semantic_ret =
         oxc_semantic::SemanticBuilder::new().with_excess_capacity(2.0).build(&program);
@@ -1167,6 +2017,10 @@ fn strip_typescript(allocator: &Allocator, path: &str, code: &str) -> String {
     let transformer =
         oxc_transformer::Transformer::new(allocator, Path::new(path), &transform_options);
     transformer.build_with_scoping(semantic_ret.semantic.into_scoping(), &mut program);
+
+    // Remove field declarations that were generated from parameter properties.
+    // oxc 0.129.0 adds field declarations for parameter properties, but we don't want them in JIT mode.
+    remove_parameter_property_fields(&mut program, &param_property_names);
 
     let codegen_ret = oxc_codegen::Codegen::new().with_source_text(code).build(&program);
 
@@ -1191,8 +2045,8 @@ fn transform_angular_file_jit(
     let source_type = SourceType::from_path(path).unwrap_or_default();
     let parser_ret = Parser::new(allocator, source, source_type).parse();
 
-    if !parser_ret.errors.is_empty() {
-        for error in parser_ret.errors {
+    if !parser_ret.diagnostics.is_empty() {
+        for error in parser_ret.diagnostics {
             result.diagnostics.push(OxcDiagnostic::error(error.to_string()));
         }
     }
@@ -1201,6 +2055,17 @@ fn transform_angular_file_jit(
     // JIT mode needs all imports preserved because constructor parameter types
     // are referenced at runtime in ctorParameters. Angular's TS JIT transform
     // patches TypeScript's import elision for the same reason.
+
+    // Collect file-scope string consts so the JIT decorator rewriter can fold
+    // identifier and template-literal references in `templateUrl` / `styleUrl`
+    // / `styleUrls`, matching the AOT metadata extraction path.
+    let string_consts = collect_string_consts(allocator, &parser_ret.program);
+
+    // Build an import map so `find_angular_decorator` can verify that a bare
+    // `@Service()` is actually Angular's, not a same-named decorator from
+    // another library.
+    let import_map =
+        build_import_map(allocator, &parser_ret.program.body, options.resolved_imports.as_ref());
 
     // 3. Walk AST to find Angular-decorated classes
     let mut jit_classes: std::vec::Vec<JitClassInfo> = std::vec::Vec::new();
@@ -1218,8 +2083,8 @@ fn transform_angular_file_jit(
                 }
                 _ => (None, 0, false, false),
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => {
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => {
                     (Some(class.as_ref()), export.span.start, true, false)
                 }
                 _ => (None, 0, false, false),
@@ -1232,28 +2097,64 @@ fn transform_angular_file_jit(
             continue;
         };
 
-        let Some((decorator_kind, decorator)) = find_angular_decorator(class) else {
+        let Some((decorator_kind, angular_decorator)) = find_angular_decorator(class, &import_map)
+        else {
             continue;
         };
 
-        // Build modified decorator text (replaces templateUrl/styleUrl with resource imports)
-        let decorator_text = build_jit_decorator_text(
-            source,
-            decorator,
-            decorator_kind,
-            &mut resource_counter,
-            &mut resource_imports,
-        );
+        // Version gating: the `@Service` decorator requires Angular v22+, where the
+        // runtime JIT facade gained `compileService`/`ɵɵdefineService`. When targeting an
+        // older version, surface the gap and leave the decorator unchanged (pass-through)
+        // so the JIT downlevel pipeline doesn't emit metadata the runtime can't consume.
+        // When the version is unknown, assume support (matches the `map_or(true, …)` pattern).
+        if matches!(decorator_kind, AngularDecoratorKind::Service)
+            && !options.angular_version.map_or(true, |v| v.supports_service_decorator())
+        {
+            result.diagnostics.push(OxcDiagnostic::error(format!(
+                "The @Service decorator on '{}' requires Angular v22 or later.",
+                class_name
+            )));
+            continue;
+        }
+
+        // Collect ALL class-level decorator spans and texts (in source order)
+        let mut all_class_decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
+        let mut all_class_decorator_texts: std::vec::Vec<String> = std::vec::Vec::new();
+
+        for dec in &class.decorators {
+            all_class_decorator_spans.push(dec.span);
+
+            // Check if this is the Angular decorator that needs special text transformation
+            if dec.span == angular_decorator.span {
+                let text = build_jit_decorator_text(
+                    &allocator,
+                    source,
+                    dec,
+                    decorator_kind,
+                    &mut resource_counter,
+                    &mut resource_imports,
+                    &string_consts,
+                );
+                all_class_decorator_texts.push(text);
+            } else {
+                // Non-Angular decorator: extract expression text from source (without @)
+                let expr_start = dec.expression.span().start;
+                let expr_end = dec.expression.span().end;
+                all_class_decorator_texts
+                    .push(source[expr_start as usize..expr_end as usize].to_string());
+            }
+        }
 
         // Extract constructor parameters for ctorParameters
         let ctor_params = extract_jit_ctor_params(source, class);
 
-        // Extract member decorators for propDecorators
-        let member_decorators = extract_jit_member_decorators(source, class);
+        // Extract Angular and non-Angular member decorators
+        let (member_decorators, non_angular_member_decorators) =
+            extract_all_jit_member_decorators(source, class);
 
         jit_classes.push(JitClassInfo {
             class_name,
-            decorator_span: decorator.span,
+            all_class_decorator_spans,
             stmt_start,
             class_start: class.span.start,
             class_body_end: class.body.span.end,
@@ -1262,7 +2163,8 @@ fn transform_angular_file_jit(
             is_abstract: class.r#abstract,
             ctor_params,
             member_decorators,
-            decorator_text,
+            all_class_decorator_texts,
+            non_angular_member_decorators,
         });
 
         result.component_count +=
@@ -1284,9 +2186,15 @@ fn transform_angular_file_jit(
     // 4. Build edits
     let mut edits: std::vec::Vec<Edit> = std::vec::Vec::new();
 
-    // Build the additional imports text (tslib + resource imports)
+    // Build the additional imports text (tslib + resource imports + Angular namespace
+    // when signal-API lowering synthesized decorators that need to resolve to
+    // `i0.Input`/`i0.Output`/etc. at runtime).
     let mut additional_imports = String::new();
     additional_imports.push_str("import { __decorate } from \"tslib\";\n");
+    if jit_classes_need_angular_core_namespace(&jit_classes) {
+        additional_imports
+            .push_str(&format!("import * as {JIT_ANGULAR_CORE_NS} from \"@angular/core\";\n"));
+    }
     for (import_name, specifier) in &resource_imports {
         additional_imports.push_str(&format!("import {} from \"{}\";\n", import_name, specifier));
     }
@@ -1328,8 +2236,8 @@ fn transform_angular_file_jit(
                 ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1343,9 +2251,9 @@ fn transform_angular_file_jit(
             continue;
         };
 
-        // 4a. Remove the Angular decorator (including @ and trailing whitespace)
-        {
-            let mut end = jit_info.decorator_span.end as usize;
+        // 4a. Remove ALL class-level decorators (including @ and trailing whitespace)
+        for decorator_span in &jit_info.all_class_decorator_spans {
+            let mut end = decorator_span.end as usize;
             let bytes = source.as_bytes();
             while end < bytes.len() {
                 let c = bytes[end];
@@ -1355,14 +2263,14 @@ fn transform_angular_file_jit(
                     break;
                 }
             }
-            edits.push(Edit::delete(jit_info.decorator_span.start, end as u32));
+            edits.push(Edit::delete(decorator_span.start, end as u32));
         }
 
-        // 4b. Remove member decorators (@Input, @Output, etc.) and constructor param decorators
+        // 4b. Remove ALL member decorators and constructor param decorators
         {
             let mut decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
             super::decorator::collect_constructor_decorator_spans(class, &mut decorator_spans);
-            super::decorator::collect_member_decorator_spans(class, &mut decorator_spans);
+            super::decorator::collect_all_member_decorator_spans(class, &mut decorator_spans);
             for span in &decorator_spans {
                 let mut end = span.end as usize;
                 let bytes = source.as_bytes();
@@ -1417,11 +2325,41 @@ fn transform_angular_file_jit(
             }
         }
 
-        // 4e. After class body, add __decorate call and export
-        let mut after_class = format!(
-            ";\n{} = __decorate([\n    {}\n], {});\n",
-            jit_info.class_name, jit_info.decorator_text, jit_info.class_name
-        );
+        // 4e. After class body, add member __decorate calls, then class __decorate call, then export
+        let mut after_class = String::from(";\n");
+
+        // Emit __decorate() for non-Angular member decorators (before class __decorate).
+        // Match TypeScript's ordering: instance (prototype) members first, then static members.
+        // Within each group, preserve source declaration order.
+        for member_dec in jit_info
+            .non_angular_member_decorators
+            .iter()
+            .filter(|m| !m.is_static)
+            .chain(jit_info.non_angular_member_decorators.iter().filter(|m| m.is_static))
+        {
+            let target = if member_dec.is_static {
+                jit_info.class_name.clone()
+            } else {
+                format!("{}.prototype", jit_info.class_name)
+            };
+            // TypeScript uses `null` for methods/accessors (reads existing descriptor)
+            // and `void 0` for properties (no existing descriptor).
+            let desc = if member_dec.is_property { "void 0" } else { "null" };
+            after_class.push_str(&format!(
+                "__decorate([{}], {}, \"{}\", {});\n",
+                member_dec.decorator_texts.join(", "),
+                target,
+                member_dec.member_name,
+                desc
+            ));
+        }
+
+        // Emit class-level __decorate() with ALL class decorators
+        let all_decorator_text = jit_info.all_class_decorator_texts.join(",\n    ");
+        after_class.push_str(&format!(
+            "{} = __decorate([\n    {}\n], {});\n",
+            jit_info.class_name, all_decorator_text, jit_info.class_name
+        ));
 
         if jit_info.is_exported {
             after_class.push_str(&format!("export {{ {} }};\n", jit_info.class_name));
@@ -1488,8 +2426,8 @@ pub fn transform_angular_file(
     let parser_ret = Parser::new(allocator, source, source_type).parse();
 
     // Collect parse errors
-    if !parser_ret.errors.is_empty() {
-        for error in parser_ret.errors {
+    if !parser_ret.diagnostics.is_empty() {
+        for error in parser_ret.diagnostics {
             result.diagnostics.push(OxcDiagnostic::error(error.to_string()));
         }
         // Still continue to try to generate output for partial results
@@ -1575,6 +2513,11 @@ pub fn transform_angular_file(
     let import_map =
         build_import_map(allocator, &parser_ret.program.body, options.resolved_imports.as_ref());
 
+    // Collect file-scope string consts so decorator metadata can resolve identifier
+    // references (e.g. `host: { [ATTR_NAME]: '' }`) the same way the official
+    // Angular compiler does.
+    let string_consts = collect_string_consts(allocator, &parser_ret.program);
+
     #[cfg(feature = "cross_file_elision")]
     let mut import_map =
         build_import_map(allocator, &parser_ret.program.body, options.resolved_imports.as_ref());
@@ -1603,28 +2546,82 @@ pub fn transform_angular_file(
                 }
                 _ => (None, 0),
             },
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(Declaration::ClassDeclaration(class)) => {
-                    (Some(class.as_ref()), export.span.start)
-                }
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => (Some(class.as_ref()), export.span.start),
                 _ => (None, 0),
             },
             _ => (None, 0),
         };
 
         if let Some(class) = class {
+            // Pre-flight: catch @Service co-located with another Angular
+            // decorator before the primary-decorator branches dispatch.
+            // Upstream service.ts:101-116 rejects this combination; without
+            // this early check, @Component / @Directive / @Pipe / @NgModule /
+            // @Injectable would win the branch race and compile the class
+            // (leaving the @Service decorator removed inconsistently) instead
+            // of producing the intended diagnostic.
+            if find_angular_service_decorator(class, &import_map).is_some() {
+                if let Some(conflict_name) = find_conflicting_angular_decorator(class, &import_map)
+                {
+                    let class_name_for_diag =
+                        class.id.as_ref().map_or(String::new(), |id| id.name.to_string());
+                    result.diagnostics.push(OxcDiagnostic::error(format!(
+                        "Cannot apply more than one Angular decorator on an @Service class. \
+                         '{}' is also decorated with @{}.",
+                        class_name_for_diag, conflict_name
+                    )));
+                    continue;
+                }
+            }
+
             // Compute implicit_standalone based on Angular version
             let implicit_standalone = options.implicit_standalone();
 
-            if let Some(mut metadata) =
-                extract_component_metadata(allocator, class, implicit_standalone, &import_map)
-            {
+            if let Some(mut metadata) = extract_component_metadata(
+                &allocator,
+                class,
+                implicit_standalone,
+                &import_map,
+                Some(source),
+                &string_consts,
+            ) {
+                // Track external resource dependencies before resolution so build tools
+                // still learn which sibling files to watch when the resource isn't in
+                // `resolved_resources` or compilation fails downstream.
+                if let Some(template_url) = &metadata.template_url {
+                    result.dependencies.push(template_url.to_string());
+                }
+                for style_url in &metadata.style_urls {
+                    result.dependencies.push(style_url.to_string());
+                }
+
                 // 3. Resolve external styles and merge into metadata
-                resolve_styles(allocator, &mut metadata, resolved_resources);
+                let missing_style_urls =
+                    resolve_styles(allocator, &mut metadata, resolved_resources);
 
                 // 4. Resolve template from inline or external source
-                let template_source = resolve_template(&metadata, resolved_resources);
+                let (template_source, missing_template_url) =
+                    resolve_template(&metadata, resolved_resources);
                 let class_name = metadata.class_name.to_string();
+
+                // Resources were provided but a styleUrl was not among them:
+                // fail loudly like ngc (COMPONENT_RESOURCE_NOT_FOUND) instead
+                // of silently dropping the styles (#314).
+                for style_url in &missing_style_urls {
+                    result.diagnostics.push(OxcDiagnostic::error(format!(
+                        "Component '{}': style URL '{}' could not be resolved \
+                         (COMPONENT_RESOURCE_NOT_FOUND)",
+                        class_name, style_url
+                    )));
+                }
+                if let Some(template_url) = &missing_template_url {
+                    result.diagnostics.push(OxcDiagnostic::error(format!(
+                        "Component '{}': template URL '{}' could not be resolved \
+                         (COMPONENT_RESOURCE_NOT_FOUND)",
+                        class_name, template_url
+                    )));
+                }
 
                 if let Some(template_string) = template_source {
                     // Allocate template in arena so it has the allocator's lifetime.
@@ -1632,11 +2629,11 @@ pub fn transform_angular_file(
                     let template = allocator.alloc_str(&template_string);
                     // 4.5 Extract view queries from the class (for @ViewChild/@ViewChildren)
                     // These need to be passed to compile_component_full so predicates can be pooled
-                    let view_queries = extract_view_queries(allocator, class);
+                    let view_queries = extract_view_queries(allocator, class, Some(source));
 
                     // 4.6 Extract content queries from the class (for @ContentChild/@ContentChildren)
                     // Signal-based queries (contentChild(), contentChildren()) are also detected here
-                    let content_queries = extract_content_queries(allocator, class);
+                    let content_queries = extract_content_queries(allocator, class, Some(source));
 
                     // Collect content query property names for .d.ts generation
                     // (before content_queries is moved into compile_component_full)
@@ -1647,7 +2644,7 @@ pub fn transform_angular_file(
                     // Pass the shared pool index to ensure unique constant names
                     // Pass the file-level namespace registry to ensure consistent namespace assignments
                     match compile_component_full(
-                        allocator,
+                        &allocator,
                         template,
                         &mut metadata,
                         path,
@@ -1657,6 +2654,7 @@ pub fn transform_angular_file(
                         content_queries,
                         shared_pool_index,
                         &mut file_namespace_registry,
+                        &import_map,
                     ) {
                         Ok(compilation_result) => {
                             // Update the shared pool index for the next component
@@ -1696,14 +2694,16 @@ pub fn transform_angular_file(
 
                             // Check if the class also has an @Injectable decorator.
                             // @Injectable is SHARED precedence and can coexist with @Component.
-                            let has_injectable = extract_injectable_metadata(allocator, class);
+                            let has_injectable =
+                                extract_injectable_metadata(allocator, class, Some(source));
                             if let Some(injectable_metadata) = &has_injectable {
                                 if let Some(span) = find_injectable_decorator_span(class) {
                                     decorator_spans_to_remove.push(span);
                                 }
                                 if let Some(inj_def) = generate_injectable_definition_from_decorator(
-                                    allocator,
+                                    &allocator,
                                     injectable_metadata,
+                                    options.compilation_mode,
                                 ) {
                                     let emitter = JsEmitter::new();
                                     property_assignments.push_str(&format!(
@@ -1743,7 +2743,7 @@ pub fn transform_angular_file(
                                                 name: Ident::from(class_name.as_str()),
                                                 source_span: None,
                                             },
-                                            allocator,
+                                            &allocator,
                                         ),
                                     );
 
@@ -1756,24 +2756,85 @@ pub fn transform_angular_file(
                                     let class_metadata = R3ClassMetadata {
                                         r#type: type_expr,
                                         decorators: build_decorator_metadata_array(
-                                            allocator,
+                                            &allocator,
                                             &[decorator],
+                                            Some(source),
+                                            Some(template),
+                                            Some(metadata.styles.as_slice()),
+                                            Some(&string_consts),
                                         ),
                                         ctor_parameters: build_ctor_params_metadata(
-                                            allocator,
+                                            &allocator,
                                             class,
                                             ctor_deps_slice,
                                             &mut file_namespace_registry,
                                             &import_map,
+                                            Some(source),
                                         ),
                                         prop_decorators: build_prop_decorators_metadata(
-                                            allocator, class,
+                                            &allocator,
+                                            class,
+                                            Some(source),
+                                            &mut file_namespace_registry,
                                         ),
                                     };
 
-                                    // Compile to the wrapped IIFE expression
-                                    let metadata_expr =
-                                        compile_class_metadata(allocator, &class_metadata);
+                                    // If the component opted into lazy loading via
+                                    // `@Component.deferredImports` AND actually uses
+                                    // `@defer` in its template, emit
+                                    // `ɵsetClassMetadataAsync` so the TestBed-facing
+                                    // metadata is built lazily inside a callback that
+                                    // receives the dynamically-imported classes as
+                                    // parameters. The decorator object literal still
+                                    // references symbols like `LazyCmp` by name, but
+                                    // those names resolve to the callback's parameters
+                                    // — there's no static reference to the import in
+                                    // the emitted code, so bundlers can tree-shake the
+                                    // `import { LazyCmp } from './lazy'` declaration in
+                                    // production builds (the sync `setClassMetadata`
+                                    // call is itself dev-only and gets dropped too).
+                                    //
+                                    // When the template has no `@defer` block we fall
+                                    // back to plain `setClassMetadata`: the resolver
+                                    // and async wrapper would never run, and emitting
+                                    // them would leave a stray `import(...)` in the
+                                    // output that defeats tree-shaking.
+                                    let deferred_deps: oxc_allocator::Vec<
+                                        R3DeferPerComponentDependency<'_>,
+                                    > = if compilation_result.has_defer_block {
+                                        super::defer_resolver::build_defer_per_component_deps(
+                                            &allocator,
+                                            &metadata.deferred_imports,
+                                            &import_map,
+                                        )
+                                    } else {
+                                        oxc_allocator::Vec::new_in(&allocator)
+                                    };
+                                    let metadata_expr = match options.compilation_mode {
+                                        crate::CompilationMode::Partial => {
+                                            // Partial mode mirrors upstream's
+                                            // compileComponentDeclareClassMetadata
+                                            // (class_metadata.ts:50): empty deferred
+                                            // deps → sync ɵɵngDeclareClassMetadata; one
+                                            // or more → async ɵɵngDeclareClassMetadataAsync.
+                                            crate::partial::compile_component_declare_class_metadata(
+                                                &allocator,
+                                                &class_metadata,
+                                                deferred_deps.as_slice(),
+                                            )
+                                        }
+                                        crate::CompilationMode::Full => {
+                                            if deferred_deps.is_empty() {
+                                                compile_class_metadata(allocator, &class_metadata)
+                                            } else {
+                                                compile_component_class_metadata(
+                                                    &allocator,
+                                                    &class_metadata,
+                                                    Some(deferred_deps.as_slice()),
+                                                )
+                                            }
+                                        }
+                                    };
                                     let metadata_js = emitter.emit_expression(&metadata_expr);
 
                                     if !decls_after_class.is_empty() {
@@ -1807,14 +2868,6 @@ pub fn transform_angular_file(
                                 class.body.span.end,
                             ));
 
-                            // Track external dependencies
-                            if let Some(template_url) = &metadata.template_url {
-                                result.dependencies.push(template_url.to_string());
-                            }
-                            for style_url in &metadata.style_urls {
-                                result.dependencies.push(style_url.to_string());
-                            }
-
                             // Generate .d.ts type declaration for this component
                             let type_argument_count = class
                                 .type_parameters
@@ -1834,11 +2887,18 @@ pub fn transform_angular_file(
                             result.diagnostics.extend(diags);
                         }
                     }
-                } else if let Some(template_url) = &metadata.template_url {
-                    // External template not resolved - add warning
-                    result.diagnostics.push(OxcDiagnostic::warn(format!(
-                        "Template URL '{}' not found in resolved resources",
-                        template_url
+                } else if missing_template_url.is_none()
+                    && let Some(template_url) = &metadata.template_url
+                {
+                    // External template not resolved: the class is emitted
+                    // without its compiled definition, so fail loudly like
+                    // ngc's COMPONENT_RESOURCE_NOT_FOUND instead of letting
+                    // the build ship a broken component (#314).
+                    result.diagnostics.push(OxcDiagnostic::error(format!(
+                        "Component '{}': template URL '{}' could not be resolved \
+                         (COMPONENT_RESOURCE_NOT_FOUND); the component was emitted \
+                         without its compiled definition",
+                        class_name, template_url
                     )));
                 }
             } else {
@@ -1847,9 +2907,13 @@ pub fn transform_angular_file(
                 // definitions. This prevents Angular's JIT runtime from processing
                 // the directive and creating conflicting property definitions (like
                 // ɵfac getters) that interfere with the AOT-compiled assignments.
-                if let Some(mut directive_metadata) =
-                    extract_directive_metadata(allocator, class, implicit_standalone)
-                {
+                if let Some(mut directive_metadata) = extract_directive_metadata(
+                    &allocator,
+                    class,
+                    implicit_standalone,
+                    Some(source),
+                    &string_consts,
+                ) {
                     // Track decorator span for removal
                     if let Some(span) = find_directive_decorator_span(class) {
                         decorator_spans_to_remove.push(span);
@@ -1864,7 +2928,7 @@ pub fn transform_angular_file(
                     // so factory deps must use namespace-prefixed references (e.g., i1.Store).
                     if let Some(ref mut deps) = directive_metadata.deps {
                         resolve_factory_dep_namespaces(
-                            allocator,
+                            &allocator,
                             deps,
                             &import_map,
                             &mut file_namespace_registry,
@@ -1876,7 +2940,7 @@ pub fn transform_angular_file(
                     // must use namespace-prefixed references (e.g., i1.BrnTooltipTrigger) because the
                     // original named import may be elided and replaced by a namespace import.
                     resolve_host_directive_namespaces(
-                        allocator,
+                        &allocator,
                         &mut directive_metadata.host_directives,
                         &import_map,
                         &mut file_namespace_registry,
@@ -1885,9 +2949,11 @@ pub fn transform_angular_file(
                     // Compile directive and generate definitions
                     // Pass shared_pool_index to ensure unique constant names across the file
                     let definitions = generate_directive_definitions(
-                        allocator,
+                        &allocator,
                         &directive_metadata,
                         shared_pool_index,
+                        options.compilation_mode,
+                        options.angular_version,
                     );
 
                     // Update shared_pool_index for the next compilation
@@ -1906,14 +2972,16 @@ pub fn transform_angular_file(
 
                     // Check if the class also has an @Injectable decorator.
                     // @Injectable is SHARED precedence and can coexist with @Directive.
-                    let has_injectable = extract_injectable_metadata(allocator, class);
+                    let has_injectable =
+                        extract_injectable_metadata(allocator, class, Some(source));
                     if let Some(injectable_metadata) = &has_injectable {
                         if let Some(span) = find_injectable_decorator_span(class) {
                             decorator_spans_to_remove.push(span);
                         }
                         if let Some(inj_def) = generate_injectable_definition_from_decorator(
-                            allocator,
+                            &allocator,
                             injectable_metadata,
+                            options.compilation_mode,
                         ) {
                             property_assignments.push_str(&format!(
                                 "\nstatic ɵprov = {};",
@@ -1931,15 +2999,35 @@ pub fn transform_angular_file(
                         .dts_declarations
                         .push(dts::generate_directive_dts(&directive_metadata, has_injectable));
 
+                    // Emit setClassMetadata for TestBed support (overrideDirective +
+                    // signal members), mirroring the @Component path.
+                    let decls_after_class = find_directive_decorator(&class.decorators)
+                        .map(|decorator| {
+                            build_set_class_metadata_decls(
+                                &allocator,
+                                class,
+                                &class_name,
+                                decorator,
+                                options,
+                                source,
+                                &string_consts,
+                                &import_map,
+                                &mut file_namespace_registry,
+                            )
+                        })
+                        .unwrap_or_default();
+
                     class_positions.push((
                         class_name.clone(),
                         compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
                         class.body.span.end,
                     ));
-                    class_definitions
-                        .insert(class_name, (property_assignments, String::new(), String::new()));
+                    class_definitions.insert(
+                        class_name,
+                        (property_assignments, String::new(), decls_after_class),
+                    );
                 } else if let Some(mut pipe_metadata) =
-                    extract_pipe_metadata(allocator, class, implicit_standalone)
+                    extract_pipe_metadata(allocator, class, implicit_standalone, Some(source))
                 {
                     // Not a @Component or @Directive - check if it's a @Pipe (PRIMARY)
                     // We need to compile @Pipe classes to generate ɵpipe and ɵfac definitions.
@@ -1956,7 +3044,7 @@ pub fn transform_angular_file(
                     // Resolve namespace imports for pipe constructor deps
                     if let Some(ref mut deps) = pipe_metadata.deps {
                         resolve_factory_dep_namespaces(
-                            allocator,
+                            &allocator,
                             deps,
                             &import_map,
                             &mut file_namespace_registry,
@@ -1964,9 +3052,11 @@ pub fn transform_angular_file(
                     }
 
                     // Compile pipe and generate both ɵfac and ɵpipe definitions as external property assignments
-                    if let Some(definition) =
-                        generate_full_pipe_definition_from_decorator(allocator, &pipe_metadata)
-                    {
+                    if let Some(definition) = generate_full_pipe_definition_from_decorator(
+                        &allocator,
+                        &pipe_metadata,
+                        options.compilation_mode,
+                    ) {
                         // Use JsEmitter to emit both expressions
                         let emitter = JsEmitter::new();
                         let class_name = pipe_metadata.class_name.to_string();
@@ -1980,14 +3070,16 @@ pub fn transform_angular_file(
 
                         // Check if the class also has an @Injectable decorator (issue #65).
                         // @Injectable is SHARED precedence and can coexist with @Pipe.
-                        let has_injectable = extract_injectable_metadata(allocator, class);
+                        let has_injectable =
+                            extract_injectable_metadata(allocator, class, Some(source));
                         if let Some(injectable_metadata) = &has_injectable {
                             if let Some(span) = find_injectable_decorator_span(class) {
                                 decorator_spans_to_remove.push(span);
                             }
                             if let Some(inj_def) = generate_injectable_definition_from_decorator(
-                                allocator,
+                                &allocator,
                                 injectable_metadata,
+                                options.compilation_mode,
                             ) {
                                 property_assignments.push_str(&format!(
                                     "\nstatic ɵprov = {};",
@@ -2006,6 +3098,23 @@ pub fn transform_angular_file(
                             has_injectable,
                         ));
 
+                        // Emit setClassMetadata for TestBed support (overridePipe).
+                        let decls_after_class = find_pipe_decorator(&class.decorators)
+                            .map(|decorator| {
+                                build_set_class_metadata_decls(
+                                    &allocator,
+                                    class,
+                                    &class_name,
+                                    decorator,
+                                    options,
+                                    source,
+                                    &string_consts,
+                                    &import_map,
+                                    &mut file_namespace_registry,
+                                )
+                            })
+                            .unwrap_or_default();
+
                         class_positions.push((
                             class_name.clone(),
                             compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
@@ -2013,11 +3122,11 @@ pub fn transform_angular_file(
                         ));
                         class_definitions.insert(
                             class_name,
-                            (property_assignments, String::new(), String::new()),
+                            (property_assignments, String::new(), decls_after_class),
                         );
                     }
                 } else if let Some(mut ng_module_metadata) =
-                    extract_ng_module_metadata(allocator, class)
+                    extract_ng_module_metadata(allocator, class, Some(source))
                 {
                     // Not a @Component, @Directive, @Injectable, or @Pipe - check if it's an @NgModule
                     // We need to compile @NgModule classes to generate ɵmod, ɵfac, and ɵinj definitions.
@@ -2035,7 +3144,7 @@ pub fn transform_angular_file(
                     // Resolve namespace imports for NgModule constructor deps
                     if let Some(ref mut deps) = ng_module_metadata.deps {
                         resolve_factory_dep_namespaces(
-                            allocator,
+                            &allocator,
                             deps,
                             &import_map,
                             &mut file_namespace_registry,
@@ -2043,9 +3152,11 @@ pub fn transform_angular_file(
                     }
 
                     // Compile NgModule and generate all definitions as external property assignments
-                    if let Some(definition) =
-                        generate_full_ng_module_definition(allocator, &ng_module_metadata)
-                    {
+                    if let Some(definition) = generate_full_ng_module_definition(
+                        &allocator,
+                        &ng_module_metadata,
+                        options.compilation_mode,
+                    ) {
                         let emitter = JsEmitter::new();
                         let class_name = ng_module_metadata.class_name.to_string();
 
@@ -2061,14 +3172,16 @@ pub fn transform_angular_file(
 
                         // Check if the class also has an @Injectable decorator.
                         // @Injectable is SHARED precedence and can coexist with @NgModule.
-                        let has_injectable = extract_injectable_metadata(allocator, class);
+                        let has_injectable =
+                            extract_injectable_metadata(allocator, class, Some(source));
                         if let Some(injectable_metadata) = &has_injectable {
                             if let Some(span) = find_injectable_decorator_span(class) {
                                 decorator_spans_to_remove.push(span);
                             }
                             if let Some(inj_def) = generate_injectable_definition_from_decorator(
-                                allocator,
+                                &allocator,
                                 injectable_metadata,
+                                options.compilation_mode,
                             ) {
                                 property_assignments.push_str(&format!(
                                     "\nstatic ɵprov = {};",
@@ -2096,6 +3209,28 @@ pub fn transform_angular_file(
                             has_injectable,
                         ));
 
+                        // Emit setClassMetadata for TestBed support (overrideModule),
+                        // appended after the NgModule's external declarations.
+                        if let Some(decorator) = find_ng_module_decorator(&class.decorators) {
+                            let metadata = build_set_class_metadata_decls(
+                                &allocator,
+                                class,
+                                &class_name,
+                                decorator,
+                                options,
+                                source,
+                                &string_consts,
+                                &import_map,
+                                &mut file_namespace_registry,
+                            );
+                            if !metadata.is_empty() {
+                                if !external_decls.is_empty() {
+                                    external_decls.push('\n');
+                                }
+                                external_decls.push_str(&metadata);
+                            }
+                        }
+
                         // NgModule: external_decls go AFTER the class (they reference the class name)
                         class_positions.push((
                             class_name.clone(),
@@ -2107,8 +3242,98 @@ pub fn transform_angular_file(
                             (property_assignments, String::new(), external_decls),
                         );
                     }
+                } else if let Some(service_decorator) =
+                    find_angular_service_decorator(class, &import_map)
+                {
+                    // Standalone @Service (Angular v22+). Mirrors the standalone-@Injectable
+                    // branch below but emits ɵɵdefineService and a deps-less ɵfac.
+                    let class_name_for_diag =
+                        class.id.as_ref().map_or(String::new(), |id| id.name.to_string());
+
+                    // Version gate: v22+ runtime introduced ɵɵdefineService. Unknown
+                    // version defaults to "supports" (matches the JIT-side gate).
+                    if !options.angular_version.map_or(true, |v| v.supports_service_decorator()) {
+                        result.diagnostics.push(OxcDiagnostic::error(format!(
+                            "The @Service decorator on '{}' requires Angular v22 or later.",
+                            class_name_for_diag
+                        )));
+                        continue;
+                    }
+
+                    // Constructor DI diagnostic: @Service ɵfac is generated with
+                    // empty deps, so any constructor parameter would silently
+                    // become `undefined` at runtime. Surface upstream's error
+                    // (service.ts:312-318) instead of emitting broken code.
+                    if class_has_own_constructor_params(class) {
+                        result.diagnostics.push(OxcDiagnostic::error(
+                            "@Service class cannot use constructor dependency injection. \
+                             Use the `inject` function instead."
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+
+                    if let Some(service_metadata) =
+                        extract_service_metadata(allocator, class, service_decorator, Some(source))
+                    {
+                        // Track decorator span for removal. Use the resolved
+                        // decorator directly so aliased imports
+                        // (`import { Service as NgService }`) still get
+                        // stripped — re-searching by literal name would miss
+                        // them.
+                        decorator_spans_to_remove.push(service_decorator.span);
+                        // Even though @Service ɵfac doesn't inject ctor params, the
+                        // user's constructor may still carry @Inject/@Optional/etc.
+                        // decorators that need to be stripped from the output (the
+                        // class metadata IIFE will pick them up).
+                        collect_constructor_decorator_spans(class, &mut decorator_spans_to_remove);
+
+                        let type_argument_count =
+                            class.type_parameters.as_ref().map_or(0, |tp| tp.params.len() as u32);
+                        let definition = generate_service_definition_from_decorator(
+                            &allocator,
+                            &service_metadata,
+                            type_argument_count,
+                        );
+
+                        let emitter = JsEmitter::new();
+                        let class_name = service_metadata.class_name.to_string();
+
+                        let property_assignments = format!(
+                            "static ɵfac = {};\nstatic ɵprov = {};",
+                            emitter.emit_expression(&definition.fac_definition),
+                            emitter.emit_expression(&definition.prov_definition)
+                        );
+
+                        result.dts_declarations.push(dts::generate_service_dts(
+                            &service_metadata,
+                            type_argument_count,
+                        ));
+
+                        let decls_after_class = build_set_class_metadata_decls(
+                            &allocator,
+                            class,
+                            &class_name,
+                            service_decorator,
+                            options,
+                            source,
+                            &string_consts,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
+
+                        class_positions.push((
+                            class_name.clone(),
+                            compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
+                            class.body.span.end,
+                        ));
+                        class_definitions.insert(
+                            class_name,
+                            (property_assignments, String::new(), decls_after_class),
+                        );
+                    }
                 } else if let Some(mut injectable_metadata) =
-                    extract_injectable_metadata(allocator, class)
+                    extract_injectable_metadata(allocator, class, Some(source))
                 {
                     // Standalone @Injectable (no PRIMARY decorator on the class)
                     // We need to compile @Injectable classes to generate ɵprov and ɵfac definitions.
@@ -2125,7 +3350,7 @@ pub fn transform_angular_file(
                     // Resolve namespace imports for constructor deps.
                     if let Some(ref mut deps) = injectable_metadata.deps {
                         resolve_factory_dep_namespaces(
-                            allocator,
+                            &allocator,
                             deps,
                             &import_map,
                             &mut file_namespace_registry,
@@ -2134,8 +3359,9 @@ pub fn transform_angular_file(
 
                     // Compile injectable and generate definitions
                     if let Some(definition) = generate_injectable_definition_from_decorator(
-                        allocator,
+                        &allocator,
                         &injectable_metadata,
+                        options.compilation_mode,
                     ) {
                         let emitter = JsEmitter::new();
                         let class_name = injectable_metadata.class_name.to_string();
@@ -2155,6 +3381,23 @@ pub fn transform_angular_file(
                             type_argument_count,
                         ));
 
+                        // Emit setClassMetadata for TestBed support.
+                        let decls_after_class = find_injectable_decorator(&class.decorators)
+                            .map(|decorator| {
+                                build_set_class_metadata_decls(
+                                    &allocator,
+                                    class,
+                                    &class_name,
+                                    decorator,
+                                    options,
+                                    source,
+                                    &string_consts,
+                                    &import_map,
+                                    &mut file_namespace_registry,
+                                )
+                            })
+                            .unwrap_or_default();
+
                         class_positions.push((
                             class_name.clone(),
                             compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
@@ -2162,7 +3405,7 @@ pub fn transform_angular_file(
                         ));
                         class_definitions.insert(
                             class_name,
-                            (property_assignments, String::new(), String::new()),
+                            (property_assignments, String::new(), decls_after_class),
                         );
                     }
                 }
@@ -2263,6 +3506,38 @@ pub fn transform_angular_file(
         }
     }
 
+    // 5e. TDZ-safe hoisting of top-level bindings referenced by decorator
+    // metadata but declared after the decorated class. Without this, the
+    // emitted `ɵcmp` static field's `ɵɵProvidersFeature` would evaluate the
+    // reference at class-definition time and throw `ReferenceError`. See
+    // issue #287.
+    //
+    // The hoister resolves identifier references through `oxc_semantic` so
+    // a nested-scope shadow of a top-level name can't be mistaken for the
+    // top-level binding itself.
+    //
+    // Gate the Semantic build behind a cheap top-level scan: a real Angular
+    // codebase contains plenty of plain `.ts` helpers, type-only modules, and
+    // services without `@Injectable` that we route through this function. For
+    // those, building a full symbol table just to discover there's nothing to
+    // hoist is pure overhead.
+    if program_has_angular_decorated_class(&parser_ret.program) {
+        // Semantic builder errors (redeclarations, etc.) are intentionally
+        // dropped: the parser already captured syntax errors into
+        // `result.diagnostics` upstream, and Semantic-level diagnostics here
+        // aren't actionable for the hoist pass — we treat the input as
+        // best-effort and rely on the host build to surface genuine errors.
+        // The JIT path (see ~line 1380) follows the same convention.
+        let hoist_semantic =
+            oxc_semantic::SemanticBuilder::new().build(&parser_ret.program).semantic;
+        edits.extend(collect_hoist_edits(
+            &parser_ret.program,
+            source,
+            &hoist_semantic,
+            &import_map,
+        ));
+    }
+
     // Apply all edits in one pass
     if options.sourcemap {
         let (code, map) = apply_edits_with_sourcemap(source, edits, path);
@@ -2302,6 +3577,16 @@ struct FullCompilationResult {
 
     /// The ng-content selectors found in the template (e.g., `["*", ".header"]`).
     ng_content_selectors: Vec<String>,
+
+    /// `true` when the parsed template contains at least one `@defer` block.
+    ///
+    /// Used by the caller to gate `setClassMetadataAsync` emission: a component
+    /// can declare `deferredImports: [...]` without actually using `@defer` in
+    /// its template (e.g., during development before the block is wired up).
+    /// In that case Angular's runtime needs neither the lazy resolver nor the
+    /// async metadata callback, and emitting them would leave dead
+    /// `import(...)` calls in the output.
+    has_defer_block: bool,
 }
 
 /// Compile a component template and generate ɵcmp/ɵfac definitions.
@@ -2313,6 +3598,49 @@ struct FullCompilationResult {
 /// The `namespace_registry` parameter is used to track and assign namespace aliases
 /// for imported modules. It is shared across all components in the file to ensure
 /// consistent namespace assignments for factory generation and import statements.
+/// Partial-mode component compile: bypass the entire template/IR pipeline
+/// and emit `ɵɵngDeclareComponent` + `ɵɵngDeclareFactory` directly from the
+/// metadata. The linker re-parses the verbatim template at consumer build
+/// time. See `crate::partial::component` for the shape.
+fn compile_component_partial<'a>(
+    allocator: &'a Allocator,
+    template: &'a str,
+    metadata: &ComponentMetadata<'a>,
+    pool_starting_index: u32,
+) -> FullCompilationResult {
+    let inputs =
+        crate::partial::PartialComponentInputs { template, is_inline: metadata.template.is_some() };
+    let cmp_expr =
+        crate::partial::compile_declare_component_from_metadata(allocator, metadata, &inputs);
+    let fac_expr =
+        crate::partial::component::compile_declare_factory_for_component(allocator, metadata);
+
+    // Detect `@defer` block presence by a cheap string scan — partial
+    // mode skips the template pipeline, but the caller's class-metadata
+    // dispatch uses this flag to decide whether to build deferred-deps
+    // and pick `ɵɵngDeclareClassMetadataAsync` over the sync form. A
+    // false positive (e.g. `@defer` inside a string literal in the
+    // template) is harmless: `deferred_deps` will be built from
+    // `metadata.deferred_imports`, which is empty when the user hasn't
+    // declared deferrable imports, and the dispatch falls back to sync.
+    // A false NEGATIVE silently strips the async lazy-loading metadata —
+    // so err on the side of detection.
+    let has_defer_block = template.contains("@defer");
+
+    let emitter = JsEmitter::new();
+    FullCompilationResult {
+        template_js: String::new(),
+        cmp_js: emitter.emit_expression(&cmp_expr),
+        fac_js: emitter.emit_expression(&fac_expr),
+        declarations_js: String::new(),
+        hmr_initializer_js: None,
+        class_debug_info_js: None,
+        next_pool_index: pool_starting_index,
+        ng_content_selectors: Vec::new(),
+        has_defer_block,
+    }
+}
+
 fn compile_component_full<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -2324,8 +3652,16 @@ fn compile_component_full<'a>(
     content_queries: OxcVec<'a, R3QueryMetadata<'a>>,
     pool_starting_index: u32,
     namespace_registry: &mut NamespaceRegistry<'a>,
+    import_map: &ImportMap<'a>,
 ) -> Result<FullCompilationResult, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
+
+    // Partial-mode early branch: skip the entire template pipeline.
+    // Partial declarations carry the template as a verbatim string and
+    // let the linker re-parse at consumer build time.
+    if matches!(options.compilation_mode, crate::CompilationMode::Partial) {
+        return Ok(compile_component_partial(allocator, template, metadata, pool_starting_index));
+    }
 
     let mut diagnostics = Vec::new();
 
@@ -2365,8 +3701,10 @@ fn compile_component_full<'a>(
     };
 
     // Stage 2: Transform HTML to R3 AST
-    let r3_transform_options =
-        R3TransformOptions { collect_comment_nodes: parse_options.collect_comment_nodes };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: options.angular_version,
+    };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
 
@@ -2389,7 +3727,7 @@ fn compile_component_full<'a>(
 
     // Stage 3-5: Ingest and compile
     // Build ingest options from metadata and transform options
-    let component_name_atom = Ident::from_in(metadata.class_name.as_str(), allocator);
+    let component_name_atom = Ident::from_in(metadata.class_name.as_str(), &allocator);
 
     // OXC is a single-file compiler, equivalent to Angular's local compilation mode.
     // In local compilation mode, Angular ALWAYS sets hasDirectiveDependencies=true,
@@ -2399,9 +3737,67 @@ fn compile_component_full<'a>(
     // Note: DomOnly mode is still used for host bindings (separate code path).
     let mode = TemplateCompilationMode::Full;
 
-    // Determine defer block emit mode based on JIT setting
-    // In JIT mode, use PerComponent mode since the compiler doesn't have full dependency info
-    let defer_block_deps_emit_mode = if options.jit {
+    // Reject overlap between `imports: [X]` and `deferredImports: [X]` —
+    // a symbol must be either eager OR deferrable, never both. Mirrors
+    // Angular's `validateNoImportOverlap` (handler.ts:2558+).
+    if !metadata.deferred_imports.is_empty() && !metadata.imports.is_empty() {
+        let eager: rustc_hash::FxHashSet<&str> =
+            metadata.imports.iter().map(|i| i.as_str()).collect();
+        for deferred in &metadata.deferred_imports {
+            if eager.contains(deferred.as_str()) {
+                diagnostics.push(OxcDiagnostic::error(format!(
+                    "`{}` is imported via both `@Component.imports` and `@Component.deferredImports`. \
+                     To fix this, make sure that dependencies are imported only once.",
+                    deferred.as_str()
+                )));
+            }
+        }
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+    }
+
+    // Build the deferrable-dependencies resolver from
+    // `@Component.deferredImports`.
+    //
+    // OXC is a single-file (local) compiler, so we use Angular's PerComponent
+    // emit mode for defer dependencies: a single shared resolver function is
+    // generated from the component's `deferredImports: [...]` array and
+    // wired into every `ɵɵdefer(...)` call. The runtime invokes it lazily,
+    // the first time any defer block triggers.
+    //
+    // Issue: voidzero-dev/oxc-angular-compiler#289 — previously the resolver
+    // was omitted entirely, leaving `ɵɵdefer(...)` with no dependency
+    // argument and no `import(...)` calls in the output, so `@defer` did no
+    // code-splitting.
+    //
+    // Note: Angular's full compilation mode also derives deferrable symbols
+    // from `imports: [...]` by matching template selectors against imported
+    // directive classes (`resolveAllDeferredDependencies`). That needs
+    // cross-file metadata OXC doesn't have, so we follow Angular's local
+    // path and require explicit `deferredImports`.
+    // Computed once and reused below: the resolver decision and the eventual
+    // `setClassMetadataAsync` gate both depend on whether the template uses
+    // `@defer`.
+    let has_defer_block = super::defer_resolver::template_has_defer_block(&r3_result.nodes);
+
+    let defer_resolver_fn = if metadata.deferred_imports.is_empty() {
+        None
+    } else if has_defer_block {
+        super::defer_resolver::build_defer_resolver_expression(allocator, metadata, import_map)
+    } else {
+        // `deferredImports` declared but no `@defer` block — the resolver
+        // would be unused dead code. Leave it off.
+        None
+    };
+
+    // When we have a resolver, switch to PerComponent emit mode so the
+    // ingest stage threads `all_deferrable_deps_fn` into each `DeferOp`.
+    // Without a resolver, the existing PerBlock-vs-JIT behavior stays in
+    // place (and `all_deferrable_deps_fn = None`).
+    let defer_block_deps_emit_mode = if defer_resolver_fn.is_some() {
+        DeferBlockDepsEmitMode::PerComponent
+    } else if options.jit {
         DeferBlockDepsEmitMode::PerComponent
     } else {
         DeferBlockDepsEmitMode::PerBlock
@@ -2413,9 +3809,9 @@ fn compile_component_full<'a>(
 
     // Build relative paths for debug locations
     let relative_template_path =
-        if enable_debug_locations { Some(Ident::from_in(file_path, allocator)) } else { None };
+        if enable_debug_locations { Some(Ident::from_in(file_path, &allocator)) } else { None };
 
-    let relative_context_file_path = Some(Ident::from_in(file_path, allocator));
+    let relative_context_file_path = Some(Ident::from_in(file_path, &allocator));
 
     let ingest_options = IngestOptions {
         mode,
@@ -2425,18 +3821,19 @@ fn compile_component_full<'a>(
         relative_template_path,
         enable_debug_locations,
         template_source: if enable_debug_locations { Some(template) } else { None },
-        // In PerComponent mode, this would be provided by the build tool
-        // For now, we don't have a way to pass it from NAPI, so it's None
-        all_deferrable_deps_fn: None,
+        // PerComponent mode: pass the shared resolver expression so the
+        // ingest stage attaches it to every defer block's create op.
+        all_deferrable_deps_fn: defer_resolver_fn,
         // Use the shared pool starting index to avoid duplicate constant names
         // when compiling multiple components in the same file
         pool_starting_index,
         // Pass Angular version for feature-gated instruction selection
         angular_version: options.angular_version,
+        legacy_optional_chaining: options.legacy_optional_chaining,
     };
 
     let mut job = ingest_component_with_options(
-        allocator,
+        &allocator,
         component_name_atom,
         r3_result.nodes,
         ingest_options,
@@ -2448,30 +3845,38 @@ fn compile_component_full<'a>(
     // See: packages/compiler/src/render3/view/compiler.ts lines 192-212
     let attrs_ref = pool_selector_attrs(allocator, &mut job, metadata);
 
-    // BEFORE template compilation: Pool view query predicates.
-    // TypeScript Angular pools query predicates BEFORE template compilation and pure functions.
-    // This ensures correct constant ordering: attrs -> query predicates -> pure functions.
-    let view_query_fn = if !view_queries.is_empty() {
+    // BEFORE template compilation: Pool query predicates so they
+    // appear in the constant table as `attrs -> query predicates ->
+    // pure functions`.
+    //
+    // Order matters: upstream ngtsc pools **content queries first, then
+    // view queries** (compiler/src/render3/view/compiler.ts emits
+    // `contentQueries:` before `viewQuery:` in the metadata object, and
+    // pools predicates in the same order). Reversing this swaps the
+    // `_c<N>` indices visible in the emitted query calls — the runtime
+    // still works either way but the emit diverges from upstream and
+    // breaks goldens / source-anchored tooling.
+    let content_queries_fn = if !content_queries.is_empty() {
         let fn_name = Some(metadata.class_name.as_str());
-        Some(create_view_queries_function(
-            allocator,
-            view_queries.as_slice(),
+        Some(create_content_queries_function(
+            &allocator,
+            content_queries.as_slice(),
             fn_name,
             Some(&mut job.pool),
+            options.angular_version,
         ))
     } else {
         None
     };
 
-    // BEFORE template compilation: Pool content query predicates.
-    // Similar to view queries, content query predicates are pooled before template compilation.
-    let content_queries_fn = if !content_queries.is_empty() {
+    let view_query_fn = if !view_queries.is_empty() {
         let fn_name = Some(metadata.class_name.as_str());
-        Some(create_content_queries_function(
-            allocator,
-            content_queries.as_slice(),
+        Some(create_view_queries_function(
+            &allocator,
+            view_queries.as_slice(),
             fn_name,
             Some(&mut job.pool),
+            options.angular_version,
         ))
     } else {
         None
@@ -2484,10 +3889,11 @@ fn compile_component_full<'a>(
     // continue from where template compilation left off (avoiding duplicate names)
     let template_pool_index = job.pool.next_name_index();
     let host_binding_output = compile_component_host_bindings(
-        allocator,
+        &allocator,
         metadata,
         template_pool_index,
         options.angular_version,
+        options.legacy_optional_chaining,
     );
 
     // Extract the result and update pool index if host bindings were compiled
@@ -2499,11 +3905,11 @@ fn compile_component_full<'a>(
                     host_binding_fn: output.result.host_binding_fn,
                     host_attrs: output.result.host_attrs,
                     host_vars: output.result.host_vars,
-                    declarations: OxcVec::new_in(allocator),
+                    declarations: OxcVec::new_in(&allocator),
                 };
                 (Some(result), Some(output.next_pool_index), declarations)
             }
-            None => (None, None, OxcVec::new_in(allocator)),
+            None => (None, None, OxcVec::new_in(&allocator)),
         };
 
     // Stage 7: Generate ɵcmp/ɵfac definitions
@@ -2511,7 +3917,7 @@ fn compile_component_full<'a>(
     // consistent namespace assignments between factory generation and import statements.
     // Pass the pre-pooled attrs_ref so the attrs entry uses the correct constant index
     let definitions = generate_component_definitions(
-        allocator,
+        &allocator,
         metadata,
         options,
         &mut job,
@@ -2559,14 +3965,14 @@ fn compile_component_full<'a>(
         // Create component type expression (reference to the class)
         let component_type = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
             ReadVarExpr { name: metadata.class_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ));
 
         // Build HMR metadata
         let mut hmr_meta = HmrMetadata::new(
             component_type,
             metadata.class_name.clone(),
-            Ident::from_in(file_path, allocator),
+            Ident::from_in(file_path, &allocator),
         );
 
         // Add the @angular/core namespace dependency (i0)
@@ -2590,7 +3996,7 @@ fn compile_component_full<'a>(
         // Create component type expression (reference to the class)
         let component_type = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
             ReadVarExpr { name: metadata.class_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ));
 
         // Compute the 1-indexed line number of the class declaration from its byte offset
@@ -2607,7 +4013,7 @@ fn compile_component_full<'a>(
 
         // Build the debug info with the actual class declaration line number
         let debug_info = R3ClassDebugInfo::new(component_type, metadata.class_name.clone())
-            .with_file_path(Ident::from_in(file_path, allocator))
+            .with_file_path(Ident::from_in(file_path, &allocator))
             .with_line_number(class_line_number);
 
         // Compile to IIFE-wrapped expression
@@ -2638,38 +4044,54 @@ fn compile_component_full<'a>(
         class_debug_info_js,
         next_pool_index,
         ng_content_selectors,
+        has_defer_block,
     })
 }
 
 /// Resolve template content from inline or external source.
+///
+/// Precedence matches Angular's AOT compiler (`parseTemplateDeclaration` in
+/// `compiler-cli/src/ngtsc/annotations/component/src/resources.ts`): when both
+/// `templateUrl` and inline `template` are present, **`templateUrl` wins** and
+/// the inline `template` is silently ignored. Angular's reference checks
+/// `component.has('templateUrl')` first and returns immediately, so the inline
+/// branch is never reached. (ngc's JIT runtime diverges — it prefers inline via
+/// `componentNeedsResolution` — but OXC is AOT-equivalent.)
 fn resolve_template(
     metadata: &ComponentMetadata<'_>,
     resources: Option<&ResolvedResources>,
-) -> Option<String> {
-    // Prefer inline template
-    if let Some(template) = &metadata.template {
-        return Some(template.to_string());
-    }
-
-    // Try to resolve from external resources
+) -> (Option<String>, Option<String>) {
+    // ngc AOT precedence: templateUrl first. When resources were supplied, a
+    // missing entry is reported to the caller instead of falling back to inline.
     if let Some(template_url) = &metadata.template_url {
         if let Some(resources) = resources {
             if let Some(template) = resources.templates.get(template_url.as_str()) {
-                return Some(template.clone());
+                return (Some(template.clone()), None);
             }
+            return (None, Some(template_url.to_string()));
         }
     }
 
-    None
+    if let Some(template) = &metadata.template {
+        return (Some(template.to_string()), None);
+    }
+
+    (None, None)
 }
 
 /// Resolve external styles and merge into component metadata.
+///
+/// Returns the styleUrls that were NOT found in `resources` (only when
+/// resources were provided), so the caller can surface a
+/// COMPONENT_RESOURCE_NOT_FOUND diagnostic per missing resource.
 fn resolve_styles<'a>(
     allocator: &'a Allocator,
     metadata: &mut ComponentMetadata<'a>,
     resources: Option<&ResolvedResources>,
-) {
+) -> Vec<String> {
     use oxc_allocator::FromIn;
+
+    let mut missing = Vec::new();
 
     if let Some(resources) = resources {
         // Resolve each styleUrl from the resources
@@ -2677,11 +4099,15 @@ fn resolve_styles<'a>(
             if let Some(style_contents) = resources.styles.get(style_url.as_str()) {
                 // Add all resolved style contents to the metadata styles
                 for style in style_contents {
-                    metadata.styles.push(Ident::from_in(style.as_str(), allocator));
+                    metadata.styles.push(Ident::from_in(style.as_str(), &allocator));
                 }
+            } else {
+                missing.push(style_url.to_string());
             }
         }
     }
+
+    missing
 }
 
 /// Compile a component template to JavaScript.
@@ -2737,8 +4163,10 @@ pub fn compile_component_template<'a>(
     };
 
     // Stage 2: Transform HTML to R3 AST
-    let r3_transform_options =
-        R3TransformOptions { collect_comment_nodes: parse_options.collect_comment_nodes };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: None,
+    };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
 
@@ -2751,7 +4179,7 @@ pub fn compile_component_template<'a>(
 
     // Stage 3-5: Ingest and compile
     use oxc_allocator::FromIn;
-    let component_name_atom = Ident::from_in(component_name, allocator);
+    let component_name_atom = Ident::from_in(component_name, &allocator);
     let mut job = ingest_component(allocator, component_name_atom, r3_result.nodes);
 
     let compiled = compile_template(&mut job);
@@ -2773,7 +4201,7 @@ pub fn compile_template_to_js<'a>(
     file_path: &str,
 ) -> Result<String, Vec<OxcDiagnostic>> {
     compile_template_to_js_with_options(
-        allocator,
+        &allocator,
         template,
         component_name,
         file_path,
@@ -2834,8 +4262,10 @@ pub fn compile_template_to_js_with_options<'a>(
     };
 
     // Stage 2: Transform HTML to R3 AST
-    let r3_transform_options =
-        R3TransformOptions { collect_comment_nodes: parse_options.collect_comment_nodes };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: options.angular_version,
+    };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
 
@@ -2869,12 +4299,13 @@ pub fn compile_template_to_js_with_options<'a>(
         all_deferrable_deps_fn: None,
         pool_starting_index: 0, // Standalone template compilation starts from 0
         angular_version: options.angular_version,
+        legacy_optional_chaining: options.legacy_optional_chaining,
     };
 
     // Stage 3-5: Ingest and compile
-    let component_name_atom = Ident::from_in(component_name, allocator);
+    let component_name_atom = Ident::from_in(component_name, &allocator);
     let mut job = ingest_component_with_options(
-        allocator,
+        &allocator,
         component_name_atom,
         r3_result.nodes,
         ingest_options,
@@ -2890,7 +4321,7 @@ pub fn compile_template_to_js_with_options<'a>(
     // Build a list of all statements to emit:
     // 1. Declarations (child view functions, pooled constants)
     // 2. Main template function as a declaration
-    let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(allocator);
+    let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(&allocator);
 
     // Add all declarations first (child view functions come before main template)
     for decl in compiled.declarations {
@@ -2908,7 +4339,7 @@ pub fn compile_template_to_js_with_options<'a>(
                 modifiers: StmtModifier::NONE,
                 source_span: compiled.template_fn.source_span,
             },
-            allocator,
+            &allocator,
         ));
         all_statements.push(main_fn_stmt);
     }
@@ -2917,12 +4348,13 @@ pub fn compile_template_to_js_with_options<'a>(
     let host_pool_starting_index = job.pool.next_name_index();
     if let Some(ref host_input) = options.host {
         if let Some(host_result) = compile_host_bindings_from_input(
-            allocator,
+            &allocator,
             host_input,
             component_name,
             options.selector.as_deref(),
             host_pool_starting_index,
             options.angular_version,
+            options.legacy_optional_chaining,
         ) {
             // Add host binding pool declarations (pure functions, etc.)
             for decl in host_result.declarations {
@@ -2941,7 +4373,7 @@ pub fn compile_template_to_js_with_options<'a>(
                                 modifiers: StmtModifier::NONE,
                                 source_span: host_fn.source_span,
                             },
-                            allocator,
+                            &allocator,
                         ));
                     all_statements.push(host_fn_stmt);
                 }
@@ -3007,8 +4439,10 @@ pub fn compile_template_for_hmr<'a>(
     };
 
     // Stage 2: Transform HTML to R3 AST
-    let r3_transform_options =
-        R3TransformOptions { collect_comment_nodes: parse_options.collect_comment_nodes };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: options.angular_version,
+    };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
 
@@ -3042,12 +4476,13 @@ pub fn compile_template_for_hmr<'a>(
         all_deferrable_deps_fn: None,
         pool_starting_index: 0, // HMR template compilation starts from 0
         angular_version: options.angular_version,
+        legacy_optional_chaining: options.legacy_optional_chaining,
     };
 
     // Stage 3-5: Ingest and compile
-    let component_name_atom = Ident::from_in(component_name, allocator);
+    let component_name_atom = Ident::from_in(component_name, &allocator);
     let mut job = ingest_component_with_options(
-        allocator,
+        &allocator,
         component_name_atom,
         r3_result.nodes,
         ingest_options,
@@ -3061,7 +4496,7 @@ pub fn compile_template_for_hmr<'a>(
     let emitter = JsEmitter::new();
 
     // Emit the template function
-    let fn_expr = OutputExpression::Function(Box::new_in(compiled.template_fn, allocator));
+    let fn_expr = OutputExpression::Function(Box::new_in(compiled.template_fn, &allocator));
     let template_js = emitter.emit_expression(&fn_expr);
 
     // Emit the declarations (child view functions, pooled constants)
@@ -3084,7 +4519,7 @@ pub fn compile_template_for_hmr<'a>(
             FunctionExpr, LiteralArrayExpr, OutputExpression, OutputStatement, ReturnStatement,
         };
 
-        let mut const_entries: OxcVec<'a, OutputExpression<'a>> = OxcVec::new_in(allocator);
+        let mut const_entries: OxcVec<'a, OutputExpression<'a>> = OxcVec::new_in(&allocator);
         for const_value in &job.consts {
             const_entries.push(const_value_to_expression(allocator, const_value));
         }
@@ -3094,7 +4529,7 @@ pub fn compile_template_for_hmr<'a>(
             // in a function that runs initializers first and returns the array.
             // This matches what definition.rs does for the initial component definition.
             let mut fn_stmts: OxcVec<'a, OutputStatement<'a>> =
-                OxcVec::with_capacity_in(job.consts_initializers.len() + 1, allocator);
+                OxcVec::with_capacity_in(job.consts_initializers.len() + 1, &allocator);
 
             for stmt in job.consts_initializers.drain(..) {
                 fn_stmts.push(stmt);
@@ -3104,26 +4539,26 @@ pub fn compile_template_for_hmr<'a>(
                 ReturnStatement {
                     value: OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
                         LiteralArrayExpr { entries: const_entries, source_span: None },
-                        allocator,
+                        &allocator,
                     )),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             )));
 
             OutputExpression::Function(oxc_allocator::Box::new_in(
                 FunctionExpr {
                     name: None,
-                    params: OxcVec::new_in(allocator),
+                    params: OxcVec::new_in(&allocator),
                     statements: fn_stmts,
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ))
         } else {
             OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
                 LiteralArrayExpr { entries: const_entries, source_span: None },
-                allocator,
+                &allocator,
             ))
         };
 
@@ -3187,6 +4622,7 @@ fn compile_component_host_bindings<'a>(
     metadata: &ComponentMetadata<'a>,
     pool_starting_index: u32,
     angular_version: Option<AngularVersion>,
+    legacy_optional_chaining: Option<bool>,
 ) -> Option<HostBindingCompilationOutput<'a>> {
     let host = metadata.host.as_ref()?;
 
@@ -3210,8 +4646,13 @@ fn compile_component_host_bindings<'a>(
 
     // Ingest and compile the host bindings with the pool starting index
     // This ensures constant names continue from where template compilation left off
-    let mut job =
-        ingest_host_binding_with_version(allocator, input, pool_starting_index, angular_version);
+    let mut job = ingest_host_binding_with_version(
+        &allocator,
+        input,
+        pool_starting_index,
+        angular_version,
+        legacy_optional_chaining,
+    );
     let result = compile_host_bindings(&mut job);
 
     // Get the next pool index after host binding compilation
@@ -3236,7 +4677,7 @@ fn convert_host_metadata_to_input<'a>(
     let empty_span = Span::empty(0);
 
     // Convert property bindings: "[class.active]" -> R3BoundAttribute
-    let mut properties: OxcVec<'a, R3BoundAttribute<'a>> = OxcVec::new_in(allocator);
+    let mut properties: OxcVec<'a, R3BoundAttribute<'a>> = OxcVec::new_in(&allocator);
 
     for (key, value) in host.properties.iter() {
         // Strip the brackets from the key: "[prop]" -> "prop"
@@ -3255,11 +4696,11 @@ fn convert_host_metadata_to_input<'a>(
         let parse_result = binding_parser.parse_binding(value_str, empty_span);
 
         properties.push(R3BoundAttribute {
-            name: Ident::from_in(final_name, allocator),
+            name: Ident::from_in(final_name, &allocator),
             binding_type,
             security_context: SecurityContext::None,
             value: parse_result.ast,
-            unit: unit.map(|u| Ident::from_in(u, allocator)),
+            unit: unit.map(|u| Ident::from_in(u, &allocator)),
             source_span: empty_span,
             key_span: empty_span,
             value_span: Some(empty_span),
@@ -3268,7 +4709,7 @@ fn convert_host_metadata_to_input<'a>(
     }
 
     // Convert event listeners: "(click)" -> R3BoundEvent
-    let mut events: OxcVec<'a, R3BoundEvent<'a>> = OxcVec::new_in(allocator);
+    let mut events: OxcVec<'a, R3BoundEvent<'a>> = OxcVec::new_in(&allocator);
 
     for (key, value) in host.listeners.iter() {
         // Strip the parentheses from the key: "(click)" -> "click"
@@ -3282,16 +4723,19 @@ fn convert_host_metadata_to_input<'a>(
         // Check for target prefix (window:, document:, body:)
         let (final_event_name, target) = parse_event_target(event_name);
 
+        let (effective_name, event_type, phase) =
+            parse_legacy_animation_event(final_event_name, &allocator);
+
         // Parse the handler expression
         let value_str = allocator.alloc_str(value.as_str());
         let parse_result = binding_parser.parse_event(value_str, empty_span);
 
         events.push(R3BoundEvent {
-            name: Ident::from_in(final_event_name, allocator),
-            event_type: ParsedEventType::Regular,
+            name: Ident::from_in(effective_name, &allocator),
+            event_type,
             handler: parse_result.ast,
-            target: target.map(|t| Ident::from_in(t, allocator)),
-            phase: None,
+            target: target.map(|t| Ident::from_in(t, &allocator)),
+            phase,
             source_span: empty_span,
             handler_span: empty_span,
             key_span: empty_span,
@@ -3310,7 +4754,7 @@ fn convert_host_metadata_to_input<'a>(
                 value: crate::output::ast::LiteralValue::String(value.clone()),
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
         attributes.insert(key.clone(), expr);
     }
@@ -3324,7 +4768,7 @@ fn convert_host_metadata_to_input<'a>(
                 value: crate::output::ast::LiteralValue::String(style_attr.clone()),
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
         attributes.insert(Ident::from("style"), expr);
     }
@@ -3335,7 +4779,7 @@ fn convert_host_metadata_to_input<'a>(
                 value: crate::output::ast::LiteralValue::String(class_attr.clone()),
                 source_span: None,
             },
-            allocator,
+            &allocator,
         ));
         attributes.insert(Ident::from("class"), expr);
     }
@@ -3373,6 +4817,49 @@ fn parse_host_property_name(name: &str) -> (BindingType, &str, Option<&str>) {
     }
 }
 
+/// Classify a host event name as a legacy animation event.
+///
+/// Mirrors Angular's `parseLegacyAnimationEventName` (binding_parser.ts) +
+/// `splitAtPeriod` (util.ts): `@` is stripped, the name is split on the first `.`,
+/// **both halves are trimmed**, and the **phase is lowercased** via `.toLowerCase()`.
+///
+/// - `@trigger.phase`  → (`"trigger"`, `LegacyAnimation`, `Some("phase")`)
+/// - `@anim.START`     → (`"anim"`,    `LegacyAnimation`, `Some("start")`)
+/// - `@anim. start `   → (`"anim"`,    `LegacyAnimation`, `Some("start")`)
+/// - `@anim.foo`       → (`"anim"`,    `LegacyAnimation`, `Some("foo")`)  Angular reports
+///                       an error for invalid phases; we drop the diagnostic to match
+///                       this codebase's convention for host metadata (see
+///                       `binding_parser.parse_event` callers below — `parse_result.errors`
+///                       is also discarded). Code output still matches Angular byte-for-byte.
+/// - `@trigger`        → (`"trigger"`, `LegacyAnimation`, `None`)
+/// - `click`           → (`"click"`,   `Regular`,         `None`)
+///
+/// Keep in sync with the identical helper in `directive/compiler.rs`.
+fn parse_legacy_animation_event<'a>(
+    event_name: &'a str,
+    allocator: &'a Allocator,
+) -> (&'a str, ParsedEventType, Option<Ident<'a>>) {
+    use oxc_allocator::FromIn;
+    let Some(without_at) = event_name.strip_prefix('@') else {
+        return (event_name, ParsedEventType::Regular, None);
+    };
+    let (trigger_raw, phase_raw) = match without_at.find('.') {
+        Some(dot) => (&without_at[..dot], Some(&without_at[dot + 1..])),
+        None => (without_at, None),
+    };
+    let trigger_trimmed = trigger_raw.trim();
+    let trigger: &'a str = if trigger_trimmed.len() == trigger_raw.len() {
+        trigger_trimmed
+    } else {
+        allocator.alloc_str(trigger_trimmed)
+    };
+    let phase = phase_raw.map(|p| {
+        let normalized = p.trim().to_lowercase();
+        Ident::from_in(normalized.as_str(), &allocator)
+    });
+    (trigger, ParsedEventType::LegacyAnimation, phase)
+}
+
 /// Parse event name to extract target (window:, document:, body:).
 ///
 /// Examples:
@@ -3401,30 +4888,30 @@ fn convert_host_metadata_input_to_host_metadata<'a>(
 ) -> HostMetadata<'a> {
     use oxc_allocator::FromIn;
 
-    let mut properties: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(allocator);
+    let mut properties: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
     for (k, v) in &input.properties {
         properties
-            .push((Ident::from_in(k.as_str(), allocator), Ident::from_in(v.as_str(), allocator)));
+            .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
     }
 
-    let mut attributes: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(allocator);
+    let mut attributes: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
     for (k, v) in &input.attributes {
         attributes
-            .push((Ident::from_in(k.as_str(), allocator), Ident::from_in(v.as_str(), allocator)));
+            .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
     }
 
-    let mut listeners: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(allocator);
+    let mut listeners: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
     for (k, v) in &input.listeners {
         listeners
-            .push((Ident::from_in(k.as_str(), allocator), Ident::from_in(v.as_str(), allocator)));
+            .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
     }
 
     HostMetadata {
         properties,
         attributes,
         listeners,
-        class_attr: input.class_attr.as_ref().map(|s| Ident::from_in(s.as_str(), allocator)),
-        style_attr: input.style_attr.as_ref().map(|s| Ident::from_in(s.as_str(), allocator)),
+        class_attr: input.class_attr.as_ref().map(|s| Ident::from_in(s.as_str(), &allocator)),
+        style_attr: input.style_attr.as_ref().map(|s| Ident::from_in(s.as_str(), &allocator)),
     }
 }
 
@@ -3456,21 +4943,21 @@ fn pool_selector_attrs<'a>(
 
     // Build the attrs array: ["attrName", "attrValue", ...]
     let mut attr_entries: OxcVec<'a, OutputExpression<'a>> =
-        OxcVec::with_capacity_in(selector_attrs.len(), allocator);
+        OxcVec::with_capacity_in(selector_attrs.len(), &allocator);
     for attr in selector_attrs {
         attr_entries.push(OutputExpression::Literal(oxc_allocator::Box::new_in(
             LiteralExpr {
-                value: LiteralValue::String(Ident::from_in(attr.as_str(), allocator)),
+                value: LiteralValue::String(Ident::from_in(attr.as_str(), &allocator)),
                 source_span: None,
             },
-            allocator,
+            &allocator,
         )));
     }
 
     // Create the attrs array literal
     let attrs_array = OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
         LiteralArrayExpr { entries: attr_entries, source_span: None },
-        allocator,
+        &allocator,
     ));
 
     // Pool the attrs array using constantPool.getConstLiteral() with forceShared=true
@@ -3489,6 +4976,7 @@ fn compile_host_bindings_from_input<'a>(
     selector: Option<&str>,
     pool_starting_index: u32,
     angular_version: Option<crate::AngularVersion>,
+    legacy_optional_chaining: Option<bool>,
 ) -> Option<HostBindingCompilationResult<'a>> {
     use oxc_allocator::FromIn;
 
@@ -3507,15 +4995,20 @@ fn compile_host_bindings_from_input<'a>(
     let host = convert_host_metadata_input_to_host_metadata(allocator, host_input);
 
     // Get component name and selector as atoms
-    let component_name_atom = Ident::from_in(component_name, allocator);
+    let component_name_atom = Ident::from_in(component_name, &allocator);
     let component_selector =
-        selector.map(|s| Ident::from_in(s, allocator)).unwrap_or_else(|| Ident::from(""));
+        selector.map(|s| Ident::from_in(s, &allocator)).unwrap_or_else(|| Ident::from(""));
 
     // Convert to HostBindingInput and compile
     let input =
         convert_host_metadata_to_input(allocator, &host, component_name_atom, component_selector);
-    let mut job =
-        ingest_host_binding_with_version(allocator, input, pool_starting_index, angular_version);
+    let mut job = ingest_host_binding_with_version(
+        &allocator,
+        input,
+        pool_starting_index,
+        angular_version,
+        legacy_optional_chaining,
+    );
     let result = compile_host_bindings(&mut job);
 
     Some(result)
@@ -3551,6 +5044,7 @@ pub fn compile_host_bindings_for_linker(
         selector,
         pool_starting_index,
         None, // Linker always targets latest Angular version
+        None, // legacyOptionalChaining: derive from (absent) version
     )?;
 
     let emitter = JsEmitter::new();
@@ -3565,7 +5059,7 @@ pub fn compile_host_bindings_for_linker(
     }
 
     let fn_js = result.host_binding_fn.map(|f| {
-        let expr = OutputExpression::Function(oxc_allocator::Box::new_in(f, &allocator));
+        let expr = OutputExpression::Function(oxc_allocator::Box::new_in(f, &&allocator));
         emitter.emit_expression(&expr)
     })?;
 
@@ -3646,8 +5140,10 @@ pub fn compile_template_for_linker<'a>(
     };
 
     // Stage 2: Transform HTML to R3 AST
-    let r3_transform_options =
-        R3TransformOptions { collect_comment_nodes: parse_options.collect_comment_nodes };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: None,
+    };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
 
@@ -3670,11 +5166,12 @@ pub fn compile_template_for_linker<'a>(
         all_deferrable_deps_fn: None,
         pool_starting_index: 0,
         angular_version: None,
+        legacy_optional_chaining: None,
     };
 
-    let component_name_atom = Ident::from_in(component_name, allocator);
+    let component_name_atom = Ident::from_in(component_name, &allocator);
     let mut job = ingest_component_with_options(
-        allocator,
+        &allocator,
         component_name_atom,
         r3_result.nodes,
         ingest_options,
@@ -3693,7 +5190,7 @@ pub fn compile_template_for_linker<'a>(
 
     // Emit consts array as JS expression
     let consts_js = if !job.consts.is_empty() {
-        let mut const_entries: OxcVec<'a, OutputExpression<'a>> = OxcVec::new_in(allocator);
+        let mut const_entries: OxcVec<'a, OutputExpression<'a>> = OxcVec::new_in(&allocator);
         for const_value in &job.consts {
             const_entries.push(const_value_to_expression(allocator, const_value));
         }
@@ -3701,7 +5198,7 @@ pub fn compile_template_for_linker<'a>(
         let consts_expr = if !job.consts_initializers.is_empty() {
             // Wrap in function with initializers
             let mut fn_stmts: OxcVec<'a, OutputStatement<'a>> =
-                OxcVec::with_capacity_in(job.consts_initializers.len() + 1, allocator);
+                OxcVec::with_capacity_in(job.consts_initializers.len() + 1, &allocator);
             for stmt in job.consts_initializers.drain(..) {
                 fn_stmts.push(stmt);
             }
@@ -3712,25 +5209,25 @@ pub fn compile_template_for_linker<'a>(
                             entries: const_entries,
                             source_span: None,
                         },
-                        allocator,
+                        &allocator,
                     )),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             )));
             OutputExpression::Function(oxc_allocator::Box::new_in(
                 FunctionExpr {
                     name: None,
-                    params: OxcVec::new_in(allocator),
+                    params: OxcVec::new_in(&allocator),
                     statements: fn_stmts,
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ))
         } else {
             OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
                 crate::output::ast::LiteralArrayExpr { entries: const_entries, source_span: None },
-                allocator,
+                &allocator,
             ))
         };
         Some(emitter.emit_expression(&consts_expr))
@@ -3751,7 +5248,7 @@ pub fn compile_template_for_linker<'a>(
         .unwrap_or_else(|| format!("{component_name}_Template"));
 
     // Emit all declarations + main template function as JS code
-    let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(allocator);
+    let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(&allocator);
 
     for decl in compiled.declarations {
         all_statements.push(decl);
@@ -3766,7 +5263,7 @@ pub fn compile_template_for_linker<'a>(
                 modifiers: StmtModifier::NONE,
                 source_span: compiled.template_fn.source_span,
             },
-            allocator,
+            &allocator,
         ));
         all_statements.push(main_fn_stmt);
     }
@@ -5377,6 +6874,111 @@ export class TestComponent {
         assert!(
             !result.code.contains("import * as i1 from './some.interface'"),
             "Should NOT generate namespace import for inline type-only import, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_aliased_import_di_token_uses_exported_name_in_factory_and_ctor_params() {
+        // Aliased DI token: factory inject and ctorParameters both use the export
+        // name (`i1.ExportedName`), never the local alias.
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+import { ExportedName as LocalAlias } from './svc';
+
+@Component({
+    selector: 'app-x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(x: LocalAlias) {}
+}
+"#;
+
+        let mut options = TransformOptions::default();
+        options.emit_class_metadata = true;
+
+        let result =
+            transform_angular_file(&allocator, "x.component.ts", source, Some(&options), None);
+
+        assert!(!result.has_errors(), "Transform should not have errors: {:?}", result.diagnostics);
+
+        // Namespace import for the service module
+        assert!(
+            result.code.contains("import * as i1 from './svc'"),
+            "Should generate namespace import for './svc', but got:\n{}",
+            result.code
+        );
+
+        // Factory inject AND setClassMetadata ctorParameters must use the export name
+        assert!(
+            result.code.contains("i1.ExportedName"),
+            "Factory and/or ctorParameters should use i1.ExportedName, but got:\n{}",
+            result.code
+        );
+        assert!(
+            !result.code.contains("i1.LocalAlias"),
+            "Must not emit i1.LocalAlias (undefined on namespace); got:\n{}",
+            result.code
+        );
+
+        // setClassMetadata ctorParameters type field specifically
+        let ctor_params_ok = result.code.contains("type: i1.ExportedName")
+            || result.code.contains("type:i1.ExportedName");
+        assert!(
+            ctor_params_ok,
+            "setClassMetadata ctorParameters should use type: i1.ExportedName, but got:\n{}",
+            result.code
+        );
+    }
+
+    /// Path rewrite keeps the specifier export name: `Foo as Bar` + resolve to
+    /// `./pkg` still emits `i1.Foo` (target exports `Foo`, not `Bar`).
+    #[test]
+    fn test_resolved_imports_path_only_keeps_export_name() {
+        use std::collections::HashMap;
+
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+import { Foo as Bar } from '@pkg';
+
+@Component({
+    selector: 'app-x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(x: Bar) {}
+}
+"#;
+
+        let mut resolved = HashMap::new();
+        resolved.insert("Bar".to_string(), "./pkg".to_string());
+
+        let mut options = TransformOptions::default();
+        options.emit_class_metadata = true;
+        options.resolved_imports = Some(resolved);
+
+        let result =
+            transform_angular_file(&allocator, "x.component.ts", source, Some(&options), None);
+
+        assert!(!result.has_errors(), "errors: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains("import * as i1 from './pkg'"),
+            "namespace import should use resolved path; got:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("i1.Foo"),
+            "should keep export name Foo after path rewrite; got:\n{}",
+            result.code
+        );
+        assert!(
+            !result.code.contains("i1.Bar"),
+            "must not use local alias Bar on namespace; got:\n{}",
             result.code
         );
     }

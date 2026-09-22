@@ -8,7 +8,8 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
     MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
 };
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use crate::factory::R3DependencyMetadata;
 use crate::output::ast::{OutputExpression, ReadVarExpr};
@@ -67,13 +68,13 @@ impl<'a> NgModuleMetadata<'a> {
         Self {
             class_name,
             class_span,
-            declarations: Vec::new_in(allocator),
-            imports: Vec::new_in(allocator),
+            declarations: Vec::new_in(&allocator),
+            imports: Vec::new_in(&allocator),
             raw_imports_expr: None,
-            exports: Vec::new_in(allocator),
+            exports: Vec::new_in(&allocator),
             providers: None,
-            bootstrap: Vec::new_in(allocator),
-            schemas: Vec::new_in(allocator),
+            bootstrap: Vec::new_in(&allocator),
+            schemas: Vec::new_in(&allocator),
             id: None,
             contains_forward_decls: false,
             deps: None,
@@ -89,7 +90,7 @@ impl<'a> NgModuleMetadata<'a> {
 
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: self.class_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ));
 
         let mut builder = R3NgModuleMetadataBuilder::new(allocator)
@@ -101,7 +102,7 @@ impl<'a> NgModuleMetadata<'a> {
         for decl in &self.declarations {
             let decl_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: decl.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
             builder = builder.add_declaration(R3Reference::value_only(decl_expr));
         }
@@ -110,7 +111,7 @@ impl<'a> NgModuleMetadata<'a> {
         for import in &self.imports {
             let import_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: import.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
             builder = builder.add_import(R3Reference::value_only(import_expr));
         }
@@ -119,7 +120,7 @@ impl<'a> NgModuleMetadata<'a> {
         for export in &self.exports {
             let export_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: export.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
             builder = builder.add_export(R3Reference::value_only(export_expr));
         }
@@ -128,7 +129,7 @@ impl<'a> NgModuleMetadata<'a> {
         for bootstrap in &self.bootstrap {
             let bootstrap_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: bootstrap.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
             builder = builder.add_bootstrap(R3Reference::value_only(bootstrap_expr));
         }
@@ -137,7 +138,7 @@ impl<'a> NgModuleMetadata<'a> {
         for schema in &self.schemas {
             let schema_expr = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: schema.clone(), source_span: None },
-                allocator,
+                &allocator,
             ));
             builder = builder.add_schema(R3Reference::value_only(schema_expr));
         }
@@ -149,7 +150,7 @@ impl<'a> NgModuleMetadata<'a> {
                     value: crate::output::ast::LiteralValue::String(id.clone()),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ));
             builder = builder.id(id_expr);
         }
@@ -180,6 +181,7 @@ impl<'a> NgModuleMetadata<'a> {
 pub fn extract_ng_module_metadata<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<NgModuleMetadata<'a>> {
     // Get the class name
     let class_name: Ident<'a> = class.id.as_ref()?.name.clone().into();
@@ -235,7 +237,8 @@ pub fn extract_ng_module_metadata<'a>(
                     // Also store the raw imports expression for ɵinj generation.
                     // This preserves call expressions like StoreModule.forRoot(...)
                     // and spread elements that are dropped by extract_reference_array.
-                    metadata.raw_imports_expr = convert_oxc_expression(allocator, &prop.value);
+                    metadata.raw_imports_expr =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "exports" => {
                     let (identifiers, has_forward_refs) =
@@ -246,7 +249,8 @@ pub fn extract_ng_module_metadata<'a>(
                     }
                 }
                 "providers" => {
-                    metadata.providers = convert_oxc_expression(allocator, &prop.value);
+                    metadata.providers =
+                        convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "bootstrap" => {
                     let (identifiers, has_forward_refs) =
@@ -276,7 +280,9 @@ pub fn extract_ng_module_metadata<'a>(
 }
 
 /// Find the @NgModule decorator in a list of decorators.
-fn find_ng_module_decorator<'a>(decorators: &'a [Decorator<'a>]) -> Option<&'a Decorator<'a>> {
+pub(crate) fn find_ng_module_decorator<'a>(
+    decorators: &'a [Decorator<'a>],
+) -> Option<&'a Decorator<'a>> {
     decorators.iter().find(|d| match &d.expression {
         Expression::CallExpression(call) => is_ng_module_call(&call.callee),
         Expression::Identifier(id) => id.name == "NgModule",
@@ -330,7 +336,7 @@ fn extract_reference_array<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
 ) -> (Vec<'a, Ident<'a>>, bool) {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
     let mut has_forward_refs = false;
 
     let Expression::ArrayExpression(arr) = expr else {
@@ -378,7 +384,7 @@ fn extract_identifier_array<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
 ) -> Vec<'a, Ident<'a>> {
-    let mut result = Vec::new_in(allocator);
+    let mut result = Vec::new_in(&allocator);
 
     let Expression::ArrayExpression(arr) = expr else {
         return result;
@@ -424,7 +430,7 @@ pub fn extract_constructor_deps<'a>(
 
     // Get the constructor's parameters
     let params = &constructor.value.params;
-    let mut deps = Vec::with_capacity_in(params.items.len(), allocator);
+    let mut deps = Vec::with_capacity_in(params.items.len(), &allocator);
 
     for param in &params.items {
         let dep = extract_param_dependency(allocator, param);
@@ -477,17 +483,26 @@ fn extract_param_dependency<'a>(
                     value: crate::output::ast::LiteralValue::String(attr_name),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ))),
             attribute_name_type: token, // The type annotation
             host,
             optional,
             self_,
             skip_self,
+            type_only_invalid: false,
         };
     }
 
-    R3DependencyMetadata { token, attribute_name_type: None, host, optional, self_, skip_self }
+    R3DependencyMetadata {
+        token,
+        attribute_name_type: None,
+        host,
+        optional,
+        self_,
+        skip_self,
+        type_only_invalid: false,
+    }
 }
 
 /// Get the name of a decorator from its expression.
@@ -514,7 +529,8 @@ fn extract_param_token<'a>(
 ) -> Option<OutputExpression<'a>> {
     // First try to get the type annotation (directly on FormalParameter, not on pattern)
     let type_annotation = param.type_annotation.as_ref()?;
-    let ts_type = &type_annotation.type_annotation;
+    // Narrow `T | null` unions to `T` to match the reference compiler.
+    let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
     // Handle TSTypeReference: SomeClass, SomeModule, etc.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
@@ -530,7 +546,7 @@ fn extract_param_token<'a>(
 
         return Some(OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: type_name, source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -563,15 +579,15 @@ mod tests {
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::ClassDeclaration(class)) => Some(class.as_ref()),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::ClassDeclaration(class) => Some(class.as_ref()),
                     _ => None,
                 },
                 _ => None,
             };
 
             if let Some(class) = class {
-                if let Some(metadata) = extract_ng_module_metadata(&allocator, class) {
+                if let Some(metadata) = extract_ng_module_metadata(&allocator, class, Some(code)) {
                     found_metadata = Some(metadata);
                     break;
                 }
@@ -896,6 +912,31 @@ mod tests {
 
             let dep = &deps[0];
             assert!(dep.token.is_some(), "Token should be extracted from type annotation");
+        });
+    }
+
+    #[test]
+    fn test_ng_module_optional_with_nullable_type() {
+        // Regression test for issue #285:
+        // `@Optional() svc: MyService | null` must resolve the token to `MyService`.
+        let code = r#"
+            @NgModule({})
+            class AppModule {
+                constructor(@Optional() private parent: AppModule | null) {}
+            }
+        "#;
+        assert_metadata(code, |meta| {
+            let deps = meta.deps.as_ref().expect("Should have constructor deps");
+            assert_eq!(deps.len(), 1);
+            let dep = &deps[0];
+            assert!(dep.optional);
+            let token = dep.token.as_ref().expect("token should resolve to AppModule");
+            match token {
+                crate::output::ast::OutputExpression::ReadVar(var) => {
+                    assert_eq!(var.name.as_str(), "AppModule");
+                }
+                other => panic!("expected ReadVar token, got {:?}", other),
+            }
         });
     }
 }

@@ -18,6 +18,12 @@ static ɵfac = function HostDir_Factory(__ngFactoryType__) {
 static ɵdir = /*@__PURE__*/ i0.ɵɵdefineDirective({type:HostDir,inputs:{value:[0,"valueAlias","value"],
     color:[0,"colorAlias","color"]},outputs:{opened:"openedAlias",closed:"closedAlias"}});
 }
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(HostDir,
+      [{type:Directive,args:[{}]}],null,{value:[{type:Input,args:["valueAlias"]}],
+          color:[{type:Input,args:["colorAlias"]}],opened:[{type:Output,args:["openedAlias"]}],
+          closed:[{type:Output,args:["closedAlias"]}]}));
+})();
 
 export class MyComponent {
 
@@ -34,4 +40,10 @@ static ɵcmp = /*@__PURE__*/ i0.ɵɵdefineComponent({type:MyComponent,selectors:
 (() =>{
   (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(MyComponent,
       {className:"MyComponent",filePath:"test.component.ts",lineNumber:22}));
+})();
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(MyComponent,
+      [{type:Component,args:[{selector:"my-component",template:"",hostDirectives:[{directive:HostDir,
+          inputs:["valueAlias","colorAlias: customColorAlias"],outputs:["openedAlias",
+              "closedAlias: customClosedAlias"]}],standalone:false}]}],null,null));
 })();

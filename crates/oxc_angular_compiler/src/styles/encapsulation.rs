@@ -26,8 +26,60 @@
 //! - `::ng-deep` → removed (deprecated but still supported)
 //! - Media queries, keyframes, etc. → preserved
 
-/// Placeholder for comments during processing.
-const COMMENT_PLACEHOLDER: &str = "%COMMENT%";
+use std::ops::Range;
+
+/// Comments are replaced by `%COMMENT<n>%` placeholders during processing,
+/// where `<n>` is the comment's index in the extracted list.
+///
+/// Angular uses a bare `%COMMENT%` here, but that only restores correctly when
+/// every placeholder survives exactly once and in order. Neither holds: the
+/// `:host-context()` pass duplicates selector text (and any placeholder in it)
+/// once per generated permutation, and `polyfill-next-selector` discards text.
+/// With an unindexed placeholder each duplicate consumes the *next* comment,
+/// so a following `/*# sourceMappingURL=... */` gets teleported into the middle
+/// of a selector and a literal `%COMMENT%` is left behind in the shipped CSS.
+/// Carrying the index makes restoration independent of both count and order.
+const COMMENT_PLACEHOLDER_PREFIX: &str = "%COMMENT";
+
+/// The placeholder standing in for `comments[index]`.
+fn comment_placeholder(index: usize) -> String {
+    format!("{COMMENT_PLACEHOLDER_PREFIX}{index}%")
+}
+
+/// Find the comment placeholder at or after `from`, returning its byte range
+/// and the comment index it carries.
+fn find_comment_placeholder(s: &str, from: usize) -> Option<(Range<usize>, usize)> {
+    let mut at = from;
+    while let Some(rel) = s[at..].find(COMMENT_PLACEHOLDER_PREFIX) {
+        let start = at + rel;
+        let digits_at = start + COMMENT_PLACEHOLDER_PREFIX.len();
+        let after = &s[digits_at..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && after.as_bytes().get(digits) == Some(&b'%')
+            && let Ok(index) = after[..digits].parse()
+        {
+            return Some((start..digits_at + digits + 1, index));
+        }
+        at = digits_at;
+    }
+    None
+}
+
+/// Remove every comment placeholder from `s`, returning the cleaned text and
+/// the removed placeholders concatenated in their original order.
+fn strip_comment_placeholders(s: &str) -> (String, String) {
+    let mut cleaned = String::with_capacity(s.len());
+    let mut removed = String::new();
+    let mut at = 0;
+    while let Some((range, _)) = find_comment_placeholder(s, at) {
+        cleaned.push_str(&s[at..range.start]);
+        at = range.end;
+        removed.push_str(&s[range]);
+    }
+    cleaned.push_str(&s[at..]);
+    (cleaned, removed)
+}
 
 // Polyfill host markers (matching Angular's shadow_css.ts)
 const POLYFILL_HOST: &str = "-shadowcsshost";
@@ -354,20 +406,22 @@ fn extract_comments(css: &str) -> (String, Vec<String>) {
                 trimmed.starts_with('#') && trimmed[1..].trim_start().starts_with("source")
             };
 
+            let index = comments.len();
             if is_sourcemap {
                 comments.push(comment.to_string());
             } else {
-                // Count newlines in the comment to preserve line count for sourcemaps
+                // Preserve only the newlines that were inside the comment. Angular
+                // v22 no longer appends an extra trailing newline (the old `+ '\n'`),
+                // so removing a comment doesn't insert blank lines.
                 let newline_count = comment.bytes().filter(|&b| b == b'\n').count();
                 let mut preserved = String::new();
                 for _ in 0..newline_count {
                     preserved.push('\n');
                 }
-                preserved.push('\n');
                 comments.push(preserved);
             }
 
-            result.push_str(COMMENT_PLACEHOLDER);
+            result.push_str(&comment_placeholder(index));
         } else {
             i += push_utf8_char(&mut result, css, i);
         }
@@ -377,18 +431,26 @@ fn extract_comments(css: &str) -> (String, Vec<String>) {
 }
 
 /// Restore comments from placeholders.
+///
+/// Every placeholder carries the index of the comment it stands for, so a
+/// placeholder that got duplicated (`:host-context()` permutations) restores to
+/// the same comment as its twin, and one that got dropped shifts nothing.
+///
+/// `extract_comments` only ever emits in-range indices, and the passes that
+/// copy selector text copy the index along with it, so every placeholder *we*
+/// generated resolves. An index that doesn't is therefore source CSS that
+/// merely looks like a placeholder (`content: "%COMMENT7%"`), and is left
+/// exactly as the author wrote it.
 fn restore_comments(css: &str, comments: &[String]) -> String {
-    let mut result = css.to_string();
-    let mut idx = 0;
+    let mut result = String::with_capacity(css.len());
+    let mut at = 0;
 
-    while result.find(COMMENT_PLACEHOLDER).is_some() {
-        if idx < comments.len() {
-            result = result.replacen(COMMENT_PLACEHOLDER, &comments[idx], 1);
-            idx += 1;
-        } else {
-            break;
-        }
+    while let Some((range, index)) = find_comment_placeholder(css, at) {
+        result.push_str(&css[at..range.start]);
+        result.push_str(comments.get(index).map_or(&css[range.start..range.end], String::as_str));
+        at = range.end;
     }
+    result.push_str(&css[at..]);
 
     result
 }
@@ -1010,6 +1072,31 @@ fn split_by_top_level_comma_str(s: &str) -> Vec<&str> {
 }
 
 /// Process :host-context in a single selector part.
+/// Returns true if `after` (the text following a `:host-context` token) begins a
+/// non-empty argument list — `(` then, ignoring whitespace, a character other than
+/// `)`. Mirrors Angular v22's `/:host-context(?=\(\s*[^)\s])/`.
+fn is_nonempty_host_context_arg(after: &str) -> bool {
+    let Some(rest) = after.strip_prefix('(') else {
+        return false;
+    };
+    matches!(rest.trim_start().chars().next(), Some(c) if c != ')')
+}
+
+/// Finds the byte offset of the first `:host-context` that is a real context
+/// selector (followed by a non-empty argument list).
+fn find_valid_host_context(s: &str) -> Option<usize> {
+    let marker = ":host-context";
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(marker) {
+        let pos = from + rel;
+        if is_nonempty_host_context_arg(&s[pos + marker.len()..]) {
+            return Some(pos);
+        }
+        from = pos + marker.len();
+    }
+    None
+}
+
 fn convert_colon_host_context_in_part(css: &str, content_attr: &str, host_attr: &str) -> String {
     let attr = if host_attr.is_empty() {
         format!("[{}]", content_attr)
@@ -1017,9 +1104,12 @@ fn convert_colon_host_context_in_part(css: &str, content_attr: &str, host_attr: 
         format!("[{}]", host_attr)
     };
 
-    // Find the first :host-context
+    // Find the first :host-context that is actually a context selector, i.e. one
+    // followed by a non-empty argument list. Angular v22 leaves bare
+    // `:host-context`, `:host-context()` and `:host-context( )` literal, so any
+    // such occurrence before the first real one is preserved as a prefix.
     let host_context_marker = ":host-context";
-    let Some(hc_global_start) = css.find(host_context_marker) else {
+    let Some(hc_global_start) = find_valid_host_context(css) else {
         return css.to_string();
     };
 
@@ -1095,12 +1185,13 @@ fn convert_colon_host_context_in_part(css: &str, content_attr: &str, host_attr: 
         current_pos = paren_end + 1;
     }
 
-    // Handle edge cases: :host-context with no selectors
-    // e.g., ":host-context .inner" or ":host-context() .inner"
+    // Angular v22: a `:host-context` that is not followed by a non-empty argument
+    // list (bare `:host-context`, `:host-context()`, `:host-context( )`) is no longer
+    // treated as a context selector. It is left literal so the regular selector
+    // scoping prefixes it with the content attribute, e.g.
+    // `:host-context .inner` -> `[contenta]:host-context .inner[contenta]`.
     if selector_groups.is_empty() || selector_groups[0].is_empty() {
-        // Remove the :host-context (with or without empty parens) and replace with host marker
-        let result = replace_host_context_patterns(css, &attr);
-        return result;
+        return css.to_string();
     }
 
     // The "other selectors" are everything after the last :host-context()
@@ -1148,15 +1239,15 @@ fn find_pseudo_function_before(before_hc: &str) -> (String, usize) {
 /// Returns the index of the closing paren (exclusive).
 fn find_matching_paren(s: &str, start: usize) -> Option<usize> {
     let mut depth = 1;
-    let chars: Vec<char> = s[start..].chars().collect();
+    let bytes = s.as_bytes();
 
-    for (i, c) in chars.iter().enumerate() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
+    for i in start..bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(start + i);
+                    return Some(i);
                 }
             }
             _ => {}
@@ -1265,9 +1356,31 @@ fn combine_host_context_selectors(context_selectors: &[String]) -> Vec<String> {
 ///
 /// Key insight: matching stops at COMMAS, not closing parens of pseudo-functions.
 /// This ensures `:host:not(:host.foo, :host.bar)` is processed correctly.
+/// Replace `:host` with the polyfill marker, skipping the `:host` that begins a
+/// `:host-context` token (mirrors Angular's `_colonHostRe = /:host(?!\-context)/`).
+fn replace_colon_host_marker(css: &str) -> String {
+    let mut result = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(pos) = rest.find(":host") {
+        let after = &rest[pos + ":host".len()..];
+        result.push_str(&rest[..pos]);
+        if after.starts_with("-context") {
+            // Leave `:host-context` literal; copy `:host` through unchanged.
+            result.push_str(":host");
+        } else {
+            result.push_str(POLYFILL_HOST);
+        }
+        rest = after;
+    }
+    result.push_str(rest);
+    result
+}
+
 fn convert_colon_host(css: &str, _host_attr: &str) -> String {
-    // Step 1: Replace all :host with marker
-    let mut result = css.replace(":host", POLYFILL_HOST);
+    // Step 1: Replace `:host` with the marker, but NOT the `:host` inside
+    // `:host-context` (Angular v22's `/:host(?!\-context)/`). A bare/empty
+    // `:host-context` is left literal here and scoped with the content attr later.
+    let mut result = replace_colon_host_marker(css);
 
     // Step 2: Process POLYFILL_HOST(...) patterns - direct parens after marker
     result = process_host_with_parens(&result);
@@ -1325,22 +1438,29 @@ fn process_host_with_parens(css: &str) -> String {
         // Split inner by top-level commas
         let inner_selectors = split_by_top_level_comma(inner_content);
 
-        // Process each inner selector
-        let converted: Vec<String> = inner_selectors
-            .iter()
-            .map(|sel| {
-                let trimmed = sel.trim();
-                if trimmed.is_empty() {
-                    return String::new();
-                }
-                // Use POLYFILL_HOST_NO_COMBINATOR + trimmed (with marker stripped) + other
-                let stripped = trimmed.replace(POLYFILL_HOST, "");
-                format!("{}{}{}", POLYFILL_HOST_NO_COMBINATOR, stripped, other_selectors)
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let replacement = converted.join(",");
+        let replacement = if inner_selectors.len() > 1 {
+            // Angular v22: a `:host(...)` whose argument is a selector list (top-level
+            // commas) is left untouched as a literal `:host(...)`. The later selector
+            // scoping then prefixes it with the content attribute, e.g.
+            // `:host(.a, .b)` -> `[contenta]:host(.a, .b)`.
+            let restored = inner_content.replace(POLYFILL_HOST, ":host");
+            format!(":host({restored}){other_selectors}")
+        } else {
+            // Single selector: convert to the no-combinator host form.
+            inner_selectors
+                .iter()
+                .map(|sel| {
+                    let trimmed = sel.trim();
+                    if trimmed.is_empty() {
+                        return String::new();
+                    }
+                    let stripped = trimmed.replace(POLYFILL_HOST, "");
+                    format!("{}{}{}", POLYFILL_HOST_NO_COMBINATOR, stripped, other_selectors)
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         result = format!("{}{}{}", &result[..host_start], replacement, &after_host[other_end..]);
     }
 
@@ -1989,6 +2109,30 @@ fn scope_selector_part_with_context(
         return String::new();
     }
 
+    // Detach any comment placeholders before anything inspects the selector.
+    // A comment can be glued straight onto the selector text (PostCSS reprints
+    // `/* why */\n.foo` as `/* why */.foo`), and every check below is a
+    // whole-string match: with `%COMMENT0%` still attached, `:where(.one)`
+    // stops looking like a pure pseudo-function and gets scoped as
+    // `[content]:where(.one)` instead of `:where(.one[content])` - which is a
+    // real cascade change, since `:where()` contributes no specificity. The
+    // placeholders restore to blank text, so re-emitting them in front is
+    // enough.
+    if selector.contains(COMMENT_PLACEHOLDER_PREFIX) {
+        // `%COMMENT` without a valid index isn't ours - fall through and treat
+        // it as ordinary selector text.
+        let (stripped, placeholders) = strip_comment_placeholders(selector);
+        if !placeholders.is_empty() {
+            if stripped.trim().is_empty() {
+                // Nothing but placeholder(s) - no real selector to scope. Must
+                // not fall through, or a lone comment would become a bare
+                // `[content]` matching every element in the component.
+                return selector.to_string();
+            }
+            return placeholders + &scope_selector_part_with_context(&stripped, ctx, part_has_host);
+        }
+    }
+
     // If this part IS the host marker, don't add content attr
     if !ctx.host_marker.is_empty() && selector.trim() == ctx.host_marker {
         return selector.to_string();
@@ -2088,7 +2232,7 @@ fn try_scope_pseudo_function_with_context(
     // Find all pseudo-function parts
     let mut pseudo_parts: Vec<String> = Vec::new();
     let mut last_end = 0;
-    let chars: Vec<char> = trimmed.chars().collect();
+    let bytes = trimmed.as_bytes();
 
     let mut search_from = 0;
     while let Some(mat) = find_where_or_is(trimmed, search_from) {
@@ -2106,13 +2250,13 @@ fn try_scope_pseudo_function_with_context(
 
         // Find the matching closing paren
         let paren_start = mat.end;
-        let mut paren_depth = 1;
+        let mut paren_depth: u32 = 1;
         let mut paren_end = paren_start;
 
-        for i in paren_start..trimmed.len() {
-            match chars[i] {
-                '(' => paren_depth += 1,
-                ')' => {
+        for i in paren_start..bytes.len() {
+            match bytes[i] {
+                b'(' => paren_depth += 1,
+                b')' => {
                     paren_depth -= 1;
                     if paren_depth == 0 {
                         paren_end = i;
@@ -2184,10 +2328,9 @@ fn scope_simple_selector(selector: &str, content_attr: &str) -> String {
         return String::new();
     }
 
-    // Don't scope comment placeholders
-    if selector.contains(COMMENT_PLACEHOLDER) {
-        return selector.to_string();
-    }
+    // Comment placeholders are detached in `scope_selector_part_with_context`,
+    // which is upstream of every caller of this function, so the selector text
+    // here is already placeholder-free.
 
     // Already has the content attribute
     let attr = format!("[{}]", content_attr);
@@ -2258,14 +2401,15 @@ fn contains_host_attr_at_top_level(selector: &str, host_attr: &str) -> bool {
 /// Returns pairs of (selector_part, combinator_with_spaces).
 fn split_by_combinators(selector: &str) -> Vec<(&str, &str)> {
     let mut result = Vec::new();
-    let chars: Vec<char> = selector.chars().collect();
-    let mut start = 0;
-    let mut i = 0;
+    let char_indices: Vec<(usize, char)> = selector.char_indices().collect();
+    let mut start = 0_usize; // byte index into selector
+    let mut i = 0_usize; // index into char_indices
     let mut paren_depth: u32 = 0;
     let mut bracket_depth: u32 = 0;
 
-    while i < chars.len() {
-        match chars[i] {
+    while i < char_indices.len() {
+        let (byte_pos, ch) = char_indices[i];
+        match ch {
             '(' => paren_depth += 1,
             ')' => paren_depth = paren_depth.saturating_sub(1),
             '[' => bracket_depth += 1,
@@ -2276,9 +2420,10 @@ fn split_by_combinators(selector: &str) -> Vec<(&str, &str)> {
                 // A space following an escaped hex value and followed by another hex character
                 // (ie: ".\fc ber" for ".über") is not a separator between 2 selectors
                 // Check: if the part ends with an escape placeholder AND next char is hex
-                let part = &selector[start..i];
-                let next_char_is_hex =
-                    i + 1 < chars.len() && chars[i] == ' ' && chars[i + 1].is_ascii_hexdigit();
+                let part = &selector[start..byte_pos];
+                let next_char_is_hex = i + 1 < char_indices.len()
+                    && ch == ' '
+                    && char_indices[i + 1].1.is_ascii_hexdigit();
                 let part_ends_with_esc_placeholder = part.contains("__esc-ph-");
 
                 if next_char_is_hex && part_ends_with_esc_placeholder {
@@ -2288,25 +2433,25 @@ fn split_by_combinators(selector: &str) -> Vec<(&str, &str)> {
                 }
 
                 // Found a potential combinator
-                let part_end = i;
+                let part_end = byte_pos;
 
                 // Collect the combinator (may include spaces around it)
-                let combinator_start = i;
-                while i < chars.len()
-                    && (chars[i] == ' '
-                        || chars[i] == '\n'
-                        || chars[i] == '\t'
-                        || chars[i] == '\r'
-                        || chars[i] == '>'
-                        || chars[i] == '+'
-                        || chars[i] == '~')
+                let combinator_start = byte_pos;
+                while i < char_indices.len()
+                    && matches!(char_indices[i].1, ' ' | '\n' | '\t' | '\r' | '>' | '+' | '~')
                 {
                     i += 1;
                 }
 
+                let combinator_end =
+                    if i < char_indices.len() { char_indices[i].0 } else { selector.len() };
+
                 // Always push the part, even if empty (to preserve leading combinators)
-                result.push((&selector[start..part_end], &selector[combinator_start..i]));
-                start = i;
+                result.push((
+                    &selector[start..part_end],
+                    &selector[combinator_start..combinator_end],
+                ));
+                start = combinator_end;
                 continue;
             }
             _ => {}
@@ -2491,16 +2636,20 @@ fn scope_after_host_with_context(selector: &str, ctx: &mut ScopingContext) -> St
 
 /// Find the start position of a pseudo-element (::).
 fn find_pseudo_element_start(s: &str) -> Option<usize> {
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
     let mut i = 0;
-    let chars: Vec<char> = s.chars().collect();
     let mut in_brackets: u32 = 0;
 
-    while i < chars.len() {
-        match chars[i] {
+    while i < char_indices.len() {
+        let (byte_pos, ch) = char_indices[i];
+        match ch {
             '[' => in_brackets += 1,
             ']' => in_brackets = in_brackets.saturating_sub(1),
-            ':' if in_brackets == 0 && i + 1 < chars.len() && chars[i + 1] == ':' => {
-                return Some(i);
+            ':' if in_brackets == 0
+                && i + 1 < char_indices.len()
+                && char_indices[i + 1].1 == ':' =>
+            {
+                return Some(byte_pos);
             }
             _ => {}
         }
@@ -2512,20 +2661,21 @@ fn find_pseudo_element_start(s: &str) -> Option<usize> {
 /// Find the start position of a pseudo-class (:), including pseudo-functions.
 /// The caller decides how to handle pseudo-functions vs regular pseudo-classes.
 fn find_pseudo_class_start(s: &str) -> Option<usize> {
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
     let mut i = 0;
-    let chars: Vec<char> = s.chars().collect();
     let mut in_brackets: u32 = 0;
 
-    while i < chars.len() {
-        match chars[i] {
+    while i < char_indices.len() {
+        let (byte_pos, ch) = char_indices[i];
+        match ch {
             '[' => in_brackets += 1,
             ']' => in_brackets = in_brackets.saturating_sub(1),
             ':' if in_brackets == 0 => {
                 // Check it's not :: (pseudo-element) - those are handled separately
-                if i + 1 < chars.len() && chars[i + 1] == ':' {
+                if i + 1 < char_indices.len() && char_indices[i + 1].1 == ':' {
                     return None;
                 }
-                return Some(i);
+                return Some(byte_pos);
             }
             _ => {}
         }
@@ -2563,43 +2713,6 @@ fn find_where_or_is(s: &str, start_from: usize) -> Option<PseudoFunctionMatch> {
         i += 1;
     }
     None
-}
-
-/// Replace `:host-context` patterns (with or without empty parens) with a replacement string.
-/// Matches `:host-context` or `:host-context()` (with optional whitespace inside parens).
-fn replace_host_context_patterns(s: &str, replacement: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Check for `:host-context`
-        if i + 13 <= len && &s[i..i + 13] == ":host-context" {
-            let after = i + 13;
-            // Check if followed by `(` with optional whitespace and `)`
-            if after < len && bytes[after] == b'(' {
-                // Skip whitespace inside parens
-                let mut j = after + 1;
-                while j < len && bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if j < len && bytes[j] == b')' {
-                    // Found :host-context() - replace entire thing
-                    result.push_str(replacement);
-                    i = j + 1;
-                    continue;
-                }
-            }
-            // Just :host-context without () or with non-empty ()
-            result.push_str(replacement);
-            i = after;
-            continue;
-        }
-        i += push_utf8_char(&mut result, s, i);
-    }
-
-    result
 }
 
 /// Check if a selector is a keyframe selector (from, to, or percentage).
@@ -3453,6 +3566,52 @@ mod tests {
             result.len() < 50_000,
             "Output should not explode exponentially. Got {} bytes",
             result.len()
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_in_selector() {
+        // Selectors with multibyte UTF-8 characters (e.g. attribute selectors with
+        // non-ASCII values) must not panic from byte/char index mismatch.
+        let result = shim_css_text(r#"[data-label="ÄÖÜ"] .child { color: red; }"#, "contenta", "");
+        assert!(
+            result.contains("[contenta]"),
+            "Should scope selectors containing multibyte UTF-8. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_pseudo_element() {
+        // Pseudo-elements on selectors with multibyte characters must not panic.
+        let result = shim_css_text(r#"[title="café"]::before { content: ""; }"#, "contenta", "");
+        assert!(
+            result.contains("[contenta]"),
+            "Should scope pseudo-elements with multibyte UTF-8. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_pseudo_class() {
+        // Pseudo-classes on selectors with multibyte characters must not panic.
+        let result = shim_css_text(r#".naïve:hover { color: blue; }"#, "contenta", "");
+        assert!(
+            result.contains("[contenta]"),
+            "Should scope pseudo-classes with multibyte UTF-8. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_combinator_split() {
+        // Combinators between selectors with multibyte characters must not panic.
+        let result =
+            shim_css_text(r#".über > .straße + .café ~ .naïve { color: green; }"#, "contenta", "");
+        assert!(
+            result.contains("[contenta]"),
+            "Should handle combinators with multibyte UTF-8 selectors. Got: {}",
+            result
         );
     }
 }

@@ -8,7 +8,8 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
     MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
 };
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 
 use crate::factory::R3DependencyMetadata;
 use crate::output::ast::{OutputExpression, ReadVarExpr};
@@ -111,7 +112,7 @@ impl<'a> InjectableMetadata<'a> {
 
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: self.class_name.clone(), source_span: None },
-            allocator,
+            &allocator,
         ));
 
         let mut builder =
@@ -171,7 +172,7 @@ fn clone_r3_deps<'a>(
     allocator: &'a Allocator,
     deps: &[R3DependencyMetadata<'a>],
 ) -> Vec<'a, R3DependencyMetadata<'a>> {
-    let mut result = Vec::with_capacity_in(deps.len(), allocator);
+    let mut result = Vec::with_capacity_in(deps.len(), &allocator);
     for dep in deps {
         result.push(R3DependencyMetadata {
             token: dep.token.as_ref().map(|t| t.clone_in(allocator)),
@@ -180,6 +181,7 @@ fn clone_r3_deps<'a>(
             optional: dep.optional,
             self_: dep.self_,
             skip_self: dep.skip_self,
+            type_only_invalid: dep.type_only_invalid,
         });
     }
     result
@@ -189,7 +191,7 @@ fn convert_deps_to_r3<'a>(
     allocator: &'a Allocator,
     deps: &[DependencyMetadata<'a>],
 ) -> oxc_allocator::Vec<'a, crate::factory::R3DependencyMetadata<'a>> {
-    let mut result = oxc_allocator::Vec::new_in(allocator);
+    let mut result = oxc_allocator::Vec::new_in(&allocator);
     for dep in deps {
         result.push(crate::factory::R3DependencyMetadata {
             token: Some(dep.token.clone_in(allocator)),
@@ -198,9 +200,17 @@ fn convert_deps_to_r3<'a>(
             optional: dep.optional,
             self_: dep.self_,
             skip_self: dep.skip_self,
+            type_only_invalid: false,
         });
     }
     result
+}
+
+/// Find the `@Injectable` decorator node on a class.
+pub(crate) fn find_injectable_decorator<'a>(
+    decorators: &'a [oxc_ast::ast::Decorator<'a>],
+) -> Option<&'a oxc_ast::ast::Decorator<'a>> {
+    decorators.iter().find(|d| is_injectable_decorator(d))
 }
 
 /// Find the span of the `@Injectable` decorator on a class.
@@ -217,6 +227,7 @@ pub fn find_injectable_decorator_span(class: &Class<'_>) -> Option<Span> {
 pub fn extract_injectable_metadata<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<InjectableMetadata<'a>> {
     let class_name: Ident<'a> = class.id.as_ref()?.name.clone().into();
     let class_span = class.span;
@@ -240,7 +251,7 @@ pub fn extract_injectable_metadata<'a>(
             use_factory: None,
             use_value: None,
             use_existing: None,
-            deps: extract_constructor_deps(allocator, class),
+            deps: extract_constructor_deps(allocator, class, source_text),
         });
     }
 
@@ -251,22 +262,22 @@ pub fn extract_injectable_metadata<'a>(
     };
 
     // Extract providedIn (None if not specified)
-    let provided_in = extract_provided_in(allocator, config_obj);
+    let provided_in = extract_provided_in(allocator, config_obj, source_text);
 
     // Extract useClass
-    let use_class = extract_use_class(allocator, config_obj);
+    let use_class = extract_use_class(allocator, config_obj, source_text);
 
     // Extract useFactory
-    let use_factory = extract_use_factory(allocator, config_obj);
+    let use_factory = extract_use_factory(allocator, config_obj, source_text);
 
     // Extract useValue
-    let use_value = extract_use_value(allocator, config_obj);
+    let use_value = extract_use_value(allocator, config_obj, source_text);
 
     // Extract useExisting
-    let use_existing = extract_use_existing(allocator, config_obj);
+    let use_existing = extract_use_existing(allocator, config_obj, source_text);
 
     // Extract constructor dependencies
-    let deps = extract_constructor_deps(allocator, class);
+    let deps = extract_constructor_deps(allocator, class, source_text);
 
     Some(InjectableMetadata {
         class_name,
@@ -302,12 +313,13 @@ fn get_property_key_name<'a>(key: &'a PropertyKey<'a>) -> Option<Ident<'a>> {
 fn extract_provided_in<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<ProvidedInValue<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "providedIn" {
-                    return parse_provided_in_value(allocator, &prop.value);
+                    return parse_provided_in_value(allocator, &prop.value, source_text);
                 }
             }
         }
@@ -318,6 +330,7 @@ fn extract_provided_in<'a>(
 fn parse_provided_in_value<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<ProvidedInValue<'a>> {
     match expr {
         Expression::StringLiteral(s) => match s.value.as_str() {
@@ -329,7 +342,8 @@ fn parse_provided_in_value<'a>(
         Expression::NullLiteral(_) => Some(ProvidedInValue::None),
         _ => {
             // Check for forwardRef
-            let (expression, is_forward_ref) = extract_forward_ref_or_expression(allocator, expr)?;
+            let (expression, is_forward_ref) =
+                extract_forward_ref_or_expression(allocator, expr, source_text)?;
             Some(ProvidedInValue::Module { expression, is_forward_ref })
         }
     }
@@ -338,14 +352,15 @@ fn parse_provided_in_value<'a>(
 fn extract_use_class<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<UseClassMetadata<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "useClass" {
                     let (class_expr, is_forward_ref) =
-                        extract_forward_ref_or_expression(allocator, &prop.value)?;
-                    let deps = extract_deps_from_config(allocator, config_obj);
+                        extract_forward_ref_or_expression(allocator, &prop.value, source_text)?;
+                    let deps = extract_deps_from_config(allocator, config_obj, source_text);
                     return Some(UseClassMetadata { class_expr, is_forward_ref, deps });
                 }
             }
@@ -357,13 +372,14 @@ fn extract_use_class<'a>(
 fn extract_use_factory<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<UseFactoryMetadata<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "useFactory" {
-                    let factory = convert_oxc_expression(allocator, &prop.value)?;
-                    let deps = extract_deps_from_config(allocator, config_obj);
+                    let factory = convert_oxc_expression(allocator, &prop.value, source_text)?;
+                    let deps = extract_deps_from_config(allocator, config_obj, source_text);
                     return Some(UseFactoryMetadata { factory, deps });
                 }
             }
@@ -375,12 +391,13 @@ fn extract_use_factory<'a>(
 fn extract_use_value<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<OutputExpression<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "useValue" {
-                    return convert_oxc_expression(allocator, &prop.value);
+                    return convert_oxc_expression(allocator, &prop.value, source_text);
                 }
             }
         }
@@ -391,13 +408,14 @@ fn extract_use_value<'a>(
 fn extract_use_existing<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<UseExistingMetadata<'a>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "useExisting" {
                     let (existing, is_forward_ref) =
-                        extract_forward_ref_or_expression(allocator, &prop.value)?;
+                        extract_forward_ref_or_expression(allocator, &prop.value, source_text)?;
                     return Some(UseExistingMetadata { existing, is_forward_ref });
                 }
             }
@@ -411,37 +429,34 @@ fn extract_use_existing<'a>(
 fn extract_forward_ref_or_expression<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<(OutputExpression<'a>, bool)> {
     // Check if this is forwardRef(() => X)
     if let Expression::CallExpression(call) = expr {
         if let Expression::Identifier(id) = &call.callee {
             if id.name == "forwardRef" {
                 if let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first() {
-                    // Get the body expression - arrow functions with expression bodies
-                    // store the expression as a single ExpressionStatement in body.statements
-                    if arrow.expression {
-                        if let Some(oxc_ast::ast::Statement::ExpressionStatement(expr_stmt)) =
-                            arrow.body.statements.first()
+                    // Expression body: forwardRef(() => X)
+                    if let Some(body_expr) = arrow.get_expression() {
+                        if let Some(expression) =
+                            convert_oxc_expression(&allocator, body_expr, source_text)
                         {
-                            if let Some(expression) =
-                                convert_oxc_expression(allocator, &expr_stmt.expression)
-                            {
-                                return Some((expression, true));
-                            }
+                            return Some((expression, true));
                         }
                     }
                 }
             }
         }
     }
-    convert_oxc_expression(allocator, expr).map(|e| (e, false))
+    convert_oxc_expression(allocator, expr, source_text).map(|e| (e, false))
 }
 
 fn extract_deps_from_config<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    source_text: Option<&'a str>,
 ) -> Vec<'a, DependencyMetadata<'a>> {
-    let mut deps = Vec::new_in(allocator);
+    let mut deps = Vec::new_in(&allocator);
 
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -449,7 +464,7 @@ fn extract_deps_from_config<'a>(
                 if key_name.as_str() == "deps" {
                     if let Expression::ArrayExpression(arr) = &prop.value {
                         for element in &arr.elements {
-                            if let Some(dep) = extract_dependency(allocator, element) {
+                            if let Some(dep) = extract_dependency(allocator, element, source_text) {
                                 deps.push(dep);
                             }
                         }
@@ -466,12 +481,13 @@ fn extract_deps_from_config<'a>(
 fn extract_dependency<'a>(
     allocator: &'a Allocator,
     element: &'a ArrayExpressionElement<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<DependencyMetadata<'a>> {
     match element {
         ArrayExpressionElement::SpreadElement(_) | ArrayExpressionElement::Elision(_) => None,
         _ => {
             let expr = element.to_expression();
-            convert_oxc_expression(allocator, expr).map(|t| DependencyMetadata {
+            convert_oxc_expression(allocator, expr, source_text).map(|t| DependencyMetadata {
                 token: t,
                 optional: false,
                 self_: false,
@@ -509,6 +525,7 @@ fn extract_dependency<'a>(
 pub fn extract_constructor_deps<'a>(
     allocator: &'a Allocator,
     class: &'a Class<'a>,
+    source_text: Option<&'a str>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
     let constructor = class.body.body.iter().find_map(|element| {
@@ -522,10 +539,10 @@ pub fn extract_constructor_deps<'a>(
 
     // Get the constructor's parameters
     let params = &constructor.value.params;
-    let mut deps = Vec::with_capacity_in(params.items.len(), allocator);
+    let mut deps = Vec::with_capacity_in(params.items.len(), &allocator);
 
     for param in &params.items {
-        let dep = extract_param_dependency(allocator, param);
+        let dep = extract_param_dependency(allocator, param, source_text);
         deps.push(dep);
     }
 
@@ -536,6 +553,7 @@ pub fn extract_constructor_deps<'a>(
 fn extract_param_dependency<'a>(
     allocator: &'a Allocator,
     param: &oxc_ast::ast::FormalParameter<'a>,
+    source_text: Option<&'a str>,
 ) -> R3DependencyMetadata<'a> {
     // Extract flags and @Inject token from decorators
     let mut optional = false;
@@ -552,7 +570,8 @@ fn extract_param_dependency<'a>(
                     // @Inject(TOKEN) - extract the token
                     if let Expression::CallExpression(call) = &decorator.expression {
                         if let Some(arg) = call.arguments.first() {
-                            inject_token = convert_oxc_expression(allocator, arg.to_expression());
+                            inject_token =
+                                convert_oxc_expression(allocator, arg.to_expression(), source_text);
                         }
                     }
                 }
@@ -586,17 +605,26 @@ fn extract_param_dependency<'a>(
                     value: crate::output::ast::LiteralValue::String(attr_name),
                     source_span: None,
                 },
-                allocator,
+                &allocator,
             ))),
             attribute_name_type: token, // The type annotation
             host,
             optional,
             self_,
             skip_self,
+            type_only_invalid: false,
         };
     }
 
-    R3DependencyMetadata { token, attribute_name_type: None, host, optional, self_, skip_self }
+    R3DependencyMetadata {
+        token,
+        attribute_name_type: None,
+        host,
+        optional,
+        self_,
+        skip_self,
+        type_only_invalid: false,
+    }
 }
 
 /// Get the name of a decorator from its expression.
@@ -623,7 +651,8 @@ fn extract_param_token<'a>(
 ) -> Option<OutputExpression<'a>> {
     // First try to get the type annotation (directly on FormalParameter, not on pattern)
     let type_annotation = param.type_annotation.as_ref()?;
-    let ts_type = &type_annotation.type_annotation;
+    // Narrow `T | null` unions to `T` to match the reference compiler.
+    let ts_type = crate::util::resolve_di_token_type(&type_annotation.type_annotation)?;
 
     // Handle TSTypeReference: SomeClass, SomeModule, etc.
     if let oxc_ast::ast::TSType::TSTypeReference(type_ref) = ts_type {
@@ -639,7 +668,7 @@ fn extract_param_token<'a>(
 
         return Some(OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: type_name, source_span: None },
-            allocator,
+            &allocator,
         )));
     }
 
@@ -663,7 +692,7 @@ mod tests {
 
         for stmt in &program.body {
             if let oxc_ast::ast::Statement::ClassDeclaration(class) = stmt {
-                return extract_injectable_metadata(allocator, class);
+                return extract_injectable_metadata(allocator, class, Some(source));
             }
         }
         None
@@ -898,6 +927,32 @@ mod tests {
 
         // Third dep: @Inject(DOCUMENT) - token should be DOCUMENT, not Document
         assert!(deps[2].token.is_some(), "Third dep should have token");
+    }
+
+    #[test]
+    fn test_injectable_optional_with_nullable_type() {
+        // Regression test for issue #285:
+        // `@Optional() svc: MyService | null` must resolve the token to `MyService`.
+        let allocator = Allocator::default();
+        let source = r#"
+            @Injectable()
+            class MyService {
+                constructor(@Optional() private svc: OtherService | null) {}
+            }
+        "#;
+
+        let metadata = parse_and_extract(&allocator, source).expect("Should have metadata");
+        let deps = metadata.deps.as_ref().expect("Should have constructor deps");
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert!(dep.optional, "Should have optional flag");
+        let token = dep.token.as_ref().expect("token should resolve to OtherService");
+        match token {
+            crate::output::ast::OutputExpression::ReadVar(var) => {
+                assert_eq!(var.name.as_str(), "OtherService");
+            }
+            other => panic!("expected ReadVar token, got {:?}", other),
+        }
     }
 
     #[test]

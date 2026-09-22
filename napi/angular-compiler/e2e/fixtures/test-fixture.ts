@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, rename, unlink, open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -6,6 +6,56 @@ import { test as base, expect, type Page } from '@playwright/test'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const FIXTURE_APP = join(__dirname, '../app/src/app')
+
+/**
+ * Write strategies that mimic how different tools / editors save files.
+ * Used to guard against watcher implementations that miss certain patterns
+ * (e.g., a per-file `node:fs.watch` on macOS dropping single fast in-place
+ * writes from AI-tool Edit operations).
+ */
+export type WriteStrategy =
+  | 'writeFile-in-place' // single fs.writeFile (Claude Code, most CLI tools)
+  | 'writeFile-with-fsync' // writeFile + explicit fsync
+  | 'atomic-rename' // write `.tmp` then rename (vim, IntelliJ "safe write")
+  | 'truncate-then-write' // writeFile('') + delay + writeFile(content)
+
+async function performWrite(
+  filepath: string,
+  content: string,
+  strategy: WriteStrategy,
+): Promise<void> {
+  switch (strategy) {
+    case 'writeFile-in-place':
+      await writeFile(filepath, content)
+      return
+    case 'writeFile-with-fsync': {
+      await writeFile(filepath, content)
+      const handle = await open(filepath, 'r+')
+      try {
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      return
+    }
+    case 'atomic-rename': {
+      const tmp = `${filepath}.hmr-${Date.now()}.tmp`
+      await writeFile(tmp, content)
+      try {
+        await rename(tmp, filepath)
+      } catch (err) {
+        await unlink(tmp).catch(() => {})
+        throw err
+      }
+      return
+    }
+    case 'truncate-then-write':
+      await writeFile(filepath, '')
+      await new Promise((r) => setTimeout(r, 30))
+      await writeFile(filepath, content)
+      return
+  }
+}
 
 /**
  * File modification utility for e2e tests.
@@ -17,8 +67,16 @@ export class FileModifier {
   /**
    * Modify a file in the fixture app directory.
    * Automatically backs up the original content for restoration.
+   *
+   * Optionally takes a write strategy to mimic how different tools save —
+   * use this to assert HMR works regardless of the consumer's editor /
+   * AI-tool save pattern.
    */
-  async modifyFile(filename: string, modifier: (content: string) => string): Promise<void> {
+  async modifyFile(
+    filename: string,
+    modifier: (content: string) => string,
+    strategy: WriteStrategy = 'writeFile-in-place',
+  ): Promise<void> {
     const filepath = join(FIXTURE_APP, filename)
     const content = await readFile(filepath, 'utf-8')
 
@@ -27,7 +85,7 @@ export class FileModifier {
     }
 
     const modified = modifier(content)
-    await writeFile(filepath, modified)
+    await performWrite(filepath, modified, strategy)
   }
 
   /**
@@ -81,6 +139,69 @@ export class HmrDetector {
    */
   async sentinelExists(sentinelId: string): Promise<boolean> {
     return (await this.page.locator(`#${sentinelId}`).count()) > 0
+  }
+
+  /**
+   * Record every HMR websocket payload the dev server sends.
+   *
+   * Must be called BEFORE `page.goto`, because it wraps `window.WebSocket`
+   * and Vite's client opens its socket during page load.
+   *
+   * Reading the wire is the only honest way to assert that no reload was
+   * requested. Vite's client drops a `full-reload` whose `.html` path does
+   * not match `location.pathname`, so a DOM sentinel survives even when the
+   * server did ask for a reload.
+   */
+  async captureWirePayloads(): Promise<void> {
+    await this.page.addInitScript(() => {
+      const KEY = '__viteHmrPayloads'
+      const read = (): unknown[] => {
+        try {
+          return JSON.parse(sessionStorage.getItem(KEY) || '[]')
+        } catch {
+          return []
+        }
+      }
+      // Persist across navigations: a `full-reload` payload is only
+      // observable if the record outlives the reload it caused.
+      const record = (payload: unknown) => {
+        const all = read()
+        all.push(payload)
+        try {
+          sessionStorage.setItem(KEY, JSON.stringify(all))
+        } catch {
+          // Storage is unavailable; the assertion will report the gap.
+        }
+      }
+      const NativeWebSocket = window.WebSocket
+      class RecordingWebSocket extends NativeWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          super(url, protocols)
+          this.addEventListener('message', (event: MessageEvent) => {
+            try {
+              record(JSON.parse(event.data))
+            } catch {
+              // Non-JSON frames are not HMR payloads.
+            }
+          })
+        }
+      }
+      window.WebSocket = RecordingWebSocket as unknown as typeof WebSocket
+    })
+  }
+
+  /**
+   * Every HMR websocket payload recorded since `captureWirePayloads`,
+   * including payloads received before a reload.
+   */
+  async getWirePayloads(): Promise<Array<{ type: string; event?: string; path?: string }>> {
+    return await this.page.evaluate(() => {
+      try {
+        return JSON.parse(sessionStorage.getItem('__viteHmrPayloads') || '[]')
+      } catch {
+        return []
+      }
+    })
   }
 
   /**

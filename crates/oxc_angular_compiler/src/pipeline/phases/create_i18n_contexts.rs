@@ -11,7 +11,7 @@
 //!
 //! Ported from Angular's `template/pipeline/src/phases/create_i18n_contexts.ts`.
 
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
 use crate::ir::enums::I18nContextKind;
@@ -115,9 +115,9 @@ pub fn create_i18n_contexts(job: &mut ComponentCompilationJob<'_>) {
             xref: context_xref,
             context_kind: I18nContextKind::Attr,
             i18n_block: None, // Attribute contexts don't have an i18n block
-            params: oxc_allocator::HashMap::new_in(allocator),
-            postprocessing_params: oxc_allocator::HashMap::new_in(allocator),
-            icu_placeholder_literals: oxc_allocator::HashMap::new_in(allocator),
+            params: oxc_allocator::HashMap::new_in(&allocator),
+            postprocessing_params: oxc_allocator::HashMap::new_in(&allocator),
+            icu_placeholder_literals: oxc_allocator::HashMap::new_in(&allocator),
             message: Some(info.message_instance_id),
         });
 
@@ -217,9 +217,9 @@ pub fn create_i18n_contexts(job: &mut ComponentCompilationJob<'_>) {
             xref: context_xref,
             context_kind: I18nContextKind::RootI18n,
             i18n_block: Some(i18n_xref),
-            params: oxc_allocator::HashMap::new_in(allocator),
-            postprocessing_params: oxc_allocator::HashMap::new_in(allocator),
-            icu_placeholder_literals: oxc_allocator::HashMap::new_in(allocator),
+            params: oxc_allocator::HashMap::new_in(&allocator),
+            postprocessing_params: oxc_allocator::HashMap::new_in(&allocator),
+            icu_placeholder_literals: oxc_allocator::HashMap::new_in(&allocator),
             message,
         });
 
@@ -381,9 +381,9 @@ fn create_icu_contexts_for_view(
                 xref: context_xref,
                 context_kind: I18nContextKind::Icu,
                 i18n_block: Some(root_xref),
-                params: oxc_allocator::HashMap::new_in(allocator),
-                postprocessing_params: oxc_allocator::HashMap::new_in(allocator),
-                icu_placeholder_literals: oxc_allocator::HashMap::new_in(allocator),
+                params: oxc_allocator::HashMap::new_in(&allocator),
+                postprocessing_params: oxc_allocator::HashMap::new_in(&allocator),
+                icu_placeholder_literals: oxc_allocator::HashMap::new_in(&allocator),
                 message: icu_message,
             });
 

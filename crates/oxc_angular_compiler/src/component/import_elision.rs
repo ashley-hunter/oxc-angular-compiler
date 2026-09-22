@@ -41,7 +41,7 @@ use oxc_ast::ast::{
     Program, Statement, TSType,
 };
 use oxc_semantic::{Semantic, SemanticBuilder, SymbolFlags};
-use oxc_span::Ident;
+use oxc_str::Ident;
 use rustc_hash::FxHashSet;
 
 use crate::optimizer::Edit;
@@ -171,10 +171,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     Self::collect_computed_keys_from_class(class, result);
                 }
             }
-            Statement::ExportNamedDeclaration(export) => {
-                if let Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) =
-                    &export.declaration
-                {
+            Statement::ExportDeclaration(export) => {
+                if let oxc_ast::ast::Declaration::ClassDeclaration(class) = &export.declaration {
                     Self::collect_computed_keys_from_class(class, result);
                 }
             }
@@ -235,8 +233,35 @@ impl<'a> ImportElisionAnalyzer<'a> {
                 Self::collect_computed_keys_from_ts_type(&array_type.element_type, result);
             }
             TSType::TSTupleType(tuple_type) => {
+                // `TSTupleElement` inherits the full set of `TSType`
+                // variants AND adds three of its own: `TSOptionalType`
+                // (`[number?]`), `TSRestType` (`[...string[]]`), and
+                // `TSNamedTupleMember` (`[name: string]`). The previous
+                // `element.to_ts_type()` call panicked with
+                // `Option::unwrap() on a None value` whenever a tuple
+                // contained any of those three variants — common in
+                // real code, e.g. function signatures expressed as
+                // tuple types in component decorator metadata.
+                //
+                // `TSTupleElement` adds `TSOptionalType` and `TSRestType` on top of the
+                // inherited `TSType` variants. Use `as_ts_type()` for the common inherited
+                // path and unpack the two named variants explicitly.
+                // `TSNamedTupleMember` is an inherited `TSType` variant and is handled in
+                // the `TSType::TSNamedTupleMember` arm of `collect_computed_keys_from_ts_type`.
                 for element in &tuple_type.element_types {
-                    Self::collect_computed_keys_from_ts_type(element.to_ts_type(), result);
+                    if let Some(ty) = element.as_ts_type() {
+                        Self::collect_computed_keys_from_ts_type(ty, result);
+                        continue;
+                    }
+                    match element {
+                        oxc_ast::ast::TSTupleElement::TSOptionalType(opt) => {
+                            Self::collect_computed_keys_from_ts_type(&opt.type_annotation, result);
+                        }
+                        oxc_ast::ast::TSTupleElement::TSRestType(rest) => {
+                            Self::collect_computed_keys_from_ts_type(&rest.type_annotation, result);
+                        }
+                        _ => {}
+                    }
                 }
             }
             TSType::TSTypeReference(type_ref) => {
@@ -244,6 +269,11 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     for ty in &type_args.params {
                         Self::collect_computed_keys_from_ts_type(ty, result);
                     }
+                }
+            }
+            TSType::TSNamedTupleMember(named) => {
+                if let Some(inner) = named.element_type.as_ts_type() {
+                    Self::collect_computed_keys_from_ts_type(inner, result);
                 }
             }
             TSType::TSParenthesizedType(paren_type) => {
@@ -371,10 +401,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     );
                 }
             }
-            Statement::ExportNamedDeclaration(export) => {
-                if let Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) =
-                    &export.declaration
-                {
+            Statement::ExportDeclaration(export) => {
+                if let oxc_ast::ast::Declaration::ClassDeclaration(class) = &export.declaration {
                     Self::collect_uses_from_class(
                         class,
                         ctor_param_decorator_uses,
@@ -597,20 +625,24 @@ impl<'a> ImportElisionAnalyzer<'a> {
             Expression::ArrowFunctionExpression(arrow) => {
                 // Arrow function bodies may contain value references, e.g.,
                 // `forwardRef(() => TagPickerComponent)` in Component imports.
-                for stmt in &arrow.body.statements {
-                    match stmt {
-                        Statement::ExpressionStatement(expr_stmt) => {
-                            Self::collect_value_uses_from_expr(
-                                &expr_stmt.expression,
-                                other_value_uses,
-                            );
-                        }
-                        Statement::ReturnStatement(ret) => {
-                            if let Some(arg) = &ret.argument {
-                                Self::collect_value_uses_from_expr(arg, other_value_uses);
+                if let Some(expr) = arrow.get_expression() {
+                    Self::collect_value_uses_from_expr(expr, other_value_uses);
+                } else if let Some(body) = arrow.get_function_body() {
+                    for stmt in &body.statements {
+                        match stmt {
+                            Statement::ExpressionStatement(expr_stmt) => {
+                                Self::collect_value_uses_from_expr(
+                                    &expr_stmt.expression,
+                                    other_value_uses,
+                                );
                             }
+                            Statement::ReturnStatement(ret) => {
+                                if let Some(arg) = &ret.argument {
+                                    Self::collect_value_uses_from_expr(arg, other_value_uses);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -742,18 +774,20 @@ pub fn import_elision_edits<'a>(
         false
     });
 
-    // Check if there are type-only exports that need removal
-    let has_type_only_exports = program.body.iter().any(|stmt| {
-        if let Statement::ExportNamedDeclaration(export_decl) = stmt {
-            if export_decl.source.is_some() || export_decl.declaration.is_some() {
-                return export_decl.export_kind.is_type();
-            }
-            if export_decl.export_kind.is_type() {
-                return true;
-            }
-            return export_decl.specifiers.iter().any(|spec| spec.export_kind.is_type());
+    // Check if there are type-only exports that need removal.
+    // ExportDeclaration always has a declaration (export class/const/type Foo) — those are
+    // not elided here. Only ExportNamedDeclaration (local `{ }`) and ExportFromDeclaration
+    // (re-exports) carry type-only / per-specifier type elision.
+    let has_type_only_exports = program.body.iter().any(|stmt| match stmt {
+        Statement::ExportNamedDeclaration(export_decl) => {
+            export_decl.export_kind.is_type()
+                || export_decl.specifiers.iter().any(|spec| spec.export_kind.is_type())
         }
-        false
+        Statement::ExportFromDeclaration(export_decl) => {
+            export_decl.export_kind.is_type()
+                || export_decl.specifiers.iter().any(|spec| spec.export_kind.is_type())
+        }
+        _ => false,
     });
 
     if !analyzer.has_type_only_imports() && !has_empty_imports && !has_type_only_exports {
@@ -871,21 +905,32 @@ pub fn import_elision_edits<'a>(
         }
     }
 
-    // Process type-only export declarations
+    // Process type-only export declarations.
+    // Local `export { ... }` → ExportNamedDeclaration; re-exports → ExportFromDeclaration.
+    // `export class/const/...` is ExportDeclaration and is skipped (no type elision here).
     for stmt in &program.body {
-        let Statement::ExportNamedDeclaration(export_decl) = stmt else {
-            continue;
+        let (span_start, span_end, export_kind_is_type, specifiers, source_module) = match stmt {
+            Statement::ExportNamedDeclaration(export_decl) => (
+                export_decl.span.start,
+                export_decl.span.end,
+                export_decl.export_kind.is_type(),
+                &export_decl.specifiers,
+                None::<&str>,
+            ),
+            Statement::ExportFromDeclaration(export_decl) => (
+                export_decl.span.start,
+                export_decl.span.end,
+                export_decl.export_kind.is_type(),
+                &export_decl.specifiers,
+                Some(export_decl.source.value.as_str()),
+            ),
+            _ => continue,
         };
 
-        // Skip exports with declarations (e.g. `export class X {}`)
-        if export_decl.declaration.is_some() {
-            continue;
-        }
-
-        if export_decl.export_kind.is_type() {
+        if export_kind_is_type {
             // `export type { X }` or `export type { X } from './foo'` — remove entirely
-            let start = export_decl.span.start as usize;
-            let mut end = export_decl.span.end as usize;
+            let start = span_start as usize;
+            let mut end = span_end as usize;
             let bytes = source.as_bytes();
             while end < bytes.len() && (bytes[end] == b'\n' || bytes[end] == b'\r') {
                 end += 1;
@@ -896,14 +941,14 @@ pub fn import_elision_edits<'a>(
 
         // Check for individual type-only specifiers (`export { type X, Y }`)
         let (type_specs, value_specs): (Vec<_>, Vec<_>) =
-            export_decl.specifiers.iter().partition(|spec| spec.export_kind.is_type());
+            specifiers.iter().partition(|spec| spec.export_kind.is_type());
 
         if type_specs.is_empty() {
             continue;
         }
 
-        let start = export_decl.span.start as usize;
-        let mut end = export_decl.span.end as usize;
+        let start = span_start as usize;
+        let mut end = span_end as usize;
         let bytes = source.as_bytes();
         while end < bytes.len() && (bytes[end] == b'\n' || bytes[end] == b'\r') {
             end += 1;
@@ -929,14 +974,14 @@ pub fn import_elision_edits<'a>(
             new_export.push_str(&named_specifiers.join(", "));
             new_export.push_str(" }");
 
-            if let Some(source_lit) = &export_decl.source {
+            if let Some(source_mod) = source_module {
                 new_export.push_str(" from \"");
-                new_export.push_str(source_lit.value.as_str());
+                new_export.push_str(source_mod);
                 new_export.push('"');
             }
             new_export.push(';');
 
-            if end > export_decl.span.end as usize {
+            if end > span_end as usize {
                 new_export.push('\n');
             }
 
@@ -1079,9 +1124,9 @@ class MyComponent implements OnInit, OnDestroy {
         let source_type = SourceType::ts();
         let parser_ret = Parser::new(&allocator, &filtered, source_type).parse();
         assert!(
-            parser_ret.errors.is_empty(),
+            parser_ret.diagnostics.is_empty(),
             "Filtered source should be valid TypeScript: {:?}",
-            parser_ret.errors
+            parser_ret.diagnostics
         );
     }
 
@@ -1136,12 +1181,12 @@ class AppComponent implements OnInit, OnDestroy {
         let allocator = Allocator::default();
         let source_type = SourceType::ts();
         let parser_ret = Parser::new(&allocator, &filtered, source_type).parse();
-        if !parser_ret.errors.is_empty() {
-            for err in &parser_ret.errors {
+        if !parser_ret.diagnostics.is_empty() {
+            for err in &parser_ret.diagnostics {
                 eprintln!("Parse error: {:?}", err);
             }
         }
-        assert!(parser_ret.errors.is_empty(), "Filtered source should be valid TypeScript");
+        assert!(parser_ret.diagnostics.is_empty(), "Filtered source should be valid TypeScript");
 
         // Check that type-only imports are removed from the right places
         let import_lines: Vec<_> =
@@ -1958,6 +2003,83 @@ class MyComponent {
             !type_only.contains("myKey"),
             "myKey in tuple element type literal should be preserved"
         );
+    }
+
+    #[test]
+    fn test_computed_key_in_optional_tuple_element_preserved() {
+        // TSOptionalType (`[number?]`) in a tuple previously caused a panic via
+        // `to_ts_type()` (which called `unwrap()` on None). The fix uses
+        // `as_ts_type()` and handles the three named TSTupleElement variants.
+        let source = r#"
+import { Component, Input } from '@angular/core';
+import { myKey } from './keys';
+
+@Component({ selector: 'test' })
+class MyComponent {
+    @Input() pair: [string?, { [myKey]: number }?];
+}
+"#;
+        let type_only = analyze_source(source);
+        assert!(
+            !type_only.contains("myKey"),
+            "myKey in optional tuple element type literal should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_computed_key_in_rest_tuple_element_preserved() {
+        // TSRestType (`[...T[]]`) in a tuple previously caused a panic via
+        // `to_ts_type()`. The fix explicitly unwraps `TSRestType`.
+        let source = r#"
+import { Component, Input } from '@angular/core';
+import { myKey } from './keys';
+
+@Component({ selector: 'test' })
+class MyComponent {
+    @Input() pair: [string, ...{ [myKey]: number }[]];
+}
+"#;
+        let type_only = analyze_source(source);
+        assert!(
+            !type_only.contains("myKey"),
+            "myKey inside rest tuple element type should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_computed_key_in_named_tuple_member_preserved() {
+        // TSNamedTupleMember (`[name: T]`) in a tuple previously caused a panic
+        // via `to_ts_type()`. The fix explicitly unwraps `TSNamedTupleMember`.
+        let source = r#"
+import { Component, Input } from '@angular/core';
+import { myKey } from './keys';
+
+@Component({ selector: 'test' })
+class MyComponent {
+    @Input() pair: [label: string, item: { [myKey]: number }];
+}
+"#;
+        let type_only = analyze_source(source);
+        assert!(
+            !type_only.contains("myKey"),
+            "myKey in named tuple member type literal should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_tuple_with_mixed_element_kinds_no_panic() {
+        // Regression: a tuple with optional, rest, and named members together
+        // must not panic (TSOptionalType/TSRestType previously hit the unwrap in to_ts_type).
+        let source = r#"
+import { Component, Input } from '@angular/core';
+
+@Component({ selector: 'test' })
+class MyComponent {
+    @Input() data: [label: string, value?: number, ...rest: string[]];
+}
+"#;
+        let type_only = analyze_source(source);
+        assert!(!type_only.contains("Component"), "Component should be preserved (decorator)");
     }
 
     #[test]

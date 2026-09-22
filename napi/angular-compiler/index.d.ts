@@ -77,7 +77,11 @@ export declare function compileForHmr(
  * * `template` - The template HTML string
  * * `component_name` - The name of the component class
  * * `file_path` - The path to the component file
- * * `styles` - Optional array of CSS styles
+ * * `styles` - The component's CSS styles, or `None` when the caller cannot
+ *   tell. `Some` is a definitive answer — an EMPTY array means "this component
+ *   has no styles" and makes the generated module emit `styles: []`, clearing
+ *   whatever it had. `None` omits the key, so the module's `...ɵcmp` spread
+ *   keeps the previous styles.
  *
  * # Returns
  *
@@ -268,6 +272,26 @@ export declare function extractAngularComponentByAst(
 ): ComponentExtractionResult
 
 /**
+ * Extract component metadata from all `@Component` decorated classes in a TypeScript file.
+ *
+ * This parses the file and extracts metadata from `@Component` decorators
+ * on class declarations.
+ *
+ * # Arguments
+ *
+ * * `source` - The TypeScript source code
+ * * `file_path` - The file path (for error messages and source type detection)
+ *
+ * # Returns
+ *
+ * A vector of `ExtractedComponentMetadata` for each component found.
+ */
+export declare function extractComponentMetadataSync(
+  source: string,
+  filePath: string,
+): Array<ExtractedComponentMetadata>
+
+/**
  * Extract templateUrl and styleUrls from all @Component decorators in a file (async).
  *
  * This is the async version of `extractComponentUrlsSync`. Use this when
@@ -447,7 +471,8 @@ export interface FactoryNapiCompileResult {
  *
  * * `component_id` - The component ID (path@ClassName)
  * * `template_js` - The compiled template function as JavaScript
- * * `styles` - Optional array of CSS styles
+ * * `styles` - The component's CSS styles, or `None` when unknown. An empty
+ *   array is definitive and emits `styles: []`, clearing the old styles.
  *
  * # Returns
  *
@@ -768,6 +793,17 @@ export interface TransformOptions {
    * When not set, assumes latest Angular version (v19+ behavior).
    */
   angularVersion?: AngularVersion
+  /**
+   * Override for the `legacyOptionalChaining` Angular compiler option
+   * (`angularCompilerOptions.legacyOptionalChaining` in `tsconfig.json`).
+   *
+   * Controls the safe-navigation operator (`?.`) in template expressions.
+   * When `true`, always emits the legacy `== null ? null` form; when `false`,
+   * emits native optional chaining (yielding `undefined`). When unset, the
+   * default is derived from `angularVersion` (legacy for < v22, modern for
+   * >= v22, legacy when the version is unknown).
+   */
+  legacyOptionalChaining?: boolean
   /** The CSS selector that identifies this component in a template. */
   selector?: string
   /**
@@ -820,10 +856,12 @@ export interface TransformOptions {
   /**
    * Emit setClassMetadata() calls for TestBed support.
    *
-   * When true, generates `ɵɵsetClassMetadata()` calls wrapped in a dev-mode guard.
-   * This preserves original decorator information for TestBed's recompilation APIs.
+   * When true, generates `ɵɵsetClassMetadata()` calls wrapped in a dev-mode guard
+   * (`(typeof ngDevMode === "undefined" || ngDevMode) && …`). Production bundles
+   * tree-shake the guarded call. Preserves original decorator information for
+   * TestBed's recompilation APIs.
    *
-   * Default: false (metadata is dev-only and usually stripped in production)
+   * Default: true — matches `ngc`, which always emits class metadata.
    */
   emitClassMetadata?: boolean
   /**
@@ -833,6 +871,17 @@ export interface TransformOptions {
    * final CSS strings that are embedded in generated component definitions.
    */
   minifyComponentStyles?: boolean
+  /**
+   * Compilation mode: `"full"` (default) or `"partial"`.
+   *
+   * - `"full"` emits fully-resolved Ivy definitions (`ɵɵdefineComponent`,
+   *   `ɵɵdefineDirective`, …) — application builds.
+   * - `"partial"` emits partial declarations (`ɵɵngDeclareComponent`,
+   *   `ɵɵngDeclareDirective`, …) — library builds. Consumers run the
+   *   linker (also exposed by this package) to expand the declarations
+   *   into full Ivy form at their build time.
+   */
+  compilationMode?: string
   /**
    * Resolved import paths for host directives and other imports.
    *

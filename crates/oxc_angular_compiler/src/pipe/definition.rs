@@ -27,11 +27,13 @@ use oxc_allocator::{Allocator, Vec as OxcVec};
 use super::compiler::compile_pipe;
 use super::decorator::PipeMetadata;
 use super::metadata::R3PipeMetadata;
+use crate::CompilationMode;
 use crate::factory::{
     FactoryTarget, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryDeps,
     R3FactoryMetadata, compile_factory_function,
 };
 use crate::output::ast::{OutputExpression, ReadVarExpr};
+use crate::partial::pipe::{compile_declare_factory_for_pipe, compile_declare_pipe_from_metadata};
 
 /// Result of generating pipe definition (ɵpipe only).
 ///
@@ -141,6 +143,7 @@ pub fn generate_pipe_definition_from_decorator<'a>(
 pub fn generate_full_pipe_definition_from_decorator<'a>(
     allocator: &'a Allocator,
     metadata: &PipeMetadata<'a>,
+    compilation_mode: CompilationMode,
 ) -> Option<FullPipeDefinition<'a>> {
     let r3_metadata = metadata.to_r3_metadata(allocator)?;
     // IMPORTANT: Generate ɵfac BEFORE ɵpipe to match Angular's namespace index assignment order.
@@ -148,10 +151,18 @@ pub fn generate_full_pipe_definition_from_decorator<'a>(
     // (see packages/compiler-cli/src/ngtsc/annotations/src/pipe.ts:266-273),
     // so factory dependencies get registered first, followed by pipe definition dependencies.
     // This ensures namespace indices (i0, i1, i2, ...) are assigned in the same order.
-    let fac_definition = generate_pipe_fac(allocator, metadata);
-    let pipe_result = compile_pipe(allocator, &r3_metadata);
-
-    Some(FullPipeDefinition { pipe_definition: pipe_result.expression, fac_definition })
+    match compilation_mode {
+        CompilationMode::Full => {
+            let fac_definition = generate_pipe_fac(allocator, metadata);
+            let pipe_result = compile_pipe(allocator, &r3_metadata);
+            Some(FullPipeDefinition { pipe_definition: pipe_result.expression, fac_definition })
+        }
+        CompilationMode::Partial => {
+            let fac_definition = compile_declare_factory_for_pipe(allocator, &r3_metadata);
+            let pipe_definition = compile_declare_pipe_from_metadata(allocator, &r3_metadata);
+            Some(FullPipeDefinition { pipe_definition, fac_definition })
+        }
+    }
 }
 
 /// Generate ɵfac factory function for a pipe.
@@ -163,14 +174,14 @@ fn generate_pipe_fac<'a>(
 
     let type_expr = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
         ReadVarExpr { name: metadata.class_name.clone(), source_span: None },
-        allocator,
+        &allocator,
     ));
 
     // Convert deps from PipeMetadata format to R3FactoryDeps
     let factory_deps = match &metadata.deps {
         Some(deps) => {
             let mut factory_deps: OxcVec<'a, R3DependencyMetadata<'a>> =
-                OxcVec::with_capacity_in(deps.len(), allocator);
+                OxcVec::with_capacity_in(deps.len(), &allocator);
             for dep in deps {
                 factory_deps.push(R3DependencyMetadata {
                     token: dep.token.as_ref().map(|t| t.clone_in(allocator)),
@@ -182,6 +193,7 @@ fn generate_pipe_fac<'a>(
                     optional: dep.optional,
                     self_: dep.self_,
                     skip_self: dep.skip_self,
+                    type_only_invalid: dep.type_only_invalid,
                 });
             }
             R3FactoryDeps::Valid(factory_deps)
@@ -209,14 +221,14 @@ mod tests {
     use crate::output::emitter::JsEmitter;
     use crate::pipe::metadata::R3PipeMetadataBuilder;
     use oxc_allocator::Box;
-    use oxc_span::Ident;
+    use oxc_str::Ident;
 
     #[test]
     fn test_generate_pure_pipe_definition() {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("MyPipe"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3PipeMetadataBuilder::new(Ident::from("MyPipe"), type_expr)
@@ -249,7 +261,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("ImpurePipe"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3PipeMetadataBuilder::new(Ident::from("ImpurePipe"), type_expr)
@@ -273,7 +285,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("LegacyPipe"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3PipeMetadataBuilder::new(Ident::from("LegacyPipe"), type_expr)
@@ -299,7 +311,7 @@ mod tests {
         let allocator = Allocator::default();
         let type_expr = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("TreeShakablePipe"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let metadata = R3PipeMetadataBuilder::new(Ident::from("TreeShakablePipe"), type_expr)

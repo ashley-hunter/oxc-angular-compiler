@@ -9,7 +9,8 @@
 use indexmap::IndexMap;
 use oxc_allocator::{Allocator, Box, Vec};
 use oxc_diagnostics::OxcDiagnostic;
-use oxc_span::{Ident, Span};
+use oxc_span::Span;
+use oxc_str::Ident;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::AngularVersion;
@@ -108,7 +109,7 @@ impl<'a> I18nMessageMetadata<'a> {
     /// Builds the metadata of an i18n message from the template.
     pub fn from_message(allocator: &'a Allocator, message: &I18nMessage<'a>) -> Self {
         let non_empty = |value: &Ident<'a>| (!value.is_empty()).then_some(*value);
-        let mut legacy_ids = Vec::new_in(allocator);
+        let mut legacy_ids = Vec::new_in(&allocator);
         legacy_ids.extend(message.legacy_ids.iter().copied());
         Self {
             message_id: non_empty(&message.id),
@@ -212,6 +213,14 @@ pub struct ComponentCompilationJob<'a> {
     /// `ɵɵconditionalCreate`/`ɵɵconditionalBranchCreate` for `@if`/`@switch` blocks.
     /// When `None`, assumes latest Angular version (v20+ behavior).
     pub angular_version: Option<AngularVersion>,
+    /// Explicit override for the `legacyOptionalChaining` compiler option.
+    ///
+    /// When `Some(true)`, safe navigation (`?.`) always expands to the legacy
+    /// `== null ? null` ternary. When `Some(false)`, it always emits native
+    /// optional chaining (`?.`, yielding `undefined`). When `None`, the default
+    /// is derived from `angular_version` (legacy for < v22, modern for >= v22,
+    /// legacy when the version is unknown). See `legacy_optional_chaining()`.
+    pub legacy_optional_chaining: Option<bool>,
     /// Diagnostics collected during compilation.
     pub diagnostics: std::vec::Vec<OxcDiagnostic>,
 }
@@ -245,8 +254,8 @@ impl<'a> ComponentCompilationJob<'a> {
             expressions: ExpressionStore::new(allocator),
             root,
             views: IndexMap::with_hasher(FxBuildHasher),
-            consts: Vec::new_in(allocator),
-            consts_initializers: Vec::new_in(allocator),
+            consts: Vec::new_in(&allocator),
+            consts_initializers: Vec::new_in(&allocator),
             next_xref_id: 1, // 0 is reserved for root
             compatibility_mode: CompatibilityMode::TemplateDefinitionBuilder,
             mode: TemplateCompilationMode::default(),
@@ -254,7 +263,7 @@ impl<'a> ComponentCompilationJob<'a> {
             i18n_message_metadata: FxHashMap::default(),
             i18n_use_external_ids: true, // Default matches Angular's JIT behavior
             relative_context_file_path: None,
-            relocation_entries: Vec::new_in(allocator),
+            relocation_entries: Vec::new_in(&allocator),
             enable_debug_locations: false,
             relative_template_path: None,
             template_source: None,
@@ -262,6 +271,7 @@ impl<'a> ComponentCompilationJob<'a> {
             all_deferrable_deps_fn: None,
             content_selectors: None,
             angular_version: None,
+            legacy_optional_chaining: None,
             diagnostics: std::vec::Vec::new(),
         }
     }
@@ -300,6 +310,21 @@ impl<'a> ComponentCompilationJob<'a> {
         self.angular_version.map_or(true, |v: AngularVersion| v.supports_dom_property())
     }
 
+    /// Resolve whether safe navigation (`?.`) should use legacy null semantics.
+    ///
+    /// Returns `true` when `?.` must expand to the legacy `== null ? null` ternary,
+    /// `false` when it should emit native optional chaining (yielding `undefined`).
+    ///
+    /// An explicit `legacy_optional_chaining` override wins. Otherwise the default
+    /// follows the Angular version: legacy for < v22, modern for >= v22, and legacy
+    /// when the version is unknown (the safe, conservative fallback Angular itself
+    /// uses for partial-compiled libraries targeting older runtimes).
+    pub fn legacy_optional_chaining(&self) -> bool {
+        self.legacy_optional_chaining.unwrap_or_else(|| {
+            self.angular_version.map_or(true, |v| !v.supports_modern_optional_chaining())
+        })
+    }
+
     /// Allocates a new cross-reference ID.
     pub fn allocate_xref_id(&mut self) -> XrefId {
         let id = XrefId::new(self.next_xref_id);
@@ -329,7 +354,7 @@ impl<'a> ComponentCompilationJob<'a> {
     pub fn allocate_view(&mut self, parent: Option<XrefId>) -> XrefId {
         let xref = self.allocate_xref_id();
         let view = ViewCompilationUnit::new(self.allocator, xref, parent);
-        let boxed = Box::new_in(view, self.allocator);
+        let boxed = Box::new_in(view, &self.allocator);
         self.views.insert(xref, boxed);
         xref
     }
@@ -460,15 +485,15 @@ impl<'a> ViewCompilationUnit<'a> {
             parent,
             create: CreateOpList::new(allocator),
             update: UpdateOpList::new(allocator),
-            create_statements: Vec::new_in(allocator),
-            update_statements: Vec::new_in(allocator),
+            create_statements: Vec::new_in(&allocator),
+            update_statements: Vec::new_in(&allocator),
             vars: None,
             fn_name: None,
             decl_count: None,
             first_child: None,
-            context_variables: Vec::new_in(allocator),
-            aliases: Vec::new_in(allocator),
-            functions: Vec::new_in(allocator),
+            context_variables: Vec::new_in(&allocator),
+            aliases: Vec::new_in(&allocator),
+            functions: Vec::new_in(&allocator),
         }
     }
 }
@@ -642,6 +667,11 @@ pub struct HostBindingCompilationJob<'a> {
     pub diagnostics: std::vec::Vec<OxcDiagnostic>,
     /// Angular version for version-gated instruction emission.
     pub angular_version: Option<AngularVersion>,
+    /// Explicit override for the `legacyOptionalChaining` compiler option.
+    ///
+    /// See [`ComponentCompilationJob::legacy_optional_chaining`] for the resolution
+    /// rules; `None` derives the default from `angular_version`.
+    pub legacy_optional_chaining: Option<bool>,
 }
 
 impl<'a> HostBindingCompilationJob<'a> {
@@ -688,6 +718,7 @@ impl<'a> HostBindingCompilationJob<'a> {
             fn_suffix: Ident::from("HostBindings"),
             diagnostics: std::vec::Vec::new(),
             angular_version: None,
+            legacy_optional_chaining: None,
         }
     }
 
@@ -704,6 +735,15 @@ impl<'a> HostBindingCompilationJob<'a> {
     /// Check if `ɵɵdomProperty` is supported (Angular 20+).
     pub fn supports_dom_property(&self) -> bool {
         self.angular_version.map_or(true, |v| v.supports_dom_property())
+    }
+
+    /// Resolve whether safe navigation (`?.`) should use legacy null semantics.
+    ///
+    /// See [`ComponentCompilationJob::legacy_optional_chaining`] for the rules.
+    pub fn legacy_optional_chaining(&self) -> bool {
+        self.legacy_optional_chaining.unwrap_or_else(|| {
+            self.angular_version.map_or(true, |v| !v.supports_modern_optional_chaining())
+        })
     }
 
     /// Allocates a new cross-reference ID.
@@ -763,8 +803,8 @@ impl<'a> HostBindingCompilationUnit<'a> {
             xref,
             create: CreateOpList::new(allocator),
             update: UpdateOpList::new(allocator),
-            create_statements: Vec::new_in(allocator),
-            update_statements: Vec::new_in(allocator),
+            create_statements: Vec::new_in(&allocator),
+            update_statements: Vec::new_in(&allocator),
             attributes: None,
             vars: None,
             fn_name: None,

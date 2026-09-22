@@ -3,7 +3,7 @@
 //! Ported from Angular's `render3/r3_factory.ts`.
 
 use oxc_allocator::Vec;
-use oxc_span::Ident;
+use oxc_str::Ident;
 
 use crate::output::ast::OutputExpression;
 
@@ -20,6 +20,10 @@ pub enum FactoryTarget {
     NgModule,
     /// Injectable factory.
     Injectable,
+    /// Service factory (Angular v22+ `@Service`). Uses the same `ɵɵinject` token
+    /// resolution as `Injectable` — the v22 service runtime expects deps to be
+    /// resolved via `inject()` calls in the constructor body, not the ɵfac.
+    Service,
 }
 
 /// Delegate type for delegated factories.
@@ -55,6 +59,14 @@ pub struct R3DependencyMetadata<'a> {
 
     /// Whether the dependency has an @SkipSelf qualifier.
     pub skip_self: bool,
+
+    /// Whether this dependency's token came from a type-only import.
+    ///
+    /// Type-only imports (`import type { X }` or `import { type X }`) are erased
+    /// at runtime; if any constructor dependency has this flag set, the factory
+    /// as a whole must become `ɵɵinvalidFactory()` — matching Angular's
+    /// `ValueUnavailableKind.TYPE_ONLY_IMPORT`. See issue #288.
+    pub type_only_invalid: bool,
 }
 
 impl<'a> R3DependencyMetadata<'a> {
@@ -67,6 +79,7 @@ impl<'a> R3DependencyMetadata<'a> {
             optional: false,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         }
     }
 
@@ -79,6 +92,7 @@ impl<'a> R3DependencyMetadata<'a> {
             optional: true,
             self_: false,
             skip_self: false,
+            type_only_invalid: false,
         }
     }
 }
@@ -187,7 +201,7 @@ mod tests {
         let allocator = Allocator::default();
         let token = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("TestService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let dep = R3DependencyMetadata::simple(token);
@@ -203,7 +217,7 @@ mod tests {
         let allocator = Allocator::default();
         let token = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: Ident::from("OptionalService"), source_span: None },
-            &allocator,
+            &&allocator,
         ));
 
         let dep = R3DependencyMetadata::optional_dep(token);

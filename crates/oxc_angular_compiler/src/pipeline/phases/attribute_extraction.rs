@@ -27,12 +27,12 @@ pub fn extract_attributes(job: &mut ComponentCompilationJob<'_>) {
     let allocator = job.allocator;
 
     // Process root view
-    process_view_attributes(job, job.root.xref, allocator);
+    process_view_attributes(job, job.root.xref, &allocator);
 
     // Process embedded views
     let view_xrefs: Vec<XrefId> = job.views.keys().copied().collect();
     for view_xref in view_xrefs {
-        process_view_attributes(job, view_xref, allocator);
+        process_view_attributes(job, view_xref, &allocator);
     }
 }
 
@@ -242,25 +242,6 @@ fn process_view_attributes<'a>(
                         trusted_value_fn: None, // Set by resolve_sanitizers phase
                     };
                     extracted_attrs.push((twp_op.target, extracted));
-                }
-                UpdateOp::Control(control_op) => {
-                    // Control bindings (e.g. [field]="...") also generate extracted
-                    // attributes for directive matching, similar to Property bindings.
-                    // Ported from Angular's attribute_extraction.ts lines 58-73.
-                    let extracted = ExtractedAttributeOp {
-                        base: CreateOpBase::default(),
-                        target: control_op.target,
-                        binding_kind: BindingKind::Property,
-                        namespace: None,
-                        name: control_op.name.clone(),
-                        value: None, // Control bindings don't copy the expression
-                        security_context: control_op.security_context,
-                        truthy_expression: false,
-                        i18n_context: None,
-                        i18n_message: None,
-                        trusted_value_fn: None, // Set by resolve_sanitizers phase
-                    };
-                    extracted_attrs.push((control_op.target, extracted));
                 }
                 // StyleProp and ClassProp bindings:
                 // In Angular TypeScript, these are only extracted in compatibility mode
@@ -473,10 +454,10 @@ fn extract_value_from_binding_expr<'a>(
 
                 let literal_expr = OutputExpression::Literal(Box::new_in(
                     LiteralExpr { value: output_value, source_span: None },
-                    allocator,
+                    &allocator,
                 ));
-                let value_expr = IrExpression::OutputExpr(Box::new_in(literal_expr, allocator));
-                Some(Box::new_in(value_expr, allocator))
+                let value_expr = IrExpression::OutputExpr(Box::new_in(literal_expr, &allocator));
+                Some(Box::new_in(value_expr, &allocator))
             } else {
                 None
             }
@@ -485,8 +466,8 @@ fn extract_value_from_binding_expr<'a>(
             // Already in the right format - clone it and wrap in IrExpression
             // This is needed for host attributes from decorators which are already OutputExpr literals
             let cloned = output_expr.clone_in(allocator);
-            let value_expr = IrExpression::OutputExpr(Box::new_in(cloned, allocator));
-            Some(Box::new_in(value_expr, allocator))
+            let value_expr = IrExpression::OutputExpr(Box::new_in(cloned, &allocator));
+            Some(Box::new_in(value_expr, &allocator))
         }
         IrExpression::Empty(_) => {
             // Empty expression means no value
