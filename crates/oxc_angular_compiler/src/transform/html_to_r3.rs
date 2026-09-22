@@ -169,6 +169,9 @@ pub struct HtmlToR3Transform<'a> {
     /// Placeholder names of the ICU being visited, keyed by their interpolation text
     /// (e.g. `{{count}}` -> `INTERPOLATION`), from the ICU's i18n message.
     icu_interpolation_names: FxHashMap<String, String>,
+    /// `VAR_*` placeholder names of the ICU being visited and its nested ICUs, from the ICU's
+    /// i18n message, keyed by the start offset of each switch expression.
+    icu_var_names: FxHashMap<u32, String>,
     /// ICU placeholder names (`ICU`, `ICU_1`, ...) from the enclosing i18n message, keyed by
     /// the ICU's start offset.
     icu_placeholder_names: FxHashMap<u32, String>,
@@ -212,6 +215,7 @@ impl<'a> HtmlToR3Transform<'a> {
             i18n_message_instance_counter: 0,
             sole_icu_message: None,
             icu_interpolation_names: FxHashMap::default(),
+            icu_var_names: FxHashMap::default(),
             icu_placeholder_names: FxHashMap::default(),
             block_placeholder_names: FxHashMap::default(),
             tag_placeholder_names: FxHashMap::default(),
@@ -1235,6 +1239,15 @@ impl<'a> HtmlToR3Transform<'a> {
     /// - Third call with "VAR_PLURAL" returns "VAR_PLURAL_2"
     ///
     /// Ported from Angular's `placeholder.ts:96-98` and `_generateUniqueName:151-161`.
+    /// The `VAR_*` name of the ICU whose switch expression starts at `start`, from the ICU's
+    /// message, or a newly generated one.
+    fn icu_var_name(&mut self, start: u32, base_name: &str) -> String {
+        match self.icu_var_names.remove(&start) {
+            Some(name) => name,
+            None => self.generate_unique_icu_placeholder(base_name),
+        }
+    }
+
     fn generate_unique_icu_placeholder(&mut self, base_name: &str) -> String {
         let count = self.icu_placeholder_counts.entry(base_name.to_string()).or_insert(0);
         let result =
@@ -1282,11 +1295,14 @@ impl<'a> HtmlToR3Transform<'a> {
         let message_string = icu_message.serialize();
         // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
         // vars, interpolations become bound text, and element markup becomes plain text.
-        let (interpolations, mut tags): (std::vec::Vec<_>, std::vec::Vec<_>) = icu_message
-            .placeholders
+        let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
+            icu_message.placeholders.into_iter().partition(|(name, _)| name.starts_with("VAR_"));
+        self.icu_var_names = vars
             .into_iter()
-            .filter(|(name, _)| !name.starts_with("VAR_"))
-            .partition(|(_, placeholder)| placeholder.text.starts_with("{{"));
+            .map(|(name, placeholder)| (placeholder.source_span.start.offset, name))
+            .collect();
+        let (interpolations, mut tags): (std::vec::Vec<_>, std::vec::Vec<_>) =
+            others.into_iter().partition(|(_, placeholder)| placeholder.text.starts_with("{{"));
         self.icu_interpolation_names = interpolations
             .into_iter()
             .map(|(name, placeholder)| (placeholder.text, name))
@@ -1305,8 +1321,10 @@ impl<'a> HtmlToR3Transform<'a> {
         // The pipeline identifies the ICU by a message holding a single IcuPlaceholder.
         let icu_type_upper = expansion.expansion_type.as_str().to_uppercase();
         let base_name = format!("VAR_{icu_type_upper}");
-        let expression_placeholder =
-            Ident::from_in(&self.generate_unique_icu_placeholder(&base_name), self.allocator);
+        let expression_placeholder = Ident::from_in(
+            &self.icu_var_name(expansion.switch_value_span.start, &base_name),
+            self.allocator,
+        );
         i18n_message.nodes.push(I18nNode::IcuPlaceholder(I18nIcuPlaceholder {
             value: Box::new_in(
                 I18nIcu {
@@ -1410,12 +1428,11 @@ impl<'a> HtmlToR3Transform<'a> {
                     let parse_result =
                         self.binding_parser.parse_binding(value_str, switch_value_span);
 
-                    // Generate unique VAR_* placeholder name for the nested ICU BEFORE recursion.
-                    // The counter is incremented immediately, so nested ICUs get sequential names.
-                    // This matches Angular's getUniquePlaceholder in i18n_parser.ts:153
+                    // Name the nested ICU's VAR_* placeholder as the ICU's message does
+                    // (Angular numbers nested ICUs before their parent).
                     let icu_type_upper = nested_expansion.expansion_type.as_str().to_uppercase();
                     let base_name = format!("VAR_{icu_type_upper}");
-                    let unique_name = self.generate_unique_icu_placeholder(&base_name);
+                    let unique_name = self.icu_var_name(switch_value_span.start, &base_name);
                     let var_placeholder_name = Ident::from_in(&unique_name, self.allocator);
 
                     // Recursively extract from nested expansion cases FIRST.
