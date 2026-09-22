@@ -1,11 +1,18 @@
 /**
  * Fixtures whose output differs from Angular's in documented ways, keyed by
- * `category/name`. A listed fixture that differs is reported as a known difference rather than
- * a failure; a listed fixture that matches Angular fails, so fixed entries get removed.
+ * `category/name`. Each entry lists the static fields that differ and why.
  *
- * Each entry lists the differences found when it was added. Remove an entry once the
- * difference is fixed in the compiler.
+ * A listed fixture is reported as a known difference only while its differences stay inside
+ * `fields`, so a new difference elsewhere in the same fixture still fails. A listed fixture
+ * that matches Angular fails too, so fixed entries get removed.
  */
+interface KnownDifference {
+  /** `Class.field` of every static field that differs, e.g. `MyComponent.ɵcmp`. */
+  fields: string[]
+  /** Why each difference exists. */
+  reasons: string[]
+}
+
 const FACTORY =
   'ɵfac uses ɵɵgetInheritedFactory where Angular emits a factory that calls the constructor'
 const QUERY_CHAINING =
@@ -17,76 +24,219 @@ const CUSTOM_DECORATOR =
 const SELECTOR_WHITESPACE =
   'runs of whitespace inside shimmed selectors are collapsed where Angular keeps them'
 
-export const KNOWN_DIFFERENCES: Record<string, string[]> = {
-  'animations/animation-metadata-with-host-bindings': ['hostVars is 2 where Angular emits 3'],
-  'class-metadata/class-metadata-ngmodule': [FACTORY, NG_MODULE_IMPORTS],
-  'class-metadata/class-metadata-pipe': [FACTORY],
-  'class-metadata/class-metadata-with-content-child': [QUERY_CHAINING],
-  'class-metadata/class-metadata-with-view-child': [QUERY_CHAINING],
-  'component-meta/change-detection-default': ['changeDetection is omitted where Angular emits it'],
-  'edge-cases/multiple-custom-decorators': [CUSTOM_DECORATOR],
-  'edge-cases/single-custom-decorator': [CUSTOM_DECORATOR],
-  'full-file/component-with-pipes': ['component styles keep a leading newline'],
-  'full-transform/full-transform-host-attribute': [HOST_ATTRS_ORDER],
-  'host-bindings/host-attribute': [HOST_ATTRS_ORDER],
-  'host-directives/host-directives-empty-mappings': [
-    'HostDirectivesFeature receives the directive class where Angular passes { directive }',
-  ],
-  'host-directives/host-directives-with-providers': [FACTORY],
-  'i18n/i18n-ng-template-deeply-nested': [FACTORY],
-  'injector/basic-injector': [FACTORY],
-  'injector/injector-with-both': [FACTORY, NG_MODULE_IMPORTS],
-  'injector/injector-with-imports': [FACTORY, NG_MODULE_IMPORTS],
-  'injector/injector-with-providers': [FACTORY],
-  'pipe-compilation/impure-pipe': [FACTORY],
-  'pipe-compilation/minimal-pipe': [FACTORY],
-  'pipe-compilation/non-standalone-pipe': [FACTORY],
-  'pipe-compilation/pure-pipe': [FACTORY],
-  'regressions/contentchild-ordering': [QUERY_CHAINING],
-  'regressions/query-chaining-mixed-view-and-content': [QUERY_CHAINING],
-  'regressions/query-chaining-multiple-contentchild': [QUERY_CHAINING],
-  'regressions/query-chaining-multiple-viewchild': [QUERY_CHAINING],
-  'regressions/unused-import-viewchild-decorator': [QUERY_CHAINING],
-  'regressions/viewchild-ordering-clickup-pattern': [QUERY_CHAINING],
-  'regressions/viewchild-ordering-mixed-selectors': [QUERY_CHAINING],
-  'regressions/viewchild-ordering-read-option': [QUERY_CHAINING],
-  'regressions/viewchild-static-ordering': [QUERY_CHAINING],
-  'regressions/viewchildren-ordering': [QUERY_CHAINING],
-  'styles/shadow-css-comments': ['component styles keep newlines left by removed comments'],
-  'styles/shadow-css-host-context-triple': [
-    ':host-context selector permutations are in a different order',
-  ],
-  'styles/shadow-css-multiline-selector': ['the newline between selectors in a list is dropped'],
-  'styles/shadow-css-ng-deep-basic': ['a leading space is kept before a ::ng-deep selector'],
-  'styles/shadow-css-polyfill-next-selector': ['a space is added before an empty rule body'],
-  'styles/shadow-css-polyfill-rule': [
-    'polyfill-rule output drops a leading ";" from the rule body',
-  ],
-  'styles/shadow-css-polyfill-unscoped-rule': [
-    'polyfill-unscoped-rule is not scoped and rewritten as Angular does',
-  ],
+export const KNOWN_DIFFERENCES: Record<string, KnownDifference> = {
+  'animations/animation-metadata-with-host-bindings': {
+    fields: ['AnimationsWithHostBindingsComponent.ɵcmp'],
+    reasons: ['hostVars is 2 where Angular emits 3'],
+  },
+  'class-metadata/class-metadata-ngmodule': {
+    fields: ['TestableModule.ɵfac', 'TestableModule.ɵmod'],
+    reasons: [FACTORY, NG_MODULE_IMPORTS],
+  },
+  'class-metadata/class-metadata-pipe': {
+    fields: ['TestablePipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'class-metadata/class-metadata-with-content-child': {
+    fields: ['ContentChildMetaComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'class-metadata/class-metadata-with-view-child': {
+    fields: ['ViewChildMetaComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'component-meta/change-detection-default': {
+    fields: ['ChangeDetectionDefaultComponent.ɵcmp'],
+    reasons: ['changeDetection is omitted where Angular emits it'],
+  },
+  'edge-cases/multiple-custom-decorators': {
+    fields: ['MultiDecoratorComponent.ɵcmp', 'MultiDecoratorComponent.ɵfac'],
+    reasons: [CUSTOM_DECORATOR],
+  },
+  'edge-cases/single-custom-decorator': {
+    fields: ['MyComponent.ɵcmp', 'MyComponent.ɵfac'],
+    reasons: [CUSTOM_DECORATOR],
+  },
+  'full-file/component-with-pipes': {
+    fields: ['ComponentWithPipes.ɵcmp'],
+    reasons: ['component styles keep a leading newline'],
+  },
+  'full-transform/full-transform-host-attribute': {
+    fields: ['HostAttributeComponent.ɵcmp'],
+    reasons: [HOST_ATTRS_ORDER],
+  },
+  'host-bindings/host-attribute': {
+    fields: ['HostAttributeComponent.ɵcmp'],
+    reasons: [HOST_ATTRS_ORDER],
+  },
+  'host-directives/host-directives-empty-mappings': {
+    fields: ['EmptyMappingsComponent.ɵcmp'],
+    reasons: [
+      'HostDirectivesFeature receives the directive class where Angular passes { directive }',
+    ],
+  },
+  'host-directives/host-directives-with-providers': {
+    fields: ['DataService.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'i18n/i18n-ng-template-deeply-nested': {
+    fields: ['ActorTextPipe.ɵfac', 'UsernamePipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'injector/basic-injector': {
+    fields: ['AppModule.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'injector/injector-with-both': {
+    fields: ['FullModule.ɵfac', 'FullModule.ɵmod'],
+    reasons: [FACTORY, NG_MODULE_IMPORTS],
+  },
+  'injector/injector-with-imports': {
+    fields: ['FeatureModule.ɵfac', 'FeatureModule.ɵmod'],
+    reasons: [FACTORY, NG_MODULE_IMPORTS],
+  },
+  'injector/injector-with-providers': {
+    fields: ['ProvidersModule.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'pipe-compilation/impure-pipe': {
+    fields: ['MyImpurePipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'pipe-compilation/minimal-pipe': {
+    fields: ['MinimalPipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'pipe-compilation/non-standalone-pipe': {
+    fields: ['LegacyPipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'pipe-compilation/pure-pipe': {
+    fields: ['MyPurePipe.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'regressions/contentchild-ordering': {
+    fields: ['ContentChildOrderingComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/query-chaining-mixed-view-and-content': {
+    fields: ['MixedQueryComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/query-chaining-multiple-contentchild': {
+    fields: ['TabsComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/query-chaining-multiple-viewchild': {
+    fields: ['LoginFormComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/unused-import-viewchild-decorator': {
+    fields: ['ViewChildDecoratorComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/viewchild-ordering-clickup-pattern': {
+    fields: ['CustomFieldLikeComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/viewchild-ordering-mixed-selectors': {
+    fields: ['ViewChildMixedSelectorsComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/viewchild-ordering-read-option': {
+    fields: ['ViewChildReadOptionComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/viewchild-static-ordering': {
+    fields: ['ViewChildStaticOrderingComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'regressions/viewchildren-ordering': {
+    fields: ['ViewChildrenOrderingComponent.ɵcmp'],
+    reasons: [QUERY_CHAINING],
+  },
+  'styles/shadow-css-comments': {
+    fields: ['CommentsComponent.ɵcmp'],
+    reasons: ['component styles keep newlines left by removed comments'],
+  },
+  'styles/shadow-css-host-context-triple': {
+    fields: ['HostContextTripleComponent.ɵcmp'],
+    reasons: [':host-context selector permutations are in a different order'],
+  },
+  'styles/shadow-css-multiline-selector': {
+    fields: ['MultilineSelectorComponent.ɵcmp'],
+    reasons: ['the newline between selectors in a list is dropped'],
+  },
+  'styles/shadow-css-ng-deep-basic': {
+    fields: ['NgDeepBasicComponent.ɵcmp'],
+    reasons: ['a leading space is kept before a ::ng-deep selector'],
+  },
+  'styles/shadow-css-polyfill-next-selector': {
+    fields: ['PolyfillNextSelectorComponent.ɵcmp'],
+    reasons: ['a space is added before an empty rule body'],
+  },
+  'styles/shadow-css-polyfill-rule': {
+    fields: ['PolyfillRuleComponent.ɵcmp'],
+    reasons: ['polyfill-rule output drops a leading ";" from the rule body'],
+  },
+  'styles/shadow-css-polyfill-unscoped-rule': {
+    fields: ['PolyfillUnscopedComponent.ɵcmp'],
+    reasons: ['polyfill-unscoped-rule is not scoped and rewritten as Angular does'],
+  },
   'i18n/i18n-compliance-element-attributes-should-correctly-bind-to-context-in-nested-template-interpolation-nested-context':
-    [FACTORY],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-element-attributes-should-support-i18n-attributes-with-interpolations-on-explicit-ng-template-elements-with-structural-directives-ng-t':
-    [FACTORY],
-  'i18n/i18n-compliance-element-attributes-should-support-interpolation-interpolation-basic': [
-    FACTORY,
-  ],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
+  'i18n/i18n-compliance-element-attributes-should-support-interpolation-interpolation-basic': {
+    fields: ['UppercasePipe.ɵfac'],
+    reasons: [FACTORY],
+  },
   'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-and-nested-elements-in-content-nested-elements':
-    [FACTORY],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-in-content-and-element-attributes-nested-elements-with-i18n-attributes':
-    [FACTORY],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-nested-nodes-should-handle-i18n-attributes-with-bindings-in-content-bindings-in-content':
-    [FACTORY],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-nested-nodes-should-support-interpolations-with-complex-expressions-interpolation-complex-expressions':
-    [FACTORY],
+    {
+      fields: ['AsyncPipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-ng-container-ng-template-should-be-able-to-act-as-child-elements-inside-i18n-block-child-elements':
-    [FACTORY],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
   'i18n/i18n-compliance-ng-container-ng-template-should-handle-single-translation-message-using-ng-container-single-ng-container':
-    [FACTORY],
-  'i18n/i18n-compliance-root-should-support-i18n-message-with-multiple-pipes-multiple-pipes': [
-    FACTORY,
-  ],
-  'styles/shadow-css-host-context-with-descendant': [SELECTOR_WHITESPACE],
-  'styles/shadow-css-where-with-host': [SELECTOR_WHITESPACE],
+    {
+      fields: ['UppercasePipe.ɵfac'],
+      reasons: [FACTORY],
+    },
+  'i18n/i18n-compliance-root-should-support-i18n-message-with-multiple-pipes-multiple-pipes': {
+    fields: ['PipeA.ɵfac', 'PipeB.ɵfac', 'PipeC.ɵfac'],
+    reasons: [FACTORY],
+  },
+  'styles/shadow-css-host-context-with-descendant': {
+    fields: ['HostContextDescendantComponent.ɵcmp'],
+    reasons: [SELECTOR_WHITESPACE],
+  },
+  'styles/shadow-css-where-with-host': {
+    fields: ['WhereWithHostComponent.ɵcmp'],
+    reasons: [SELECTOR_WHITESPACE],
+  },
 }

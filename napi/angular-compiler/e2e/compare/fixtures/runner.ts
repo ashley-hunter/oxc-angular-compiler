@@ -125,16 +125,24 @@ export async function runFixtures(options: FixtureRunnerOptions = {}): Promise<F
 
 /**
  * Test a single fixture, applying its documented known differences: a listed fixture that
- * differs is reported as a known difference, and one that now matches fails so that the stale
- * entry is removed.
+ * differs only in the fields the entry documents is reported as a known difference, one that
+ * differs elsewhere still fails, and one that now matches fails so that the stale entry is
+ * removed.
  */
 async function testFixture(fixture: Fixture, verbose?: boolean): Promise<FixtureResult> {
   const result = await compareFixture(fixture, verbose)
-  const knownDifferences = KNOWN_DIFFERENCES[`${fixture.category}/${fixture.name}`]
-  if (!knownDifferences) {
+  const known = KNOWN_DIFFERENCES[`${fixture.category}/${fixture.name}`]
+  if (!known) {
     return result
   }
+  const knownDifferences = known.reasons
   if (result.status === 'mismatch') {
+    const undocumented = (result.staticFieldDiffs ?? [])
+      .map((diff) => `${diff.className}.${diff.fieldName}`)
+      .filter((field) => !known.fields.includes(field))
+    if (undocumented.length > 0) {
+      return { ...result, knownDifferences, undocumentedFields: [...new Set(undocumented)] }
+    }
     return { ...result, status: 'known-difference', knownDifferences }
   }
   if (result.status === 'match') {
@@ -945,6 +953,16 @@ export function printFixtureSummary(report: FixtureReport): void {
       for (const reason of result.knownDifferences!) {
         console.log(`    - ${reason}`)
       }
+    }
+  }
+  const undocumentedFixtures = report.fixtures.filter((r) => r.undocumentedFields)
+  if (undocumentedFixtures.length > 0) {
+    console.log('\nUndocumented Differences (add to fixtures/known-differences.ts or fix):')
+    console.log('-'.repeat(50))
+    for (const result of undocumentedFixtures) {
+      console.log(
+        `  ${result.fixture.category}/${result.fixture.name}: ${result.undocumentedFields!.join(', ')}`,
+      )
     }
   }
   const staleFixtures = report.fixtures.filter((r) => r.staleKnownDifference)

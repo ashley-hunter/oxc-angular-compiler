@@ -285,6 +285,9 @@ export interface FixtureResult {
   /** The fixture is listed in known-differences.ts but now matches Angular */
   staleKnownDifference?: boolean
 
+  /** Fields that differ in a fixture listed in known-differences.ts but are not documented there */
+  undocumentedFields?: string[]
+
   /** Oxc compiler output */
   oxcOutput?: FixtureCompilerOutput
 

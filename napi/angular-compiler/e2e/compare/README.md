@@ -181,8 +181,10 @@ pnpm compare --fixtures --category control-flow --category animations
 ### Known Differences
 
 `fixtures/known-differences.ts` lists fixtures whose output differs from Angular's in
-documented ways, with the reasons. They are reported as known differences instead of failures.
-A listed fixture that matches Angular fails, so remove its entry once the difference is fixed.
+documented ways, with the static fields that differ and the reasons. They are reported as known
+differences instead of failures, but only while the differences stay inside the listed fields:
+a difference in any other field of the same fixture is still a failure. A listed fixture that
+matches Angular fails too, so remove its entry once the difference is fixed.
 
 ### Generated i18n Fixtures
 
