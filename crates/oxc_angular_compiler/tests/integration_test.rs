@@ -4770,6 +4770,16 @@ fn test_i18n_svg_element_placeholders() {
     );
 }
 
+/// Whitespace around an ICU at the template root is removed: Angular's parseTemplate runs the
+/// whitespace pass over root nodes without sibling context. Angular 22.1.5 for
+/// "\n  {age, select, ...}\n": `i0.ɵɵi18n(0, 0)` with no text nodes.
+#[test]
+fn test_i18n_root_icu_template_drops_surrounding_whitespace() {
+    let js = compile_i18n_component("\n  {count, select, 3 {three} other {other}}\n");
+    assert_contains(&js, "i0.ɵɵi18n(0,0);");
+    assert!(!js.contains("ɵɵtext("), "Root whitespace next to the ICU must be removed:\n{js}");
+}
+
 #[test]
 fn test_nested_if_listener_ctx_reference() {
     // Test: nested @if where a listener in the inner @if accesses component properties.
