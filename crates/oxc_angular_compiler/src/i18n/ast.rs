@@ -478,6 +478,10 @@ impl Visitor for LocalizeMessageStringVisitor {
         ph: &TagPlaceholder,
         context: &mut Self::Context,
     ) -> Self::Result {
+        // A void element is a single placeholder, as in Angular's serializers.
+        if ph.is_void {
+            return self.format_ph(&ph.start_name);
+        }
         let children: String =
             ph.children.iter().map(|child| child.visit(self, context)).collect::<Vec<_>>().join("");
         format!("{}{children}{}", self.format_ph(&ph.start_name), self.format_ph(&ph.close_name))
