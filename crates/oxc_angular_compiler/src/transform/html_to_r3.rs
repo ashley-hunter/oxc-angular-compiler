@@ -1275,12 +1275,9 @@ impl<'a> HtmlToR3Transform<'a> {
     ///
     /// Ported from Angular's r3_template_transform.ts:301-337
     fn visit_expansion(&mut self, expansion: &HtmlExpansion<'a>) -> Option<R3Node<'a>> {
-        // Do not generate Icu if it was created outside of i18n block/element in a template
-        // Reference: r3_template_transform.ts:301-306
-        let in_i18n_context = expansion.in_i18n_block || self.i18n_depth > 0;
-        if !in_i18n_context {
-            return None;
-        }
+        // Every ICU gets an i18n message, including ICUs outside an i18n block: Angular's
+        // I18nMetaVisitor visits all expansions, and the wrap_icus phase later gives such an ICU
+        // its own i18n block.
 
         // Reset ICU placeholder counters for this new top-level ICU.
         // This ensures unique placeholder names within each ICU context.
