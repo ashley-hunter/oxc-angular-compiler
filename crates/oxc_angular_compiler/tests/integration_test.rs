@@ -4841,19 +4841,20 @@ fn test_i18n_attribute_on_ng_template_uses_bindings_marker() {
 }
 
 /// Text that looks like a placeholder marker stays literal text. Angular 22.1.5 for
-/// `&#123;$notAPlaceholder&#125; {{ name }}`:
-///   goog.getMsg("{$notAPlaceholder} {$interpolation}", { "interpolation": "\uFFFD0\uFFFD" })
-///   $localize `{$notAPlaceholder} ${"\uFFFD0\uFFFD"}:INTERPOLATION:`
+/// `&#123;\\path and &#123;$x&#125; {{ name }}`:
+///   goog.getMsg("{\\\\path and {$x} {$interpolation}", { "interpolation": "\\uFFFD0\\uFFFD" })
+///   __makeTemplateObject(["{\\\\path and {$x} ", ":INTERPOLATION:"],
+///                        ["{\\\\\\\\path and {$x} ", ":INTERPOLATION:"])
 #[test]
 fn test_i18n_literal_placeholder_like_text() {
-    let js = compile_i18n_component("<div i18n>&#123;$notAPlaceholder&#125; {{ name }}</div>");
+    let js = compile_i18n_component(r"<div i18n>&#123;\\path and &#123;$x&#125; {{ name }}</div>");
     assert_contains(
         &js,
-        "goog.getMsg(\"{$notAPlaceholder} {$interpolation}\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"})",
+        "goog.getMsg(\"{\\\\path and {$x} {$interpolation}\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"})",
     );
     assert_contains(
         &js,
-        "__tpl([\"{$notAPlaceholder} \", \":INTERPOLATION:\"], [\"{$notAPlaceholder} \", \":INTERPOLATION:\"]), \"\u{FFFD}0\u{FFFD}\")",
+        "__tpl([\"{\\\\path and {$x} \", \":INTERPOLATION:\"], [\"{\\\\\\\\path and {$x} \", \":INTERPOLATION:\"]), \"\u{FFFD}0\u{FFFD}\")",
     );
 }
 

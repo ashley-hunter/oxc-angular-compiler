@@ -480,12 +480,19 @@ impl LocalizeMessageStringVisitor {
     }
 }
 
+/// Escapes message text so that code generation can tell `{$NAME}` placeholder markers from
+/// text that looks like one, such as `{$notAPlaceholder}`: `{\` becomes `{\\` and `{$`
+/// becomes `{\$`.
+pub fn escape_placeholder_markers(text: &str) -> String {
+    text.replace("{\\", "{\\\\").replace("{$", "{\\$")
+}
+
 impl Visitor for LocalizeMessageStringVisitor {
     type Context = ();
     type Result = String;
 
     fn visit_text(&mut self, text: &Text, _context: &mut Self::Context) -> Self::Result {
-        text.value.clone()
+        escape_placeholder_markers(&text.value)
     }
 
     fn visit_container(

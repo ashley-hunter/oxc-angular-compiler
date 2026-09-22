@@ -653,18 +653,14 @@ fn generate_message_from_params(params: &[(String, I18nParamExpr)]) -> String {
 /// Converts a stored message string to goog.getMsg format by writing each `{$NAME}` placeholder
 /// in camelCase, as Angular's `GetMsgSerializerVisitor` does.
 fn to_get_msg_string(message: &str) -> String {
-    let mut result = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(start) = rest.find("{$") {
-        let Some(len) = rest[start..].find('}') else { break };
-        result.push_str(&rest[..start]);
-        let name = &rest[start + 2..start + len];
+    let (text_parts, placeholders) = parse_message_string(message);
+    let mut result = text_parts.first().cloned().unwrap_or_default();
+    for (i, placeholder) in placeholders.iter().enumerate() {
         result.push_str("{$");
-        result.push_str(&format_i18n_placeholder_name(name, true));
+        result.push_str(&format_i18n_placeholder_name(placeholder, true));
         result.push('}');
-        rest = &rest[start + len + 1..];
+        result.push_str(text_parts.get(i + 1).map_or("", String::as_str));
     }
-    result.push_str(rest);
     result
 }
 
@@ -788,6 +784,15 @@ fn parse_message_string(message: &str) -> (Vec<String>, Vec<String>) {
     let mut chars = message.chars().peekable();
 
     while let Some(ch) = chars.next() {
+        // Text that looks like a marker is escaped by the message serializer.
+        if ch == '{' && chars.peek() == Some(&'\\') {
+            chars.next();
+            current_text.push('{');
+            if let Some(escaped) = chars.next() {
+                current_text.push(escaped);
+            }
+            continue;
+        }
         if ch == '{' && chars.peek() == Some(&'$') {
             // Start of placeholder: {$NAME}
             text_parts.push(current_text);
