@@ -389,7 +389,7 @@ describe('pendingHmrUpdates race condition', () => {
 
     const scopedDir = join(tempDir, 'packages', '@company', 'app')
     mkdirSync(scopedDir, { recursive: true })
-    const scopedPath = normalizePath(join(scopedDir, 'scoped.component.ts'))
+    const scopedPath = join(scopedDir, 'scoped.component.ts')
     const source = `
       import { Component } from '@angular/core';
       @Component({ selector: 'app-scoped', template: '<p>S</p>' })
@@ -567,7 +567,7 @@ describe('pendingHmrUpdates race condition', () => {
 
     const scopedDir = join(tempDir, 'packages', '@company', 'prune')
     mkdirSync(scopedDir, { recursive: true })
-    const stalePath = normalizePath(join(scopedDir, 'stale.component.ts'))
+    const stalePath = join(scopedDir, 'stale.component.ts')
     const originalSource = `
       import { Component } from '@angular/core';
       @Component({ selector: 'app-keep', template: '<keep/>' })
