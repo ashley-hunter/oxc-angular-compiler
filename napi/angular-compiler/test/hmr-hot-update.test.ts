@@ -2126,6 +2126,44 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     expect(body).toContain('styles: []')
   })
 
+  // Vite hands `transform` forward-slash ids on every platform. The endpoint
+  // must look the file up by that same spelling, not a re-resolved one, or on
+  // Windows it serves nothing and never treats an empty style list as final.
+  it('serves the module for a forward-slash (Vite-normalized) component id', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithRealConfig(plugin)
+
+    const sibCssPath = normalizePath(join(appDir, 'ps-posix-sib.component.css'))
+    const posixPath = normalizePath(join(appDir, 'ps-posix.component.ts'))
+    writeFileSync(sibCssPath, '.PS_POSIX_SIB_MARKER { color: red; }')
+
+    const source = `
+      import { Component } from '@angular/core';
+      @Component({ selector: 'app-ps-posix', template: '<p>posix</p>', styles: [] })
+      export class PosixComponent {}
+      @Component({
+        selector: 'app-ps-posix-sib',
+        template: '<p>sib</p>',
+        styleUrls: ['./ps-posix-sib.component.css'],
+      })
+      export class PosixSiblingComponent {}
+    `
+    writeFileSync(posixPath, source)
+    await transformSource(plugin, source, posixPath)
+
+    writeFileSync(sibCssPath, '.PS_POSIX_SIB_MARKER { color: green; }')
+    const ctx = createMockHmrContext(sibCssPath, [{ id: sibCssPath }], mockServer)
+    await callHandleHotUpdate(plugin, ctx)
+    expectDispatched(mockServer, `${posixPath}@PosixComponent`)
+
+    const body = await invokeAngularMiddleware(
+      getMiddleware(mockServer),
+      `${posixPath}@PosixComponent`,
+    )
+    expect(body).toContain('function PosixComponent_UpdateMetadata(PosixComponent')
+    expect(body).toContain('styles: []')
+  })
+
   it('serves both entries of a `styleUrls` array mixing a constant with a literal', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
