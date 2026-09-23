@@ -726,16 +726,25 @@ impl<'a> WhitespaceVisitor<'a> {
     }
 }
 
-/// Remove whitespace from parsed HTML nodes.
-///
-/// This is the main entry point for whitespace processing.
+/// Remove whitespace from parsed template nodes, as Angular's `parseTemplate` does when
+/// `preserveWhitespaces` is off.
 pub fn remove_whitespaces<'a>(
     allocator: &'a Allocator,
     nodes: &[HtmlNode<'a>],
     preserve_significant_whitespace: bool,
 ) -> Vec<'a, HtmlNode<'a>> {
     let mut visitor = WhitespaceVisitor::new(allocator, preserve_significant_whitespace);
-    visitor.visit_all(nodes)
+    // Angular's parseTemplate visits the root nodes with `visitAll`, not
+    // `visitAllWithSiblings`, so root-level text has no sibling context: whitespace next to a
+    // root-level ICU is removed, while inside elements it is kept.
+    let mut result = Vec::with_capacity_in(nodes.len(), &allocator);
+    let no_siblings = SiblingContext { prev: None, next: None };
+    for node in nodes {
+        if let Some(new_node) = visitor.visit_node(node, &no_siblings) {
+            result.push(new_node);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

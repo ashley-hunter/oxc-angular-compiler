@@ -1056,9 +1056,9 @@ impl JsEmitter {
         }
         ctx.print("], ");
 
-        // Raw strings (same as cooked for i18n)
+        // Raw strings
         ctx.print("[");
-        for (i, part) in expr.message_parts.iter().enumerate() {
+        for (i, part) in expr.raw_message_parts.iter().enumerate() {
             if i > 0 {
                 ctx.print(", ");
             }
@@ -2479,6 +2479,11 @@ mod tests {
                 description: None,
                 meaning: None,
                 custom_id: None,
+                raw_message_parts: {
+                    let mut raw = oxc_allocator::Vec::new_in(&&alloc);
+                    raw.extend(message_parts.iter().copied());
+                    raw
+                },
                 message_parts,
                 placeholder_names,
                 expressions,
@@ -2518,6 +2523,11 @@ mod tests {
                 description: None,
                 meaning: None,
                 custom_id: None,
+                raw_message_parts: {
+                    let mut raw = oxc_allocator::Vec::new_in(&&alloc);
+                    raw.extend(message_parts.iter().copied());
+                    raw
+                },
                 message_parts,
                 placeholder_names,
                 expressions,

@@ -1128,6 +1128,8 @@ pub struct I18nMessageOp<'a> {
     /// The serialized message string for goog.getMsg and $localize.
     /// Contains the message text with placeholder markers like "{$interpolation}".
     pub message_string: Option<Ident<'a>>,
+    /// For an ICU sub-message, its `$localize` id, written on the parent's ICU placeholder.
+    pub associated_message_id: Option<Ident<'a>>,
     /// Whether message needs postprocessing (has params with multiple values).
     pub needs_postprocessing: bool,
     /// Sub-messages.

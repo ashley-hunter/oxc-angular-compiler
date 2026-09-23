@@ -806,8 +806,11 @@ pub struct LocalizedStringExpr<'a> {
     pub meaning: Option<Ident<'a>>,
     /// Custom message ID.
     pub custom_id: Option<Ident<'a>>,
-    /// Message parts.
+    /// Message parts (cooked strings).
     pub message_parts: Vec<'a, Ident<'a>>,
+    /// Raw strings of the message parts, with the escapes `$localize` reads to find the end of
+    /// each metadata block (Angular's `createCookedRawString`).
+    pub raw_message_parts: Vec<'a, Ident<'a>>,
     /// Placeholder names.
     pub placeholder_names: Vec<'a, Ident<'a>>,
     /// Interpolated expressions.
@@ -1395,6 +1398,9 @@ impl<'a> OutputExpression<'a> {
                 for part in e.message_parts.iter() {
                     message_parts.push(part.clone());
                 }
+                let mut raw_message_parts =
+                    Vec::with_capacity_in(e.raw_message_parts.len(), &allocator);
+                raw_message_parts.extend(e.raw_message_parts.iter().copied());
                 let mut placeholder_names =
                     Vec::with_capacity_in(e.placeholder_names.len(), &allocator);
                 for name in e.placeholder_names.iter() {
@@ -1410,6 +1416,7 @@ impl<'a> OutputExpression<'a> {
                         meaning: e.meaning.clone(),
                         custom_id: e.custom_id.clone(),
                         message_parts,
+                        raw_message_parts,
                         placeholder_names,
                         expressions,
                         source_span: e.source_span,

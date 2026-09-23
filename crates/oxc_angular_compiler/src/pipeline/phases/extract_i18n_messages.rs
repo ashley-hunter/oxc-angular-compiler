@@ -133,6 +133,8 @@ pub fn extract_i18n_messages(job: &mut ComponentCompilationJob<'_>) {
                                 meaning: metadata.and_then(|m| m.meaning.clone()),
                                 description: metadata.and_then(|m| m.description.clone()),
                                 message_string: metadata.and_then(|m| m.message_string.clone()),
+                                associated_message_id: metadata
+                                    .and_then(|m| m.associated_message_id),
                                 needs_postprocessing,
                                 sub_messages: oxc_allocator::Vec::new_in(&allocator),
                             });
@@ -393,8 +395,7 @@ pub fn format_param_values(values: &[I18nParamValue]) -> Option<String> {
 /// with expression placeholders.
 ///
 /// For example, if strings = ["Hello ", "!"] and expression_placeholders has one
-/// entry with value 0, the output would be "Hello ${�0�}!" where the expression
-/// placeholder is formatted using format_value.
+/// entry with value 0, the output would be "Hello \u{FFFD}0\u{FFFD}!".
 ///
 /// Ported from Angular's `formatIcuPlaceholder` function.
 pub fn format_icu_placeholder(
@@ -405,8 +406,7 @@ pub fn format_icu_placeholder(
     for (i, s) in strings.iter().enumerate() {
         result.push_str(s.as_str());
         if let Some(expr_value) = expression_placeholders.get(i) {
-            // Format as ${value} where value is the formatted expression placeholder
-            result.push_str(&format!("${{{}}}", format_value(expr_value)));
+            result.push_str(&format_value(expr_value));
         }
     }
     result

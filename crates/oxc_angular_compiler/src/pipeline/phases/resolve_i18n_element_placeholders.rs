@@ -45,14 +45,9 @@ pub fn resolve_i18n_element_placeholders(job: &mut ComponentCompilationJob<'_>) 
         }
     }
 
-    // Process placeholders for root view
+    // Child views are reached through the ops that create them, as in Angular, so each view
+    // is resolved exactly once and with its enclosing structural directive.
     resolve_placeholders_for_view(job, job.root.xref, &i18n_contexts, &elements, None);
-
-    // Process placeholders for other views
-    let view_xrefs: Vec<XrefId> = job.views.keys().copied().collect();
-    for view_xref in view_xrefs {
-        resolve_placeholders_for_view(job, view_xref, &i18n_contexts, &elements, None);
-    }
 }
 
 /// Information about an element for placeholder resolution.
@@ -92,7 +87,6 @@ fn resolve_placeholders_for_view<'a>(
 
     // Collect operations and context info in first pass
     let mut operations: Vec<OpInfo> = Vec::new();
-    let mut child_views_to_process: Vec<(XrefId, Option<PendingStructuralDirective>)> = Vec::new();
 
     {
         let view = if view_xref.0 == 0 { Some(&job.root) } else { job.view(view_xref) };
@@ -187,175 +181,67 @@ fn resolve_placeholders_for_view<'a>(
 
                         // Handle fallback view
                         if let Some(fallback_xref) = proj_op.fallback {
-                            if let Some(ref fallback_placeholder) =
-                                proj_op.fallback_i18n_placeholder
-                            {
-                                if let Some(ref ops) = current_ops {
-                                    // Record template start/end for fallback view
-                                    if let Some(slot) = proj_op.slot {
-                                        operations.push(OpInfo::TemplateStart {
-                                            view_xref: fallback_xref,
-                                            slot: slot.0,
-                                            start_name: fallback_placeholder.start_name.clone(),
-                                            context_xref: ops.i18n_context_xref,
-                                            sub_template_index: ops.sub_template_index,
-                                            pending_structural,
-                                            has_close_name: fallback_placeholder
-                                                .close_name
-                                                .is_some(),
-                                        });
-                                        if let Some(close_name) = &fallback_placeholder.close_name {
-                                            operations.push(OpInfo::TemplateEnd {
-                                                view_xref: fallback_xref,
-                                                slot: slot.0,
-                                                close_name: close_name.clone(),
-                                                context_xref: ops.i18n_context_xref,
-                                                pending_structural,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            child_views_to_process.push((fallback_xref, None));
+                            record_template(
+                                &mut operations,
+                                current_ops.as_ref(),
+                                &mut pending_structural,
+                                fallback_xref,
+                                proj_op.slot,
+                                proj_op.fallback_i18n_placeholder.as_ref(),
+                                TemplateKind::Block,
+                            );
                         }
                     }
-                    CreateOp::Template(template_op) => {
-                        let template_view_xref = template_op.xref;
-                        if template_op.i18n_placeholder.is_none() {
-                            // No i18n placeholder, just recurse
-                            child_views_to_process.push((template_view_xref, None));
-                        } else if let Some(ref placeholder) = template_op.i18n_placeholder {
-                            if let Some(ref ops) = current_ops {
-                                if template_op.template_kind == TemplateKind::Structural {
-                                    // Structural directive - pass as pending
-                                    if let Some(slot) = template_op.slot {
-                                        child_views_to_process.push((
-                                            template_view_xref,
-                                            Some(PendingStructuralDirective { slot }),
-                                        ));
-                                    }
-                                } else {
-                                    // Non-structural template - record start and end
-                                    if let Some(slot) = template_op.slot {
-                                        operations.push(OpInfo::TemplateStart {
-                                            view_xref: template_view_xref,
-                                            slot: slot.0,
-                                            start_name: placeholder.start_name.clone(),
-                                            context_xref: ops.i18n_context_xref,
-                                            sub_template_index: ops.sub_template_index,
-                                            pending_structural,
-                                            has_close_name: placeholder.close_name.is_some(),
-                                        });
-                                        child_views_to_process.push((template_view_xref, None));
-                                        if let Some(close_name) = &placeholder.close_name {
-                                            operations.push(OpInfo::TemplateEnd {
-                                                view_xref: template_view_xref,
-                                                slot: slot.0,
-                                                close_name: close_name.clone(),
-                                                context_xref: ops.i18n_context_xref,
-                                                pending_structural,
-                                            });
-                                        }
-                                    }
-                                    pending_structural = None;
-                                }
-                            }
-                        }
-                    }
-                    CreateOp::Conditional(cond_op) => {
-                        let cond_view_xref = cond_op.xref;
-                        if cond_op.i18n_placeholder.is_none() {
-                            child_views_to_process.push((cond_view_xref, None));
-                        } else if let Some(ref placeholder) = cond_op.i18n_placeholder {
-                            if let Some(ref ops) = current_ops {
-                                // Record conditional start/end
-                                if let Some(slot) = cond_op.slot {
-                                    operations.push(OpInfo::TemplateStart {
-                                        view_xref: cond_view_xref,
-                                        slot: slot.0,
-                                        start_name: placeholder.start_name.clone(),
-                                        context_xref: ops.i18n_context_xref,
-                                        sub_template_index: ops.sub_template_index,
-                                        pending_structural,
-                                        has_close_name: placeholder.close_name.is_some(),
-                                    });
-                                    child_views_to_process.push((cond_view_xref, None));
-                                    if let Some(close_name) = &placeholder.close_name {
-                                        operations.push(OpInfo::TemplateEnd {
-                                            view_xref: cond_view_xref,
-                                            slot: slot.0,
-                                            close_name: close_name.clone(),
-                                            context_xref: ops.i18n_context_xref,
-                                            pending_structural,
-                                        });
-                                    }
-                                }
-                                pending_structural = None;
-                            }
-                        }
-                    }
-                    CreateOp::RepeaterCreate(rep_op) => {
+                    CreateOp::Template(op) => record_template(
+                        &mut operations,
+                        current_ops.as_ref(),
+                        &mut pending_structural,
+                        op.xref,
+                        op.slot,
+                        op.i18n_placeholder.as_ref(),
+                        op.template_kind,
+                    ),
+                    CreateOp::Conditional(op) => record_template(
+                        &mut operations,
+                        current_ops.as_ref(),
+                        &mut pending_structural,
+                        op.xref,
+                        op.slot,
+                        op.i18n_placeholder.as_ref(),
+                        op.template_kind,
+                    ),
+                    CreateOp::ConditionalBranch(op) => record_template(
+                        &mut operations,
+                        current_ops.as_ref(),
+                        &mut pending_structural,
+                        op.xref,
+                        op.slot,
+                        op.i18n_placeholder.as_ref(),
+                        op.template_kind,
+                    ),
+                    CreateOp::RepeaterCreate(op) => {
                         // RepeaterCreate has 3 slots: op itself, @for template, @empty template
-                        let for_slot = rep_op.slot.map(|s| s.0 + 1).unwrap_or(0);
-                        let for_view_xref = rep_op.body_view;
-
-                        if rep_op.i18n_placeholder.is_none() {
-                            child_views_to_process.push((for_view_xref, None));
-                        } else if let Some(ref placeholder) = rep_op.i18n_placeholder {
-                            if let Some(ref ops) = current_ops {
-                                // Record @for template start/end
-                                operations.push(OpInfo::TemplateStart {
-                                    view_xref: for_view_xref,
-                                    slot: for_slot,
-                                    start_name: placeholder.start_name.clone(),
-                                    context_xref: ops.i18n_context_xref,
-                                    sub_template_index: ops.sub_template_index,
-                                    pending_structural: None,
-                                    has_close_name: placeholder.close_name.is_some(),
-                                });
-                                child_views_to_process.push((for_view_xref, None));
-                                if let Some(close_name) = &placeholder.close_name {
-                                    operations.push(OpInfo::TemplateEnd {
-                                        view_xref: for_view_xref,
-                                        slot: for_slot,
-                                        close_name: close_name.clone(),
-                                        context_xref: ops.i18n_context_xref,
-                                        pending_structural: None,
-                                    });
-                                }
-                            }
-                        }
-
-                        // Handle @empty template if present
-                        if let Some(empty_view_xref) = rep_op.empty_view {
-                            let empty_slot = rep_op.slot.map(|s| s.0 + 2).unwrap_or(0);
-                            if rep_op.empty_i18n_placeholder.is_none() {
-                                child_views_to_process.push((empty_view_xref, None));
-                            } else if let Some(ref empty_placeholder) =
-                                rep_op.empty_i18n_placeholder
-                            {
-                                if let Some(ref ops) = current_ops {
-                                    operations.push(OpInfo::TemplateStart {
-                                        view_xref: empty_view_xref,
-                                        slot: empty_slot,
-                                        start_name: empty_placeholder.start_name.clone(),
-                                        context_xref: ops.i18n_context_xref,
-                                        sub_template_index: ops.sub_template_index,
-                                        pending_structural: None,
-                                        has_close_name: empty_placeholder.close_name.is_some(),
-                                    });
-                                    child_views_to_process.push((empty_view_xref, None));
-                                    if let Some(close_name) = &empty_placeholder.close_name {
-                                        operations.push(OpInfo::TemplateEnd {
-                                            view_xref: empty_view_xref,
-                                            slot: empty_slot,
-                                            close_name: close_name.clone(),
-                                            context_xref: ops.i18n_context_xref,
-                                            pending_structural: None,
-                                        });
-                                    }
-                                }
-                            }
+                        let for_slot = op.slot.map(|s| SlotId(s.0 + 1));
+                        record_template(
+                            &mut operations,
+                            current_ops.as_ref(),
+                            &mut pending_structural,
+                            op.body_view,
+                            for_slot,
+                            op.i18n_placeholder.as_ref(),
+                            TemplateKind::Block,
+                        );
+                        if let Some(empty_view) = op.empty_view {
+                            let empty_slot = op.slot.map(|s| SlotId(s.0 + 2));
+                            record_template(
+                                &mut operations,
+                                current_ops.as_ref(),
+                                &mut pending_structural,
+                                empty_view,
+                                empty_slot,
+                                op.empty_i18n_placeholder.as_ref(),
+                                TemplateKind::Block,
+                            );
                         }
                     }
                     _ => {}
@@ -483,18 +369,28 @@ fn resolve_placeholders_for_view<'a>(
                     &allocator,
                 );
             }
+            OpInfo::Recurse { view_xref, pending_structural } => {
+                resolve_placeholders_for_view(
+                    job,
+                    view_xref,
+                    i18n_contexts,
+                    elements,
+                    pending_structural,
+                );
+            }
             OpInfo::TemplateEnd {
                 view_xref,
                 slot,
                 close_name,
                 context_xref,
+                sub_template_index,
                 pending_structural,
             } => {
                 let flags = I18nParamValueFlags::TEMPLATE_TAG.with(I18nParamValueFlags::CLOSE_TAG);
 
                 // Record template close with proper sub-template index
                 let template_sub_index =
-                    get_sub_template_index_for_template_tag(job, None, view_xref);
+                    get_sub_template_index_for_template_tag(job, sub_template_index, view_xref);
                 let param_value = I18nParamValue::new(
                     I18nParamValueContent::Slot(slot),
                     template_sub_index,
@@ -512,7 +408,7 @@ fn resolve_placeholders_for_view<'a>(
                 if let Some(structural) = pending_structural {
                     let structural_value = I18nParamValue::new(
                         I18nParamValueContent::Slot(structural.slot.0),
-                        None, // Use current block's sub-template index
+                        sub_template_index,
                         flags,
                     );
                     add_param_to_context(
@@ -526,16 +422,51 @@ fn resolve_placeholders_for_view<'a>(
             }
         }
     }
+}
 
-    // Recursively process child views
-    for (child_view_xref, child_pending_structural) in child_views_to_process {
-        resolve_placeholders_for_view(
-            job,
-            child_view_xref,
-            i18n_contexts,
-            elements,
-            child_pending_structural,
-        );
+/// Records the placeholders of an op that creates a child view (`recordTemplateStart`, the
+/// recursion, and `recordTemplateClose` in Angular), in that order.
+fn record_template<'a>(
+    operations: &mut Vec<OpInfo<'a>>,
+    current_ops: Option<&CurrentI18nOps>,
+    pending_structural: &mut Option<PendingStructuralDirective>,
+    view_xref: XrefId,
+    slot: Option<SlotId>,
+    placeholder: Option<&I18nPlaceholder<'a>>,
+    template_kind: TemplateKind,
+) {
+    let (Some(placeholder), Some(ops), Some(slot)) = (placeholder, current_ops, slot) else {
+        operations.push(OpInfo::Recurse { view_xref, pending_structural: None });
+        return;
+    };
+    if template_kind == TemplateKind::Structural {
+        // The template's element records the combined value.
+        operations.push(OpInfo::Recurse {
+            view_xref,
+            pending_structural: Some(PendingStructuralDirective { slot }),
+        });
+        return;
+    }
+    let pending = pending_structural.take();
+    operations.push(OpInfo::TemplateStart {
+        view_xref,
+        slot: slot.0,
+        start_name: placeholder.start_name,
+        context_xref: ops.i18n_context_xref,
+        sub_template_index: ops.sub_template_index,
+        pending_structural: pending,
+        has_close_name: placeholder.close_name.is_some(),
+    });
+    operations.push(OpInfo::Recurse { view_xref, pending_structural: None });
+    if let Some(close_name) = &placeholder.close_name {
+        operations.push(OpInfo::TemplateEnd {
+            view_xref,
+            slot: slot.0,
+            close_name: *close_name,
+            context_xref: ops.i18n_context_xref,
+            sub_template_index: ops.sub_template_index,
+            pending_structural: pending,
+        });
     }
 }
 
@@ -596,8 +527,11 @@ enum OpInfo<'a> {
         /// The close placeholder name (e.g., "CLOSE_BLOCK_IF").
         close_name: Ident<'a>,
         context_xref: XrefId,
+        sub_template_index: Option<u32>,
         pending_structural: Option<PendingStructuralDirective>,
     },
+    /// Resolve a child view, in op order.
+    Recurse { view_xref: XrefId, pending_structural: Option<PendingStructuralDirective> },
 }
 
 /// Add a param value to an i18n context's params map.

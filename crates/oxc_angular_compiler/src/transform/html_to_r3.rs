@@ -24,7 +24,7 @@ use crate::ast::r3::{
     R3BoundText, R3Comment, R3Component, R3Content, R3DeferredBlock, R3Directive, R3Element,
     R3ForLoopBlock, R3Icu, R3IcuPlaceholder, R3IfBlock, R3IfBlockBranch, R3LetDeclaration, R3Node,
     R3ParseResult, R3Reference, R3SwitchBlock, R3Template, R3TemplateAttr, R3Text, R3TextAttribute,
-    R3Variable, SecurityContext, serialize_i18n_nodes,
+    R3Variable, SecurityContext,
 };
 use crate::i18n::parser::I18nMessageFactory;
 use crate::i18n::placeholder::PlaceholderRegistry;
@@ -173,6 +173,39 @@ pub struct HtmlToR3Transform<'a> {
     /// (e.g., by `ingestControlFlowInsertionPoint` and `ingestStaticAttributes`), both
     /// can share the same i18n context.
     i18n_message_instance_counter: u32,
+    /// The `i18n` attribute value and message instance id of an element whose only child is
+    /// an ICU. That ICU is the element's message rather than a sub-message, so it reuses the
+    /// element's message (Angular's I18nMetaVisitor: `currentMessage || meta`).
+    sole_icu_message: Option<(String, u32)>,
+    /// Placeholder names from the enclosing i18n message.
+    message_names: MessagePlaceholderNames,
+    /// Placeholder names from the message of the ICU being visited.
+    icu_names: IcuPlaceholderNames,
+    /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
+    element_full_names: std::vec::Vec<String>,
+}
+
+/// Placeholder names taken from an i18n message, keyed by source offset, so that the r3 AST
+/// uses the same names as the message: Angular's placeholder registry numbers them per message.
+#[derive(Default)]
+struct MessagePlaceholderNames {
+    /// ICU placeholder names (`ICU`, `ICU_1`, ...), keyed by the ICU's start offset.
+    icus: FxHashMap<u32, String>,
+    /// Block start and close names (`START_BLOCK_IF`, `CLOSE_BLOCK_IF`, ...), keyed by the
+    /// block's start offset.
+    blocks: FxHashMap<u32, (String, String)>,
+    /// Tag start and close names, keyed by the element's start offset.
+    tags: FxHashMap<u32, (String, String)>,
+}
+
+/// Placeholder names taken from the message of the ICU being visited.
+#[derive(Default)]
+struct IcuPlaceholderNames {
+    /// `VAR_*` names of the ICU and its nested ICUs, keyed by the start offset of each switch
+    /// expression.
+    vars: FxHashMap<u32, String>,
+    /// Interpolation placeholder names, keyed by their interpolation text (`{{count}}`).
+    interpolations: FxHashMap<String, String>,
 }
 
 impl<'a> HtmlToR3Transform<'a> {
@@ -199,6 +232,10 @@ impl<'a> HtmlToR3Transform<'a> {
             i18n_placeholder_registry: PlaceholderRegistry::new(),
             i18n_message_instance_counter: 0,
             angular_version: options.angular_version,
+            sole_icu_message: None,
+            message_names: MessagePlaceholderNames::default(),
+            icu_names: IcuPlaceholderNames::default(),
+            element_full_names: std::vec::Vec::new(),
         }
     }
 
@@ -463,12 +500,14 @@ impl<'a> HtmlToR3Transform<'a> {
 
                 let message = factory.create_message(
                     &element.children,
+                    Some(self.element_i18n_name(&resolved_name, host_tag.as_deref())),
                     meaning,
                     description,
                     custom_id,
                     None,
                     source_file,
                 );
+                collect_placeholder_names(&message.nodes, &mut self.message_names);
                 message.serialize()
             }
         } else {
@@ -495,6 +534,12 @@ impl<'a> HtmlToR3Transform<'a> {
             None
         };
 
+        if let (Some(attr), Some(I18nMeta::Message(message))) = (i18n_attr, &i18n_meta)
+            && matches!(element.children.as_slice(), [HtmlNode::Expansion(_)])
+        {
+            self.sole_icu_message = Some((attr.value.to_string(), message.instance_id));
+        }
+
         // Increment non_bindable depth if this element has ngNonBindable
         if has_non_bindable {
             self.non_bindable_depth += 1;
@@ -511,7 +556,12 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Visit children
+        self.element_full_names
+            .push(self.element_i18n_name(&resolved_name, host_tag.as_deref()).to_string());
         let children = self.visit_children(&element.children);
+        self.element_full_names.pop();
+        // Consumed by the ICU child, if any; do not leak it to a later ICU.
+        self.sole_icu_message = None;
 
         // Decrement non_bindable depth if we incremented it
         if has_non_bindable {
@@ -571,7 +621,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 source_span: element.span,
                 start_source_span: element.start_span,
                 end_source_span: element.end_span,
-                i18n: None,
+                // Inside an i18n block, <ng-content> is a tag placeholder like any element.
+                i18n: i18n_meta,
             };
             let mut result = R3Node::Content(Box::new_in(content, &self.allocator));
 
@@ -808,6 +859,12 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         Some(result)
+    }
+
+    /// The name Angular's i18n placeholders are built from: the resolved element name
+    /// (`:svg:circle`), or the host tag for a selectorless component.
+    fn element_i18n_name<'n>(&self, resolved_name: &'n str, host_tag: Option<&'n str>) -> &'n str {
+        if resolved_name.is_empty() { host_tag.unwrap_or("") } else { resolved_name }
     }
 
     /// Prefix inherited from the innermost open element (`""` at the root).
@@ -1320,6 +1377,17 @@ impl<'a> HtmlToR3Transform<'a> {
     /// - Third call with "VAR_PLURAL" returns "VAR_PLURAL_2"
     ///
     /// Ported from Angular's `placeholder.ts:96-98` and `_generateUniqueName:151-161`.
+    /// The `VAR_*` name of the ICU whose switch expression starts at `start`, from the ICU's
+    /// message, or a newly generated one.
+    fn icu_var_name(&mut self, start: u32, base_name: &str) -> String {
+        match self.icu_names.vars.remove(&start) {
+            // Angular's visitExpansion trims the key: `{count, select , ...}` is named
+            // "VAR_SELECT " in the message but the var is VAR_SELECT.
+            Some(name) => name.trim().to_string(),
+            None => self.generate_unique_icu_placeholder(base_name),
+        }
+    }
+
     fn generate_unique_icu_placeholder(&mut self, base_name: &str) -> String {
         let count = self.icu_placeholder_counts.entry(base_name.to_string()).or_insert(0);
         let result =
@@ -1344,62 +1412,85 @@ impl<'a> HtmlToR3Transform<'a> {
     ///
     /// Ported from Angular's r3_template_transform.ts:301-337
     fn visit_expansion(&mut self, expansion: &HtmlExpansion<'a>) -> Option<R3Node<'a>> {
-        // Do not generate Icu if it was created outside of i18n block/element in a template
-        // Reference: r3_template_transform.ts:301-306
-        let in_i18n_context = expansion.in_i18n_block || self.i18n_depth > 0;
-        if !in_i18n_context {
-            return None;
-        }
+        // Every ICU gets an i18n message, including ICUs outside an i18n block: Angular's
+        // I18nMetaVisitor visits all expansions, and the wrap_icus phase later gives such an ICU
+        // its own i18n block.
 
         // Reset ICU placeholder counters for this new top-level ICU.
         // This ensures unique placeholder names within each ICU context.
         // Ported from Angular's PlaceholderRegistry usage in i18n_parser.ts.
         self.reset_icu_placeholder_counts();
 
-        // Create i18n metadata with proper ICU placeholder
-        // This matches Angular's behavior where expansion.i18n is a Message
-        // containing a single IcuPlaceholder node
+        // The ICU's message is built from the expansion itself (Angular's I18nMetaVisitor:
+        // `_generateI18nMessage([expansion], currentMessage || meta)`). An ICU that is the only
+        // child of an i18n element shares that element's message, so it is the message rather
+        // than a sub-message of it.
+        let source_file =
+            std::sync::Arc::new(crate::util::ParseSourceFile::new(self.source_text, "<template>"));
+        let icu_message = I18nMessageFactory::new(false, true).create_icu_message(
+            expansion,
+            self.element_full_names.last().map(String::as_str),
+            source_file,
+        );
+        let message_string = icu_message.serialize();
+        // Angular's meta visitor gives an ICU sub-message no meaning.
+        let associated_message_id = crate::i18n::compute_msg_id(
+            &crate::i18n::ast::serialize_message_for_id(&icu_message.nodes),
+            "",
+        );
+        // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
+        // vars, interpolations become bound text, and element markup becomes plain text.
+        let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
+            icu_message.placeholders.into_iter().partition(|(name, _)| name.starts_with("VAR_"));
+        self.icu_names.vars = vars
+            .into_iter()
+            .map(|(name, placeholder)| (placeholder.source_span.start.offset, name))
+            .collect();
+        let (interpolations, mut tags): (std::vec::Vec<_>, std::vec::Vec<_>) =
+            others.into_iter().partition(|(_, placeholder)| placeholder.text.starts_with("{{"));
+        self.icu_names.interpolations = interpolations
+            .into_iter()
+            .map(|(name, placeholder)| (placeholder.text, name))
+            .collect();
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
+            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
+            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
+        };
+        let I18nMeta::Message(mut i18n_message) =
+            parse_i18n_meta_with_message(self.allocator, &meta_value, instance_id, &message_string)
+        else {
+            unreachable!("parse_i18n_meta_with_message always returns a Message")
+        };
+        if is_sub_message {
+            i18n_message.associated_message_id =
+                Ident::from_in(associated_message_id.as_str(), self.allocator);
+        }
+
+        // The pipeline identifies the ICU by a message holding a single IcuPlaceholder.
         let icu_type_upper = expansion.expansion_type.as_str().to_uppercase();
         let base_name = format!("VAR_{icu_type_upper}");
-        let expression_placeholder =
-            Ident::from_in(&self.generate_unique_icu_placeholder(&base_name), &self.allocator);
-        let icu_placeholder_name = Ident::from_in("ICU", &self.allocator);
-
-        // Create the I18nIcu for the i18n metadata
-        // The cases are empty here since they're parsed separately into R3Icu.placeholders
-        let i18n_icu = I18nIcu {
-            expression: expansion.switch_value,
-            icu_type: expansion.expansion_type,
-            cases: HashMap::new_in(&self.allocator),
+        let expression_placeholder = Ident::from_in(
+            &self.icu_var_name(expansion.switch_value_span.start, &base_name),
+            self.allocator,
+        );
+        i18n_message.nodes.push(I18nNode::IcuPlaceholder(I18nIcuPlaceholder {
+            value: Box::new_in(
+                I18nIcu {
+                    expression: expansion.switch_value,
+                    icu_type: expansion.expansion_type,
+                    cases: HashMap::new_in(self.allocator),
+                    source_span: expansion.span,
+                    expression_placeholder: Some(expression_placeholder),
+                },
+                &self.allocator,
+            ),
+            name: Ident::from_in(
+                self.message_names.icus.remove(&expansion.span.start).as_deref().unwrap_or("ICU"),
+                self.allocator,
+            ),
             source_span: expansion.span,
-            expression_placeholder: Some(expression_placeholder),
-        };
-
-        // Create the IcuPlaceholder wrapping the ICU
-        let i18n_icu_placeholder = I18nIcuPlaceholder {
-            value: Box::new_in(i18n_icu, &self.allocator),
-            name: icu_placeholder_name,
-            source_span: expansion.span,
-        };
-
-        // Create the Message containing the single IcuPlaceholder
-        let mut nodes = Vec::new_in(&self.allocator);
-        nodes.push(I18nNode::IcuPlaceholder(i18n_icu_placeholder));
-
-        // Serialize the message string for goog.getMsg and $localize
-        let message_string_str = serialize_i18n_nodes(&nodes);
-        let message_string = Ident::from_in(&*message_string_str, &self.allocator);
-
-        let i18n_message = I18nMessage {
-            instance_id: self.allocate_i18n_message_instance_id(),
-            nodes,
-            meaning: Ident::from(""),
-            description: Ident::from(""),
-            custom_id: Ident::from(""),
-            id: Ident::from(""),
-            legacy_ids: Vec::new_in(&self.allocator),
-            message_string,
-        };
+        }));
 
         // Create variable for the switch value (using VAR_* placeholder name)
         let mut vars = Vec::new_in(&self.allocator);
@@ -1417,6 +1508,32 @@ impl<'a> HtmlToR3Transform<'a> {
         let mut placeholders = Vec::new_in(&self.allocator);
         for case in &expansion.cases {
             self.extract_placeholders_from_nodes(&case.expansion, &mut placeholders, &mut vars);
+        }
+        for (name, placeholder) in tags {
+            // Angular: `_visitTextWithInterpolation(value.text, ...)`, so markup such as
+            // `<span title="{{a}}">` becomes bound text with expression placeholders.
+            let span =
+                Span::new(placeholder.source_span.start.offset, placeholder.source_span.end.offset);
+            let text = self.allocator.alloc_str(&placeholder.text);
+            let value = if self.has_interpolation(text) {
+                self.parse_interpolation(text, span).map(|value| {
+                    R3IcuPlaceholder::BoundText(R3BoundText {
+                        value,
+                        source_span: span,
+                        i18n: None,
+                    })
+                })
+            } else {
+                None
+            };
+            let value = value.unwrap_or_else(|| {
+                R3IcuPlaceholder::Text(R3Text { value: Ident::from(text), source_span: span })
+            });
+            ordered_insert_placeholder(
+                &mut placeholders,
+                Ident::from_in(name.as_str(), self.allocator),
+                value,
+            );
         }
 
         // Add the outer ICU's var AFTER processing all children.
@@ -1469,13 +1586,12 @@ impl<'a> HtmlToR3Transform<'a> {
                     let parse_result =
                         self.binding_parser.parse_binding(value_str, switch_value_span);
 
-                    // Generate unique VAR_* placeholder name for the nested ICU BEFORE recursion.
-                    // The counter is incremented immediately, so nested ICUs get sequential names.
-                    // This matches Angular's getUniquePlaceholder in i18n_parser.ts:153
+                    // Name the nested ICU's VAR_* placeholder as the ICU's message does
+                    // (Angular numbers nested ICUs before their parent).
                     let icu_type_upper = nested_expansion.expansion_type.as_str().to_uppercase();
                     let base_name = format!("VAR_{icu_type_upper}");
-                    let unique_name = self.generate_unique_icu_placeholder(&base_name);
-                    let var_placeholder_name = Ident::from_in(&unique_name, &self.allocator);
+                    let unique_name = self.icu_var_name(switch_value_span.start, &base_name);
+                    let var_placeholder_name = Ident::from_in(&unique_name, self.allocator);
 
                     // Recursively extract from nested expansion cases FIRST.
                     // This ensures placeholders and further nested ICU vars are processed
@@ -1551,7 +1667,13 @@ impl<'a> HtmlToR3Transform<'a> {
                     let value_str = self.allocator.alloc_str(expr_content);
                     let parse_result = self.binding_parser.parse_binding(value_str, interp_span);
 
-                    let placeholder_key = Ident::from_in(interpolation, &self.allocator);
+                    let placeholder_key = Ident::from_in(
+                        self.icu_names
+                            .interpolations
+                            .get(interpolation)
+                            .map_or(interpolation, String::as_str),
+                        self.allocator,
+                    );
                     let bound_text = R3BoundText {
                         value: parse_result.ast,
                         source_span: interp_span,
@@ -2058,6 +2180,22 @@ impl<'a> HtmlToR3Transform<'a> {
         // Only create placeholders when inside an i18n context
         if self.i18n_depth == 0 {
             return None;
+        }
+
+        // Use the names from the enclosing i18n message, as Angular does.
+        if let Some((start, close)) = self.message_names.blocks.remove(&source_span.start) {
+            let mut params = Vec::new_in(&self.allocator);
+            params.extend(parameters.iter().copied());
+            return Some(I18nMeta::BlockPlaceholder(I18nBlockPlaceholder {
+                name: Ident::from_in(block_name, self.allocator),
+                parameters: params,
+                start_name: Ident::from_in(start.as_str(), self.allocator),
+                close_name: Ident::from_in(close.as_str(), self.allocator),
+                children: Vec::new_in(&self.allocator),
+                source_span,
+                start_source_span: Some(start_source_span),
+                end_source_span,
+            }));
         }
 
         // Generate unique placeholder names (following Angular's placeholder naming convention)
@@ -3060,8 +3198,24 @@ impl<'a> HtmlToR3Transform<'a> {
                     );
                     continue;
                 }
+                // Angular's I18nMetaVisitor only gives a message to a plain attribute with that
+                // name and a value, built from the value: `_generateI18nMessage([attr], meta)`.
+                let Some(target) =
+                    attrs.iter().find(|a| a.name.as_str() == target_attr && !a.value.is_empty())
+                else {
+                    continue;
+                };
                 let instance_id = self.allocate_i18n_message_instance_id();
-                let meta = parse_i18n_meta(self.allocator, attr.value.as_str(), instance_id);
+                let (message_string, nodes) = self.create_attribute_i18n_message(target);
+                let mut meta = parse_i18n_meta_with_message(
+                    self.allocator,
+                    attr.value.as_str(),
+                    instance_id,
+                    &message_string,
+                );
+                if let I18nMeta::Message(message) = &mut meta {
+                    message.nodes = nodes;
+                }
                 i18n_attrs_meta.insert(target_attr, meta);
             }
         }
@@ -3306,6 +3460,46 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         (attributes, inputs, outputs, references, variables, template_attr_info)
+    }
+
+    /// Builds the i18n message for a translated attribute from the attribute's value.
+    ///
+    /// Returns the serialized message and its top-level nodes. An attribute message only
+    /// contains text and interpolation placeholders; the placeholder nodes give ingest the
+    /// names Angular reads from `Object.keys(message.placeholders)`.
+    fn create_attribute_i18n_message(
+        &self,
+        attr: &HtmlAttribute<'a>,
+    ) -> (String, Vec<'a, I18nNode<'a>>) {
+        let source_file =
+            std::sync::Arc::new(crate::util::ParseSourceFile::new(self.source_text, "<template>"));
+        let message =
+            I18nMessageFactory::new(false, true).create_attribute_message(attr, source_file);
+        let span = |s: &crate::util::ParseSourceSpan| Span::new(s.start.offset, s.end.offset);
+        let mut nodes = Vec::new_in(&self.allocator);
+        let mut push = |node: &crate::i18n::ast::Node| match node {
+            crate::i18n::ast::Node::Text(text) => nodes.push(I18nNode::Text(I18nText {
+                value: Ident::from_in(text.value.as_str(), self.allocator),
+                source_span: span(&text.source_span),
+            })),
+            crate::i18n::ast::Node::Placeholder(ph) => {
+                nodes.push(I18nNode::Placeholder(I18nPlaceholder {
+                    value: Ident::from_in(ph.value.as_str(), self.allocator),
+                    name: Ident::from_in(ph.name.as_str(), self.allocator),
+                    source_span: span(&ph.source_span),
+                }));
+            }
+            _ => {}
+        };
+        for node in &message.nodes {
+            match node {
+                crate::i18n::ast::Node::Container(container) => {
+                    container.children.iter().for_each(&mut push);
+                }
+                node => push(node),
+            }
+        }
+        (message.serialize(), nodes)
     }
 
     /// Normalizes an attribute name by stripping the data- prefix (case-insensitive).
@@ -4236,15 +4430,19 @@ impl<'a> HtmlToR3Transform<'a> {
             }
         }
 
-        // Generate placeholder names
-        let start_name = self
-            .i18n_placeholder_registry
-            .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
-        let close_name = if is_void {
-            String::new()
-        } else {
-            self.i18n_placeholder_registry.get_close_tag_placeholder_name(tag_name)
-        };
+        // Use the names from the enclosing i18n message, as Angular does.
+        let (start_name, close_name) =
+            self.message_names.tags.remove(&element.span.start).unwrap_or_else(|| {
+                let start_name = self
+                    .i18n_placeholder_registry
+                    .get_start_tag_placeholder_name(tag_name, &attrs, is_void);
+                let close_name = if is_void {
+                    String::new()
+                } else {
+                    self.i18n_placeholder_registry.get_close_tag_placeholder_name(tag_name)
+                };
+                (start_name, close_name)
+            });
 
         // Create TagPlaceholder
         let mut placeholder_attrs = HashMap::new_in(&self.allocator);
@@ -4435,11 +4633,15 @@ impl<'a> HtmlToR3Transform<'a> {
                 let expr = text[abs_start + 2..abs_end].trim();
 
                 if !expr.is_empty() {
-                    // Generate placeholder name using the i18n placeholder registry
-                    let placeholder_name =
-                        self.i18n_placeholder_registry.get_placeholder_name("INTERPOLATION", expr);
-                    let name_atom = Ident::from_in(&placeholder_name, &self.allocator);
-                    let value_atom = Ident::from_in(expr, &self.allocator);
+                    // Generate placeholder name using the i18n placeholder registry, honouring a
+                    // custom name from `// i18n(ph="NAME")` as Angular's i18n parser does.
+                    let base_name = crate::i18n::parser::extract_placeholder_name(expr);
+                    let placeholder_name = self.i18n_placeholder_registry.get_placeholder_name(
+                        base_name.as_deref().unwrap_or("INTERPOLATION"),
+                        expr,
+                    );
+                    let name_atom = Ident::from_in(&placeholder_name, self.allocator);
+                    let value_atom = Ident::from_in(expr, self.allocator);
 
                     children.push(I18nNode::Placeholder(I18nPlaceholder {
                         value: value_atom,
@@ -4464,13 +4666,9 @@ impl<'a> HtmlToR3Transform<'a> {
             }
         }
 
-        // Return Container if multiple children, otherwise single node
-        if children.len() == 1 {
-            let single_child = children.pop().unwrap();
-            I18nMeta::Node(single_child)
-        } else {
-            I18nMeta::Node(I18nNode::Container(I18nContainer { children, source_span: span }))
-        }
+        // Text with an interpolation is always a Container, even `{{ x }}` alone, as in
+        // Angular's _visitTextWithInterpolation; ingest reads placeholder names from it.
+        I18nMeta::Node(I18nNode::Container(I18nContainer { children, source_span: span }))
     }
 
     /// Parses an interpolation expression.
@@ -4899,19 +5097,39 @@ fn is_style_url_resolvable(url: &str) -> bool {
     }
 }
 
-/// Parses i18n metadata from an attribute value (for i18n-* attributes).
-///
-/// Format: `meaning|description@@customId`
-/// Examples:
-/// - `"Save button tooltip|Click to save@@SAVE_BTN"` -> meaning: "Save button tooltip", description: "Click to save", customId: "SAVE_BTN"
-/// - `"Click to save@@SAVE_BTN"` -> description: "Click to save", customId: "SAVE_BTN"
-/// - `"Click to save"` -> description: "Click to save"
-/// - `"@@SAVE_BTN"` -> customId: "SAVE_BTN"
-///
-/// This variant is used for i18n-* attributes where the message content comes from
-/// the attribute value itself, not from children.
-fn parse_i18n_meta<'a>(allocator: &'a Allocator, value: &str, instance_id: u32) -> I18nMeta<'a> {
-    parse_i18n_meta_with_message(allocator, value, instance_id, "")
+/// Records the placeholder names of each ICU and block in an i18n message, keyed by their start
+/// offset. Angular takes these names from the message (`getPlaceholderName('ICU', ...)`,
+/// `getStartBlockPlaceholderName(...)`), giving `ICU_1`, `START_BLOCK_IF_1`, ... as needed.
+fn collect_placeholder_names(
+    nodes: &[crate::i18n::ast::Node],
+    names: &mut MessagePlaceholderNames,
+) {
+    use crate::i18n::ast::Node;
+    for node in nodes {
+        match node {
+            Node::IcuPlaceholder(ph) => {
+                names.icus.insert(ph.source_span.start.offset, ph.name.clone());
+            }
+            Node::Container(container) => {
+                collect_placeholder_names(&container.children, names);
+            }
+            Node::TagPlaceholder(tag) => {
+                names.tags.insert(
+                    tag.source_span.start.offset,
+                    (tag.start_name.clone(), tag.close_name.clone()),
+                );
+                collect_placeholder_names(&tag.children, names);
+            }
+            Node::BlockPlaceholder(block) => {
+                names.blocks.insert(
+                    block.source_span.start.offset,
+                    (block.start_name.clone(), block.close_name.clone()),
+                );
+                collect_placeholder_names(&block.children, names);
+            }
+            Node::Text(_) | Node::Icu(_) | Node::Placeholder(_) => {}
+        }
+    }
 }
 
 /// Parses i18n metadata from an attribute value.
@@ -4954,7 +5172,8 @@ fn parse_i18n_meta_with_message<'a>(
         custom_id: Ident::from_in(custom_id, &allocator),
         id: Ident::from(""),
         legacy_ids: Vec::new_in(&allocator),
-        message_string: Ident::from_in(message_string, &allocator),
+        message_string: Ident::from_in(message_string, allocator),
+        associated_message_id: Ident::from(""),
     })
 }
 

@@ -20,7 +20,7 @@ use crate::output::ast::{
 };
 use crate::pipeline::compilation::{ComponentCompilationJob, ConstValue};
 use crate::pipeline::phases::i18n_closure::{
-    I18nMessageMeta, create_translation_declaration, generate_closure_var_name,
+    I18nMessageMeta, I18nParamExpr, create_translation_declaration, generate_closure_var_name,
     generate_file_based_i18n_suffix, generate_i18n_var_name,
 };
 use crate::r3::Identifiers;
@@ -60,7 +60,11 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
     // I18n Message Xref -> I18n Message Op info
     let mut messages: FxHashMap<XrefId, MessageInfo> = FxHashMap::default();
     // I18n Context Xref -> Params
-    let mut params_by_context: FxHashMap<XrefId, Vec<(String, String)>> = FxHashMap::default();
+    let mut params_by_context: FxHashMap<XrefId, Vec<(String, I18nParamExpr)>> =
+        FxHashMap::default();
+    // I18n Context Xref -> Post-processing params
+    let mut postprocessing_params_by_context: FxHashMap<XrefId, FxHashMap<String, String>> =
+        FxHashMap::default();
 
     // Collect info from all views
     for view in job.all_views() {
@@ -91,6 +95,10 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                             custom_id: msg_op.custom_id.as_ref().map(|a| a.to_string()),
                             message_id: msg_op.message_id.as_ref().map(|a| a.to_string()),
                             message_string: msg_op.message_string.as_ref().map(|a| a.to_string()),
+                            associated_message_id: msg_op
+                                .associated_message_id
+                                .as_ref()
+                                .map(ToString::to_string),
                             needs_postprocessing: msg_op.needs_postprocessing,
                             sub_messages: msg_op.sub_messages.iter().copied().collect(),
                         },
@@ -98,8 +106,20 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                 }
                 CreateOp::I18nContext(ctx_op) => {
                     // Collect formatted params from context
-                    let formatted = format_context_params(&ctx_op.params);
+                    let formatted = format_context_params(&ctx_op.params)
+                        .into_iter()
+                        .map(|(name, value)| (name, I18nParamExpr::Literal(value)))
+                        .collect();
                     params_by_context.insert(ctx_op.xref, formatted);
+
+                    // Angular's createI18nMessage formats the context's post-processing params,
+                    // then extractI18nMessages sets each ICU placeholder's literal over them.
+                    let mut postprocessing: FxHashMap<String, String> =
+                        format_context_params(&ctx_op.postprocessing_params).into_iter().collect();
+                    for (name, value) in &ctx_op.icu_placeholder_literals {
+                        postprocessing.insert(name.to_string(), value.to_string());
+                    }
+                    postprocessing_params_by_context.insert(ctx_op.xref, postprocessing);
                 }
                 _ => {}
             }
@@ -173,6 +193,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
             &allocator,
             &messages,
             &params_by_context,
+            &postprocessing_params_by_context,
             &msg_info,
             &file_based_i18n_suffix,
             job.i18n_use_external_ids,
@@ -429,6 +450,7 @@ struct MessageInfo {
     custom_id: Option<String>,
     message_id: Option<String>,
     message_string: Option<String>,
+    associated_message_id: Option<String>,
     needs_postprocessing: bool,
     sub_messages: Vec<XrefId>,
 }
@@ -444,7 +466,8 @@ struct I18nExpressionInfo {
 fn collect_message<'a>(
     allocator: &'a oxc_allocator::Allocator,
     messages: &FxHashMap<XrefId, MessageInfo>,
-    params_by_context: &FxHashMap<XrefId, Vec<(String, String)>>,
+    params_by_context: &FxHashMap<XrefId, Vec<(String, I18nParamExpr)>>,
+    postprocessing_params_by_context: &FxHashMap<XrefId, FxHashMap<String, String>>,
     msg_info: &MessageInfo,
     file_suffix: &str,
     use_external_ids: bool,
@@ -454,12 +477,15 @@ fn collect_message<'a>(
 
     // Recursively collect sub-messages first
     let mut sub_message_placeholders: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    // Placeholder -> `$localize` id of its sub-message.
+    let mut associated_message_ids: FxHashMap<String, String> = FxHashMap::default();
     for &sub_msg_xref in &msg_info.sub_messages {
         if let Some(sub_msg) = messages.get(&sub_msg_xref) {
             let (sub_var_name, sub_statements) = collect_message(
                 &allocator,
                 messages,
                 params_by_context,
+                postprocessing_params_by_context,
                 sub_msg,
                 file_suffix,
                 use_external_ids,
@@ -469,6 +495,9 @@ fn collect_message<'a>(
 
             if let Some(ref placeholder) = sub_msg.message_placeholder {
                 sub_message_placeholders.entry(placeholder.clone()).or_default().push(sub_var_name);
+                if let Some(id) = &sub_msg.associated_message_id {
+                    associated_message_ids.insert(placeholder.clone(), id.clone());
+                }
             }
         }
     }
@@ -480,16 +509,21 @@ fn collect_message<'a>(
         .cloned()
         .unwrap_or_default();
 
-    // Build postprocessing params from sub-message placeholders (for ICU post-processing)
-    let postprocessing_params: Vec<(String, Vec<String>)> = sub_message_placeholders
-        .iter()
-        .filter(|(_, vars)| vars.len() > 1)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut postprocessing_params: Vec<(String, I18nParamExpr)> = msg_info
+        .i18n_context
+        .and_then(|ctx| postprocessing_params_by_context.get(&ctx))
+        .map(|params| {
+            params
+                .iter()
+                .map(|(name, value)| (name.clone(), I18nParamExpr::Literal(value.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Build params with sub-message values
     let mut params = base_params;
-    add_sub_message_params(&mut params, &sub_message_placeholders, msg_info.needs_postprocessing);
+    add_sub_message_params(&mut params, &mut postprocessing_params, &sub_message_placeholders);
+    postprocessing_params.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Sort params for consistency
     params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -519,27 +553,21 @@ fn collect_message<'a>(
         None
     };
 
-    // Serialize message for goog.getMsg format
-    // Use stored message_string if available, otherwise fallback to generating from params
-    let message_for_closure =
+    // The stored message string names placeholders as `{$NAME}`; goog.getMsg uses camelCase.
+    let message_string =
         msg_info.message_string.clone().unwrap_or_else(|| generate_message_from_params(&params));
+    let message_for_closure = to_get_msg_string(&message_string);
 
     // Create $localize expression
     let localized_expr = create_localize_expression(
-        &allocator,
-        &message_for_closure,
+        allocator,
+        &message_string,
         &params,
         msg_info.description.clone(),
         msg_info.meaning.clone(),
         msg_info.custom_id.clone(),
+        &associated_message_ids,
     );
-
-    // Wrap with postprocess if needed
-    let localized_expr = if msg_info.needs_postprocessing || !postprocessing_params.is_empty() {
-        wrap_with_postprocess(allocator, localized_expr, &postprocessing_params)
-    } else {
-        localized_expr
-    };
 
     // Generate dual-mode translation declaration
     let i18n_var_atom = Ident::from(allocator.alloc_str(&i18n_var_name));
@@ -557,36 +585,81 @@ fn collect_message<'a>(
 
     all_statements.extend(statements);
 
+    // Angular applies post-processing after both the Closure and $localize branches:
+    // `i18n_X = ɵɵi18nPostprocess(i18n_X, params?)`.
+    if msg_info.needs_postprocessing || !postprocessing_params.is_empty() {
+        let read_var = || {
+            OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+                ReadVarExpr { name: i18n_var_atom, source_span: None },
+                &allocator,
+            ))
+        };
+        let postprocess = wrap_with_postprocess(allocator, read_var(), &postprocessing_params);
+        let assignment = OutputExpression::BinaryOperator(oxc_allocator::Box::new_in(
+            crate::output::ast::BinaryOperatorExpr {
+                operator: crate::output::ast::BinaryOperator::Assign,
+                lhs: oxc_allocator::Box::new_in(read_var(), &allocator),
+                rhs: oxc_allocator::Box::new_in(postprocess, &allocator),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        all_statements.push(OutputStatement::Expression(oxc_allocator::Box::new_in(
+            crate::output::ast::ExpressionStatement { expr: assignment, source_span: None },
+            &allocator,
+        )));
+    }
+
     (i18n_var_name, all_statements)
 }
 
 /// Add sub-message placeholder values to the params.
+///
+/// Ported from Angular's `addSubMessageParams`: a single sub-message is passed by its
+/// variable; several sub-messages sharing a placeholder are mapped at post-processing time.
 fn add_sub_message_params(
-    params: &mut Vec<(String, String)>,
+    params: &mut Vec<(String, I18nParamExpr)>,
+    postprocessing_params: &mut Vec<(String, I18nParamExpr)>,
     sub_message_placeholders: &FxHashMap<String, Vec<String>>,
-    _needs_postprocessing: bool,
 ) {
     for (placeholder, sub_vars) in sub_message_placeholders {
-        if sub_vars.len() == 1 {
-            // Single sub-message: use its variable directly
-            // The value will be the variable reference (handled at runtime)
-            params.push((placeholder.clone(), format!("{ESCAPE}{}{ESCAPE}", sub_vars[0])));
+        if let [sub_var] = sub_vars.as_slice() {
+            params.push((placeholder.clone(), I18nParamExpr::Var(sub_var.clone())));
         } else {
-            // Multiple sub-messages: create ICU mapping placeholder for post-processing
             params.push((
                 placeholder.clone(),
-                format!("{ESCAPE}{I18N_ICU_MAPPING_PREFIX}{placeholder}{ESCAPE}"),
+                I18nParamExpr::Literal(format!(
+                    "{ESCAPE}{I18N_ICU_MAPPING_PREFIX}{placeholder}{ESCAPE}"
+                )),
             ));
+            postprocessing_params.retain(|(name, _)| name != placeholder);
+            postprocessing_params
+                .push((placeholder.clone(), I18nParamExpr::Vars(sub_vars.clone())));
         }
     }
 }
 
 /// Generate a message string from params (fallback when message AST is not available).
-fn generate_message_from_params(params: &[(String, String)]) -> String {
+fn generate_message_from_params(params: &[(String, I18nParamExpr)]) -> String {
     let mut result = String::new();
     for (name, _value) in params {
-        let formatted_name = format_i18n_placeholder_name(name, true);
-        result.push_str(&format!("{{${formatted_name}}}"));
+        result.push_str("{$");
+        result.push_str(name);
+        result.push('}');
+    }
+    result
+}
+
+/// Converts a stored message string to goog.getMsg format by writing each `{$NAME}` placeholder
+/// in camelCase, as Angular's `GetMsgSerializerVisitor` does.
+fn to_get_msg_string(message: &str) -> String {
+    let (text_parts, placeholders) = parse_message_string(message);
+    let mut result = text_parts.first().cloned().unwrap_or_default();
+    for (i, placeholder) in placeholders.iter().enumerate() {
+        result.push_str("{$");
+        result.push_str(&format_i18n_placeholder_name(placeholder, true));
+        result.push('}');
+        result.push_str(text_parts.get(i + 1).map_or("", String::as_str));
     }
     result
 }
@@ -619,28 +692,32 @@ fn format_context_params(
 fn create_localize_expression<'a>(
     allocator: &'a oxc_allocator::Allocator,
     message_string: &str,
-    params: &[(String, String)],
+    params: &[(String, I18nParamExpr)],
     description: Option<String>,
     meaning: Option<String>,
     custom_id: Option<String>,
+    associated_message_ids: &FxHashMap<String, String>,
 ) -> OutputExpression<'a> {
     // Parse message_string to extract text parts and placeholder names in order
     let (text_parts, placeholder_order) = parse_message_string(message_string);
 
     let mut message_parts = ArenaVec::new_in(&allocator);
+    let mut raw_message_parts = ArenaVec::new_in(&allocator);
     let mut placeholder_names = ArenaVec::new_in(&allocator);
     let mut expressions = ArenaVec::new_in(&allocator);
+    let mut push_part = |(cooked, raw): (String, String)| {
+        message_parts.push(Ident::from(allocator.alloc_str(&cooked)));
+        raw_message_parts.push(Ident::from(allocator.alloc_str(&raw)));
+    };
 
     // Build a map from placeholder name to value for quick lookup
-    let params_map: FxHashMap<String, String> =
+    let params_map: FxHashMap<String, I18nParamExpr> =
         params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     // First message part: includes metadata block + first text segment
     // Format: ":meaning|description@@customId:text"
     let first_text = text_parts.first().map(|s| s.as_str()).unwrap_or("");
-    let head_cooked = serialize_i18n_head(first_text, &meaning, &description, &custom_id);
-    let head_str = allocator.alloc_str(&head_cooked);
-    message_parts.push(Ident::from(head_str));
+    push_part(serialize_i18n_head(first_text, &meaning, &description, &custom_id));
 
     // Subsequent parts: ":PLACEHOLDER_NAME:text"
     for (i, placeholder) in placeholder_order.iter().enumerate() {
@@ -654,21 +731,17 @@ fn create_localize_expression<'a>(
         // uses camelCase (from format_i18n_placeholder_name with use_camel_case=true).
         // We need to find the matching param key.
         let value = find_param_value(&params_map, placeholder);
-        let value_str = allocator.alloc_str(&value);
-        let literal_expr = OutputExpression::Literal(oxc_allocator::Box::new_in(
-            crate::output::ast::LiteralExpr {
-                value: LiteralValue::String(Ident::from(value_str)),
-                source_span: None,
-            },
-            &allocator,
-        ));
-        expressions.push(literal_expr);
+        expressions.push(value.to_expr(allocator));
 
         // Text part after this placeholder
         let text_part = text_parts.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-        let part_cooked = serialize_i18n_template_part(&formatted_name, text_part);
-        let part_str = allocator.alloc_str(&part_cooked);
-        message_parts.push(Ident::from(part_str));
+        // Angular's serializeI18nTemplatePart names an ICU placeholder's sub-message when the
+        // sub-message has no legacy ids (always, in Oxc): `:ICU@@<id>:`.
+        let meta_block = match associated_message_ids.get(placeholder) {
+            Some(id) => format!("{formatted_name}@@{id}"),
+            None => formatted_name.clone(),
+        };
+        push_part(create_cooked_raw_string(&meta_block, text_part));
     }
 
     // Store metadata for potential future use (JSDoc generation in emitter)
@@ -691,6 +764,7 @@ fn create_localize_expression<'a>(
             meaning: meaning_atom,
             custom_id: custom_id_atom,
             message_parts,
+            raw_message_parts,
             placeholder_names,
             expressions,
             source_span: None,
@@ -710,6 +784,15 @@ fn parse_message_string(message: &str) -> (Vec<String>, Vec<String>) {
     let mut chars = message.chars().peekable();
 
     while let Some(ch) = chars.next() {
+        // Text that looks like a marker is escaped by the message serializer.
+        if ch == '{' && chars.peek() == Some(&'\\') {
+            chars.next();
+            current_text.push('{');
+            if let Some(escaped) = chars.next() {
+                current_text.push(escaped);
+            }
+            continue;
+        }
         if ch == '{' && chars.peek() == Some(&'$') {
             // Start of placeholder: {$NAME}
             text_parts.push(current_text);
@@ -738,91 +821,66 @@ fn parse_message_string(message: &str) -> (Vec<String>, Vec<String>) {
     (text_parts, placeholders)
 }
 
-/// Serialize the i18n head (first message part) with metadata.
-///
-/// Format: ":meaning|description@@customId:text"
-/// - meaning and description are separated by |
-/// - customId is prefixed with @@
-/// - If there's no metadata, just return the text (with starting colon escaped if needed)
+/// Serialize the i18n head (first message part) with its metadata block
+/// (`meaning|description@@customId`), as Angular's `serializeI18nHead`.
 fn serialize_i18n_head(
     text: &str,
     meaning: &Option<String>,
     description: &Option<String>,
     custom_id: &Option<String>,
-) -> String {
-    let mut meta_block = String::new();
+) -> (String, String) {
+    let mut meta_block = description.clone().unwrap_or_default();
+    if let Some(meaning) = meaning.as_deref().filter(|m| !m.is_empty()) {
+        meta_block = format!("{meaning}|{meta_block}");
+    }
+    if let Some(id) = custom_id.as_deref().filter(|id| !id.is_empty()) {
+        meta_block = format!("{meta_block}@@{id}");
+    }
+    create_cooked_raw_string(&meta_block, text)
+}
 
-    // Build meta block: meaning|description@@customId
-    if let Some(m) = meaning {
-        meta_block.push_str(m);
-    }
-    if meaning.is_some() || description.is_some() {
-        if meaning.is_some() {
-            meta_block.push('|');
-        }
-        if let Some(d) = description {
-            meta_block.push_str(d);
-        }
-    }
-    if let Some(id) = custom_id {
-        meta_block.push_str("@@");
-        meta_block.push_str(id);
-    }
-
+/// Returns the cooked and raw strings of a `$localize` message part with its metadata block,
+/// as Angular's `createCookedRawString`. Only the raw string carries escapes: `$localize` reads
+/// it to tell an escaped `\:` from the `:` that ends the metadata block.
+fn create_cooked_raw_string(meta_block: &str, message_part: &str) -> (String, String) {
+    let escape_slashes = |s: &str| s.replace('\\', "\\\\");
+    let escape_for_template_literal = |s: &str| s.replace('`', "\\`").replace("${", "$\\{");
     if meta_block.is_empty() {
-        // No metadata - just return text (escape starting colon if needed)
-        if text.starts_with(':') { format!("\\:{}", &text[1..]) } else { text.to_string() }
+        let raw = escape_slashes(message_part);
+        let raw = match raw.strip_prefix(':') {
+            Some(rest) => format!("\\:{rest}"),
+            None => raw,
+        };
+        (message_part.to_string(), escape_for_template_literal(&raw))
     } else {
-        // With metadata: :meta:text
-        format!(":{}:{}", meta_block, text)
+        let raw = format!(
+            ":{}:{}",
+            escape_slashes(meta_block).replace(':', "\\:"),
+            escape_slashes(message_part)
+        );
+        (format!(":{meta_block}:{message_part}"), escape_for_template_literal(&raw))
     }
 }
 
-/// Serialize an i18n template part (after first part).
-///
-/// Format: ":PLACEHOLDER_NAME:text"
-fn serialize_i18n_template_part(placeholder_name: &str, text: &str) -> String {
-    format!(":{}:{}", placeholder_name, text)
-}
-
-/// Find the parameter value for a placeholder name from the message string.
-///
-/// The message_string uses camelCase placeholder names (e.g., `interpolation`),
-/// but the params_map is keyed by the original placeholder names (e.g., `INTERPOLATION`).
-/// This function tries to find the matching param key by comparing the formatted names.
-fn find_param_value(params_map: &FxHashMap<String, String>, placeholder_name: &str) -> String {
-    // First try direct lookup
-    if let Some(value) = params_map.get(placeholder_name) {
-        return value.clone();
-    }
-
-    // Try UPPERCASE lookup first since that's the most common format
-    let uppercase_name = format_i18n_placeholder_name(placeholder_name, false);
-    if let Some(value) = params_map.get(&uppercase_name) {
-        return value.clone();
-    }
-
-    // Try to find a key that matches when formatted to camelCase
-    for (key, value) in params_map {
-        let formatted_key = format_i18n_placeholder_name(key, true);
-        if formatted_key == placeholder_name {
-            return value.clone();
-        }
-    }
-
-    // Fallback to empty string if no match found
-    String::new()
+/// Find the parameter value for a placeholder, by its name in the message (Angular:
+/// `params[ph.text]`).
+fn find_param_value(
+    params_map: &FxHashMap<String, I18nParamExpr>,
+    placeholder_name: &str,
+) -> I18nParamExpr {
+    params_map
+        .get(placeholder_name)
+        .cloned()
+        .unwrap_or_else(|| I18nParamExpr::Literal(String::new()))
 }
 
 /// Wrap an i18n expression with i18nPostprocess for ICU message handling.
 fn wrap_with_postprocess<'a>(
     allocator: &'a oxc_allocator::Allocator,
     expr: OutputExpression<'a>,
-    postprocessing_params: &[(String, Vec<String>)],
+    postprocessing_params: &[(String, I18nParamExpr)],
 ) -> OutputExpression<'a> {
-    use crate::output::ast::{
-        InvokeFunctionExpr, LiteralArrayExpr, LiteralMapEntry, LiteralMapExpr,
-    };
+    use crate::output::ast::{InvokeFunctionExpr, LiteralMapEntry, LiteralMapExpr};
 
     // Create ɵɵi18nPostprocess function reference (i0.ɵɵi18nPostprocess)
     let fn_var = OutputExpression::ReadProp(oxc_allocator::Box::new_in(
@@ -848,27 +906,11 @@ fn wrap_with_postprocess<'a>(
     // Add postprocessing params if any
     if !postprocessing_params.is_empty() {
         let mut entries = ArenaVec::new_in(&allocator);
-        for (placeholder, var_names) in postprocessing_params {
-            // Format placeholder name
+        for (placeholder, value) in postprocessing_params {
             let formatted_name = format_i18n_placeholder_name(placeholder, false);
-            let key_str = allocator.alloc_str(&formatted_name);
-
-            // Create array of variable references
-            let mut var_refs = ArenaVec::new_in(&allocator);
-            for var_name in var_names {
-                let var_str = allocator.alloc_str(var_name);
-                var_refs.push(OutputExpression::ReadVar(oxc_allocator::Box::new_in(
-                    ReadVarExpr { name: Ident::from(var_str), source_span: None },
-                    &allocator,
-                )));
-            }
-
             entries.push(LiteralMapEntry::new(
-                Ident::from(key_str),
-                OutputExpression::LiteralArray(oxc_allocator::Box::new_in(
-                    LiteralArrayExpr { entries: var_refs, source_span: None },
-                    &allocator,
-                )),
+                Ident::from(allocator.alloc_str(&formatted_name)),
+                value.to_expr(allocator),
                 true,
             ));
         }
@@ -945,7 +987,10 @@ mod tests {
             &&allocator,
         ));
 
-        let params = vec![("ICU_0".to_string(), vec!["i18n_1".to_string(), "i18n_2".to_string()])];
+        let params = vec![(
+            "ICU_0".to_string(),
+            I18nParamExpr::Vars(vec!["i18n_1".to_string(), "i18n_2".to_string()]),
+        )];
 
         let result = wrap_with_postprocess(&allocator, input_expr, &params);
 

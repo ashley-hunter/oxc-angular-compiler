@@ -10,7 +10,6 @@ use oxc_span::Span;
 use oxc_str::Ident;
 
 use crate::ast::expression::{ASTWithSource, AngularExpression, BindingType, ParsedEventType};
-use crate::i18n::serializer::format_i18n_placeholder_name;
 
 // ============================================================================
 // i18n Metadata
@@ -56,6 +55,10 @@ pub struct I18nMessage<'a> {
     /// The serialized message string for goog.getMsg and $localize.
     /// Contains the message text with placeholder markers like "{$interpolation}".
     pub message_string: Ident<'a>,
+    /// For an ICU sub-message, its `$localize` id (Angular's
+    /// `computeMsgId(message.messageString, message.meaning)`), written on the parent message's
+    /// ICU placeholder. Empty otherwise.
+    pub associated_message_id: Ident<'a>,
 }
 
 /// i18n AST node.
@@ -214,6 +217,7 @@ impl<'a> I18nMessage<'a> {
             id: self.id.clone(),
             legacy_ids,
             message_string: self.message_string.clone(),
+            associated_message_id: self.associated_message_id,
         }
     }
 }
@@ -337,99 +341,6 @@ impl<'a> I18nBlockPlaceholder<'a> {
             end_source_span: self.end_source_span,
         }
     }
-}
-
-// ============================================================================
-// i18n Message Serialization
-// ============================================================================
-
-/// Serialize i18n nodes to the $localize / goog.getMsg message format.
-///
-/// This produces a message string with placeholder markers like "{$interpolation}"
-/// for expression placeholders and "{$startTag}/{$closeTag}" for element boundaries.
-///
-/// Ported from Angular's `serialize_message` in `i18n/i18n_ast.ts`.
-pub fn serialize_i18n_nodes(nodes: &[I18nNode<'_>]) -> String {
-    let mut result = String::new();
-    for node in nodes {
-        serialize_i18n_node(node, &mut result);
-    }
-    result
-}
-
-/// Serialize a single i18n node to the message string format.
-///
-/// Placeholder names are formatted to camelCase for goog.getMsg compatibility.
-/// For example: `INTERPOLATION` -> `{$interpolation}`, `START_TAG_DIV` -> `{$startTagDiv}`
-fn serialize_i18n_node(node: &I18nNode<'_>, result: &mut String) {
-    match node {
-        I18nNode::Text(text) => {
-            result.push_str(text.value.as_str());
-        }
-        I18nNode::Container(container) => {
-            for child in container.children.iter() {
-                serialize_i18n_node(child, result);
-            }
-        }
-        I18nNode::Icu(icu) => {
-            serialize_i18n_icu(icu, result);
-        }
-        I18nNode::TagPlaceholder(ph) => {
-            let start_name = format_i18n_placeholder_name(ph.start_name.as_str(), true);
-            let close_name = format_i18n_placeholder_name(ph.close_name.as_str(), true);
-            result.push_str(&format!("{{${start_name}}}"));
-            for child in ph.children.iter() {
-                serialize_i18n_node(child, result);
-            }
-            result.push_str(&format!("{{${close_name}}}"));
-        }
-        I18nNode::Placeholder(ph) => {
-            let name = format_i18n_placeholder_name(ph.name.as_str(), true);
-            result.push_str(&format!("{{${name}}}"));
-        }
-        I18nNode::IcuPlaceholder(ph) => {
-            let name = format_i18n_placeholder_name(ph.name.as_str(), true);
-            result.push_str(&format!("{{${name}}}"));
-        }
-        I18nNode::BlockPlaceholder(ph) => {
-            let start_name = format_i18n_placeholder_name(ph.start_name.as_str(), true);
-            let close_name = format_i18n_placeholder_name(ph.close_name.as_str(), true);
-            result.push_str(&format!("{{${start_name}}}"));
-            for child in ph.children.iter() {
-                serialize_i18n_node(child, result);
-            }
-            result.push_str(&format!("{{${close_name}}}"));
-        }
-    }
-}
-
-/// Serialize an ICU expression to the message string format.
-fn serialize_i18n_icu(icu: &I18nIcu<'_>, result: &mut String) {
-    // Use expression_placeholder if available, otherwise use expression directly
-    let expr =
-        icu.expression_placeholder.as_ref().map_or_else(|| icu.expression.as_str(), |p| p.as_str());
-
-    result.push('{');
-    result.push_str(expr);
-    result.push_str(", ");
-    result.push_str(icu.icu_type.as_str());
-    result.push_str(", ");
-
-    // Serialize cases - must be sorted for deterministic output
-    let mut cases: std::vec::Vec<_> = icu.cases.iter().collect();
-    cases.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-
-    for (i, (key, value)) in cases.iter().enumerate() {
-        if i > 0 {
-            result.push(' ');
-        }
-        result.push_str(key.as_str());
-        result.push_str(" {");
-        serialize_i18n_node(value, result);
-        result.push('}');
-    }
-
-    result.push('}');
 }
 
 // ============================================================================

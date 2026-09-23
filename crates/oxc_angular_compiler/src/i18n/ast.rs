@@ -413,22 +413,86 @@ pub trait Visitor {
 // Serialization
 // ============================================================================
 
+/// Serialize message nodes as Angular's `serializeMessage` does for `Message.messageString`.
+///
+/// This is the text from which `$localize` message ids are computed (`computeMsgId`).
+/// Placeholders are `{$NAME}` everywhere, including inside ICUs, and a void tag keeps its empty
+/// close placeholder. This differs from the string used for code generation.
+pub fn serialize_message_for_id(nodes: &[Node]) -> String {
+    struct MessageStringVisitor;
+    impl Visitor for MessageStringVisitor {
+        type Context = ();
+        type Result = String;
+        fn visit_text(&mut self, text: &Text, (): &mut ()) -> String {
+            text.value.clone()
+        }
+        fn visit_container(&mut self, container: &Container, ctx: &mut ()) -> String {
+            container.children.iter().map(|c| c.visit(self, ctx)).collect()
+        }
+        fn visit_icu(&mut self, icu: &Icu, ctx: &mut ()) -> String {
+            let cases: Vec<String> =
+                icu.cases.iter().map(|(k, v)| format!("{k} {{{}}}", v.visit(self, ctx))).collect();
+            let placeholder = icu.expression_placeholder.as_deref().unwrap_or_default();
+            format!("{{{placeholder}, {}, {}}}", icu.icu_type, cases.join(" "))
+        }
+        fn visit_tag_placeholder(&mut self, ph: &TagPlaceholder, ctx: &mut ()) -> String {
+            let children: String = ph.children.iter().map(|c| c.visit(self, ctx)).collect();
+            format!("{{${}}}{children}{{${}}}", ph.start_name, ph.close_name)
+        }
+        fn visit_placeholder(&mut self, ph: &Placeholder, (): &mut ()) -> String {
+            format!("{{${}}}", ph.name)
+        }
+        fn visit_icu_placeholder(&mut self, ph: &IcuPlaceholder, (): &mut ()) -> String {
+            format!("{{${}}}", ph.name)
+        }
+        fn visit_block_placeholder(&mut self, ph: &BlockPlaceholder, ctx: &mut ()) -> String {
+            let children: String = ph.children.iter().map(|c| c.visit(self, ctx)).collect();
+            format!("{{${}}}{children}{{${}}}", ph.start_name, ph.close_name)
+        }
+    }
+    nodes.iter().map(|n| n.visit(&mut MessageStringVisitor, &mut ())).collect()
+}
+
 /// Serialize the message to the $localize backtick string format.
 fn serialize_message(nodes: &[Node]) -> String {
-    let mut visitor = LocalizeMessageStringVisitor;
+    let mut visitor = LocalizeMessageStringVisitor { in_icu: false };
     let mut ctx = ();
     nodes.iter().map(|n| n.visit(&mut visitor, &mut ctx)).collect::<Vec<_>>().join("")
 }
 
-/// Visitor that serializes i18n nodes to $localize format.
-struct LocalizeMessageStringVisitor;
+/// Visitor that serializes i18n nodes to the message string stored for code generation.
+///
+/// Placeholders are written as `{$NAME}` markers with their original names: `$localize` uses
+/// the name as-is and `goog.getMsg` its camelCase form, as Angular's two serializers do.
+/// Inside an ICU, Angular's `IcuSerializerVisitor` keeps them as literal `{UPPER_CASE}` ICU
+/// text that is resolved by `ɵɵi18nPostprocess` at runtime.
+struct LocalizeMessageStringVisitor {
+    in_icu: bool,
+}
+
+impl LocalizeMessageStringVisitor {
+    fn format_ph(&self, name: &str) -> String {
+        if self.in_icu {
+            format!("{{{}}}", format_i18n_placeholder_name(name, false))
+        } else {
+            format!("{{${name}}}")
+        }
+    }
+}
+
+/// Escapes message text so that code generation can tell `{$NAME}` placeholder markers from
+/// text that looks like one, such as `{$notAPlaceholder}`: `{\` becomes `{\\` and `{$`
+/// becomes `{\$`.
+pub fn escape_placeholder_markers(text: &str) -> String {
+    text.replace("{\\", "{\\\\").replace("{$", "{\\$")
+}
 
 impl Visitor for LocalizeMessageStringVisitor {
     type Context = ();
     type Result = String;
 
     fn visit_text(&mut self, text: &Text, _context: &mut Self::Context) -> Self::Result {
-        text.value.clone()
+        escape_placeholder_markers(&text.value)
     }
 
     fn visit_container(
@@ -445,11 +509,13 @@ impl Visitor for LocalizeMessageStringVisitor {
     }
 
     fn visit_icu(&mut self, icu: &Icu, context: &mut Self::Context) -> Self::Result {
+        let was_in_icu = std::mem::replace(&mut self.in_icu, true);
         let cases: Vec<String> = icu
             .cases
             .iter()
             .map(|(k, v)| format!("{} {{{}}}", k, v.visit(self, context)))
             .collect();
+        self.in_icu = was_in_icu;
         let expr_placeholder = icu.expression_placeholder.as_deref().unwrap_or(&icu.expression);
         format!("{{{}, {}, {}}}", expr_placeholder, icu.icu_type, cases.join(" "))
     }
@@ -459,11 +525,13 @@ impl Visitor for LocalizeMessageStringVisitor {
         ph: &TagPlaceholder,
         context: &mut Self::Context,
     ) -> Self::Result {
+        // A void element is a single placeholder, as in Angular's serializers.
+        if ph.is_void {
+            return self.format_ph(&ph.start_name);
+        }
         let children: String =
-            ph.children.iter().map(|child| child.visit(self, context)).collect::<Vec<_>>().join("");
-        let start_name = format_i18n_placeholder_name(&ph.start_name, true);
-        let close_name = format_i18n_placeholder_name(&ph.close_name, true);
-        format!("{{${start_name}}}{children}{{${close_name}}}")
+            ph.children.iter().map(|child| child.visit(self, context)).collect::<String>();
+        format!("{}{children}{}", self.format_ph(&ph.start_name), self.format_ph(&ph.close_name))
     }
 
     fn visit_placeholder(
@@ -471,8 +539,7 @@ impl Visitor for LocalizeMessageStringVisitor {
         ph: &Placeholder,
         _context: &mut Self::Context,
     ) -> Self::Result {
-        let name = format_i18n_placeholder_name(&ph.name, true);
-        format!("{{${name}}}")
+        self.format_ph(&ph.name)
     }
 
     fn visit_icu_placeholder(
@@ -480,8 +547,7 @@ impl Visitor for LocalizeMessageStringVisitor {
         ph: &IcuPlaceholder,
         _context: &mut Self::Context,
     ) -> Self::Result {
-        let name = format_i18n_placeholder_name(&ph.name, true);
-        format!("{{${name}}}")
+        self.format_ph(&ph.name)
     }
 
     fn visit_block_placeholder(
@@ -490,10 +556,8 @@ impl Visitor for LocalizeMessageStringVisitor {
         context: &mut Self::Context,
     ) -> Self::Result {
         let children: String =
-            ph.children.iter().map(|child| child.visit(self, context)).collect::<Vec<_>>().join("");
-        let start_name = format_i18n_placeholder_name(&ph.start_name, true);
-        let close_name = format_i18n_placeholder_name(&ph.close_name, true);
-        format!("{{${start_name}}}{children}{{${close_name}}}")
+            ph.children.iter().map(|child| child.visit(self, context)).collect::<String>();
+        format!("{}{children}{}", self.format_ph(&ph.start_name), self.format_ph(&ph.close_name))
     }
 }
 
@@ -701,6 +765,7 @@ mod tests {
             String::new(),
             String::new(),
         );
-        assert_eq!(msg.message_string, "Hello {$interpolation}!");
+        // Original placeholder names; goog.getMsg converts them to camelCase.
+        assert_eq!(msg.message_string, "Hello {$INTERPOLATION}!");
     }
 }

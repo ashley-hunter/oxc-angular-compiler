@@ -267,10 +267,26 @@ export interface FixtureResult {
   fixture: Fixture
 
   /** Comparison status */
-  status: 'match' | 'mismatch' | 'oxc-error' | 'ts-error' | 'both-error' | 'skipped'
+  status:
+    | 'match'
+    | 'mismatch'
+    | 'known-difference'
+    | 'oxc-error'
+    | 'ts-error'
+    | 'both-error'
+    | 'skipped'
 
   /** Skip reason (only when status is "skipped") */
   skipReason?: string
+
+  /** Documented differences from Angular's output (see known-differences.ts) */
+  knownDifferences?: string[]
+
+  /** The fixture is listed in known-differences.ts but now matches Angular */
+  staleKnownDifference?: boolean
+
+  /** Fields that differ in a fixture listed in known-differences.ts but are not documented there */
+  undocumentedFields?: string[]
 
   /** Oxc compiler output */
   oxcOutput?: FixtureCompilerOutput
@@ -331,6 +347,9 @@ export interface CategoryStats {
   /** Number of skipped fixtures */
   skipped: number
 
+  /** Number of fixtures with documented known differences */
+  knownDifferences: number
+
   /** Pass rate as percentage */
   passRate: number
 }
@@ -361,6 +380,9 @@ export interface FixtureReport {
 
     /** Fixtures that were skipped */
     skipped: number
+
+    /** Fixtures that differ from Angular only in documented ways */
+    knownDifferences: number
 
     /** Overall pass rate matched / (total - skipped) */
     passRate: number

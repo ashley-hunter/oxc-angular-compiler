@@ -4,6 +4,7 @@
 //!
 //! Ported from Angular's `i18n/i18n_parser.ts`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -37,6 +38,9 @@ pub struct I18nVisitorContext {
     pub placeholder_to_message: FxHashMap<String, Message>,
     /// Source file for span conversion.
     pub source_file: Arc<ParseSourceFile>,
+    /// Full name (`:svg:svg`) of the element whose children are being visited, from which
+    /// child elements inherit their namespace.
+    pub parent_element: Option<String>,
 }
 
 impl I18nVisitorContext {
@@ -48,6 +52,7 @@ impl I18nVisitorContext {
             placeholders: FxHashMap::default(),
             placeholder_to_message: FxHashMap::default(),
             source_file,
+            parent_element: None,
         }
     }
 }
@@ -76,9 +81,14 @@ impl I18nMessageFactory {
     }
 
     /// Converts HTML nodes to an i18n Message.
+    ///
+    /// `parent_element` is the full name (such as `:svg:text`) of the element whose children
+    /// these nodes are, from which child elements inherit their namespace.
+    #[expect(clippy::too_many_arguments)]
     pub fn create_message(
         &self,
         nodes: &[HtmlNode<'_>],
+        parent_element: Option<&str>,
         meaning: Option<&str>,
         description: Option<&str>,
         custom_id: Option<&str>,
@@ -86,6 +96,7 @@ impl I18nMessageFactory {
         source_file: Arc<ParseSourceFile>,
     ) -> Message {
         let mut context = I18nVisitorContext::new(source_file);
+        context.parent_element = parent_element.map(str::to_string);
         let visit_fn = visit_node_fn.unwrap_or(noop_visit_node);
 
         // Check if this is a single ICU expression
@@ -100,6 +111,53 @@ impl I18nMessageFactory {
             meaning.unwrap_or("").to_string(),
             description.unwrap_or("").to_string(),
             custom_id.unwrap_or("").to_string(),
+        )
+    }
+
+    /// Converts a single attribute to an i18n Message.
+    ///
+    /// Equivalent to Angular's `createI18nMessage([attr], ...)`, without having to wrap the
+    /// attribute in an `HtmlNode`. Metadata (meaning, description, id) is left empty because
+    /// callers only need the message text.
+    pub fn create_attribute_message(
+        &self,
+        attribute: &HtmlAttribute<'_>,
+        source_file: Arc<ParseSourceFile>,
+    ) -> Message {
+        let mut context = I18nVisitorContext::new(source_file);
+        let nodes = self.visit_attribute(attribute, &mut context).into_iter().collect();
+        Message::new(
+            nodes,
+            context.placeholders,
+            context.placeholder_to_message,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
+    /// Converts a single ICU expansion to an i18n Message.
+    ///
+    /// Equivalent to Angular's `createI18nMessage([expansion], ...)`: the message consists of
+    /// the ICU itself, with `VAR_*` and interpolation placeholders registered inside it.
+    pub fn create_icu_message(
+        &self,
+        expansion: &HtmlExpansion<'_>,
+        parent_element: Option<&str>,
+        source_file: Arc<ParseSourceFile>,
+    ) -> Message {
+        let mut context = I18nVisitorContext::new(source_file);
+        context.parent_element = parent_element.map(str::to_string);
+        context.is_icu = true;
+        let nodes =
+            self.visit_expansion(expansion, &mut context, noop_visit_node).into_iter().collect();
+        Message::new(
+            nodes,
+            context.placeholders,
+            context.placeholder_to_message,
+            String::new(),
+            String::new(),
+            String::new(),
         )
     }
 
@@ -145,12 +203,17 @@ impl I18nMessageFactory {
 
     /// Visits a text node and extracts interpolations.
     fn visit_text(&self, text: &HtmlText<'_>, context: &mut I18nVisitorContext) -> Option<Node> {
-        let value = text.value.as_str();
-
-        // Skip empty text unless configured to retain
-        if value.trim().is_empty() && !self.retain_empty_tokens {
-            return None;
+        // Angular: `text.tokens.length === 1 ? new Text(text.value) : _visitTextWithInterpolation`.
+        // Building from tokens keeps entity tokens as decoded, e.g. `&ngsp;` as U+E500, which
+        // whitespace processing only replaces in plain text tokens.
+        if text.tokens.len() > 1 {
+            return Some(self.visit_text_with_interpolation_tokens(
+                &text.tokens,
+                text.span,
+                context,
+            ));
         }
+        let value = text.value.as_str();
 
         // Check if text contains interpolations
         if value.contains("{{") && value.contains("}}") {
@@ -398,8 +461,8 @@ impl I18nMessageFactory {
             }
         }
 
-        // Return result based on what we found
-        if has_interpolation && nodes.len() > 1 {
+        // Angular: a Container whenever there is an interpolation, otherwise the single node.
+        if has_interpolation {
             Node::Container(Container::new(nodes, overall_span))
         } else if nodes.len() == 1 {
             nodes
@@ -545,7 +608,9 @@ impl I18nMessageFactory {
         context: &mut I18nVisitorContext,
         visit_fn: VisitNodeFn,
     ) -> Option<Node> {
-        let tag_name = element.name.as_str();
+        // Angular names placeholders from the element's full name (`:svg:circle`).
+        let full_name = element_full_name(element.name.as_str(), context.parent_element.as_deref());
+        let tag_name: &str = &full_name;
         let is_void = is_void_element(tag_name);
 
         // Convert element attributes to an IndexMap for placeholder registry (ordered for consistent serialization)
@@ -561,6 +626,11 @@ impl I18nMessageFactory {
             }
         }
 
+        // Visit children first: Angular names nested tags before their parent.
+        let parent = context.parent_element.replace(full_name.to_string());
+        let children = self.visit_all(&element.children, context, visit_fn);
+        context.parent_element = parent;
+
         // Generate placeholder names for the tag
         let start_name =
             context.placeholder_registry.get_start_tag_placeholder_name(tag_name, &attrs, is_void);
@@ -569,9 +639,6 @@ impl I18nMessageFactory {
         } else {
             context.placeholder_registry.get_close_tag_placeholder_name(tag_name)
         };
-
-        // Visit children
-        let children = self.visit_all(&element.children, context, visit_fn);
 
         let source_span = ParseSourceSpan::from_offsets(
             &context.source_file,
@@ -794,38 +861,45 @@ pub fn create_i18n_message_factory(
     I18nMessageFactory::new(retain_empty_tokens, preserve_expression_whitespace)
 }
 
+/// An element's full name with its namespace prefix: explicit (`:xhtml:div`), implicit for the
+/// tag (`:svg:svg`) or inherited from its parent (`:svg:circle`), as Angular's HTML parser
+/// computes it in `_getElementFullName`.
+pub(crate) fn element_full_name<'a>(name: &'a str, parent: Option<&str>) -> Cow<'a, str> {
+    use crate::parser::html::{get_html_tag_definition, get_ns_prefix, split_ns_name};
+    if name.starts_with(':') {
+        return Cow::Borrowed(name);
+    }
+    let mut prefix = get_html_tag_definition(name).implicit_namespace_prefix;
+    if prefix.is_none()
+        && let Some(parent) = parent.filter(|parent| parent.starts_with(':'))
+        && !get_html_tag_definition(split_ns_name(parent).1).prevent_namespace_inheritance
+    {
+        prefix = get_ns_prefix(parent);
+    }
+    match prefix {
+        Some(prefix) => Cow::Owned(format!(":{prefix}:{name}")),
+        None => Cow::Borrowed(name),
+    }
+}
+
 /// Extracts a custom placeholder name from an expression if present.
-/// Looks for comments like `// i18n(ph="CUSTOM_NAME")` in the expression.
-///
-/// Supported formats:
-/// - `/* i18n(ph="NAME") */` - block comment format
-/// - `// i18n(ph="NAME")` - line comment format (at the end)
+/// Looks for a trailing comment like `// i18n(ph="CUSTOM_NAME")` in the expression, allowing
+/// whitespace between the parts (`// i18n(ph = 'name')`), as Angular's `_CUSTOM_PH_EXP` does.
 ///
 /// Returns `Some(name)` if a custom placeholder name is found, `None` otherwise.
-fn extract_placeholder_name(expression: &str) -> Option<String> {
-    // Look for block comment format: /* i18n(ph="NAME") */
-    if let Some(start) = expression.find("i18n(ph=") {
-        let rest = &expression[start + 8..]; // Skip "i18n(ph="
-
-        // Determine quote type (single or double)
-        let (quote, rest) = if rest.starts_with('"') {
-            ('"', &rest[1..])
-        } else if rest.starts_with('\'') {
-            ('\'', &rest[1..])
-        } else {
-            return None;
-        };
-
-        // Find the closing quote
-        if let Some(end) = rest.find(quote) {
-            let name = &rest[..end];
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
-    }
-
-    None
+pub(crate) fn extract_placeholder_name(expression: &str) -> Option<String> {
+    // Angular: /\/\/[\s\S]*i18n[\s\S]*\([\s\S]*ph[\s\S]*=[\s\S]*("|')([\s\S]*?)\1[\s\S]*\)/
+    let rest = &expression[expression.find("//")?..];
+    let rest = &rest[rest.find("i18n")?..];
+    let rest = &rest[rest.find('(')?..];
+    let rest = &rest[rest.find("ph")?..];
+    let rest = &rest[rest.find('=')? + 1..];
+    let start = rest.find(['"', '\''])?;
+    let quote = rest[start..].chars().next()?;
+    let body = &rest[start + 1..];
+    let end = body.find(quote)?;
+    let name = &body[..end];
+    (!name.is_empty() && body[end + 1..].contains(')')).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -841,7 +915,7 @@ mod tests {
     fn test_create_simple_message() {
         let factory = create_i18n_message_factory(false, false);
         let source_file = Arc::new(ParseSourceFile::new("", "<test>"));
-        let message = factory.create_message(&[], None, None, None, None, source_file);
+        let message = factory.create_message(&[], None, None, None, None, None, source_file);
         assert!(message.nodes.is_empty());
     }
 
@@ -866,7 +940,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello {{name}}!", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have one Container with Text, Placeholder, Text inside
         assert_eq!(message.nodes.len(), 1);
@@ -897,7 +971,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("Hello World", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have one Text node
         assert_eq!(message.nodes.len(), 1);
@@ -918,7 +992,7 @@ mod tests {
 
         let nodes = vec![HtmlNode::Text(Box::new_in(text, &&allocator))];
         let source_file = Arc::new(ParseSourceFile::new("{{greeting}} {{name}}!", "<test>"));
-        let message = factory.create_message(&nodes, None, None, None, None, source_file);
+        let message = factory.create_message(&nodes, None, None, None, None, None, source_file);
 
         // Should have Container with multiple placeholders
         assert_eq!(message.nodes.len(), 1);

@@ -166,10 +166,9 @@ interface TransformOptions {
   jit?: boolean
   hmr?: boolean
   advancedOptimizations?: boolean
-  useDomOnlyMode?: boolean
 
-  // i18n
-  i18nUseExternalIds?: boolean
+  // i18n (note the capital N, as the N-API bindings generate it)
+  i18NUseExternalIds?: boolean
 
   // Final component style output
   minifyComponentStyles?: boolean
@@ -191,23 +190,17 @@ interface TransformOptions {
 ### Vite Plugin Options
 
 ```typescript
-interface AngularPluginOptions {
+interface PluginOptions {
   // Project configuration
   tsconfig?: string
   workspaceRoot?: string
-
-  // File filtering
-  include?: string | string[]
-  exclude?: string | string[]
+  angularVersion?: { major: number; minor: number; patch: number }
 
   // Features
-  sourcemap?: boolean
-  hmr?: boolean
   jit?: boolean
-  advancedOptimizations?: boolean
-  useDomOnlyMode?: boolean
-  zoneless?: boolean
   liveReload?: boolean
+  zoneless?: boolean
+  sourceMap?: boolean | { scripts?: boolean; vendor?: boolean }
 
   // Style processing
   inlineStylesExtension?: string
@@ -218,6 +211,12 @@ interface AngularPluginOptions {
     replace: string
     with: string
   }>
+
+  // SSR
+  ssrEntry?: string
+
+  // Template hook, applied during both the initial build and HMR
+  templateTransform?: (content: string, filePath: string) => string
 }
 ```
 
@@ -303,6 +302,10 @@ The Vite plugin consists of these sub-plugins:
 
 - External message IDs
 - File-based naming
+
+Not supported: legacy message IDs (Angular's `enableI18nLegacyMessageIdFormat`) and
+`i18nNormalizeLineEndingsInICUs`. `$localize` messages carry no legacy IDs, so translations
+keyed only by legacy IDs are not applied; translations keyed by the current message IDs are.
 
 ## Platform Support
 

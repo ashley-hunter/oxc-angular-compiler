@@ -25,10 +25,10 @@ use super::compilation::{
 use super::conversion::prefix_with_namespace;
 use crate::ast::expression::{AngularExpression, ParsedEventType};
 use crate::ast::r3::{
-    I18nIcuPlaceholder, I18nMeta, I18nNode, R3BoundAttribute, R3BoundEvent, R3BoundText, R3Content,
-    R3DeferredBlock, R3Element, R3ForLoopBlock, R3Icu, R3IcuPlaceholder, R3IfBlock,
-    R3LetDeclaration, R3Node, R3SwitchBlock, R3Template, R3TemplateAttr, R3Text, R3TextAttribute,
-    SecurityContext,
+    I18nIcuPlaceholder, I18nMessage, I18nMeta, I18nNode, R3BoundAttribute, R3BoundEvent,
+    R3BoundText, R3Content, R3DeferredBlock, R3Element, R3ForLoopBlock, R3Icu, R3IcuPlaceholder,
+    R3IfBlock, R3LetDeclaration, R3Node, R3SwitchBlock, R3Template, R3TemplateAttr, R3Text,
+    R3TextAttribute, SecurityContext,
 };
 use crate::ir::enums::{
     BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace, TemplateKind,
@@ -675,19 +675,6 @@ fn convert_binary_op(
     }
 }
 
-/// Converts an interpolation expression to an IR interpolation, storing inner expressions.
-///
-/// This is needed because interpolations contain inner expressions that need to be
-/// resolved during name resolution. By converting to IR Interpolation, the inner
-/// expressions become visible to the expression transformer.
-fn convert_interpolation_to_ir<'a>(
-    job: &mut ComponentCompilationJob<'a>,
-    expr: AngularExpression<'a>,
-) -> Box<'a, IrExpression<'a>> {
-    let allocator = job.allocator;
-    convert_interpolation_to_ir_with_i18n_placeholders(job, expr, Vec::new_in(&allocator))
-}
-
 /// Converts an Angular expression to IR, handling interpolations with i18n placeholders.
 ///
 /// This is used for bound text inside i18n blocks where the i18n metadata contains
@@ -974,6 +961,19 @@ fn get_single_icu_placeholder<'a, 'b>(
     None
 }
 
+/// Records an i18n message's metadata for later phases, keyed by its instance id, and returns
+/// that id. Metadata already recorded for the same message is kept.
+fn record_i18n_message_metadata<'a>(
+    job: &mut ComponentCompilationJob<'a>,
+    message: &I18nMessage<'a>,
+) -> u32 {
+    let allocator = job.allocator;
+    job.i18n_message_metadata
+        .entry(message.instance_id)
+        .or_insert_with(|| I18nMessageMetadata::from_message(allocator, message));
+    message.instance_id
+}
+
 /// Ingests an ICU expression node (plural, select, selectordinal).
 ///
 /// Creates IcuStartOp and IcuEndOp to bracket the ICU expression,
@@ -995,6 +995,13 @@ fn ingest_icu<'a>(job: &mut ComponentCompilationJob<'a>, view_xref: XrefId, icu:
         }
     };
 
+    // The ICU's own message (Angular: `createIcuStartOp(xref, icu.i18n, ...)`). When it is the
+    // same message as the enclosing i18n block, the ICU is the message rather than a sub-message.
+    let message = match &icu.i18n {
+        Some(I18nMeta::Message(message)) => Some(record_i18n_message_metadata(job, message)),
+        _ => None,
+    };
+
     let xref = job.allocate_xref_id();
 
     // Create IcuStartOp
@@ -1002,7 +1009,7 @@ fn ingest_icu<'a>(job: &mut ComponentCompilationJob<'a>, view_xref: XrefId, icu:
         base: CreateOpBase { source_span: Some(icu.source_span), ..Default::default() },
         xref,
         context: None, // Will be set by create_i18n_contexts phase
-        message: None, // Will be set by phases
+        message,
         icu_placeholder: Some(icu_placeholder_name),
     });
 
@@ -1242,35 +1249,7 @@ fn ingest_element<'a>(
             let instance_id = message.instance_id;
 
             // Store i18n message metadata keyed by instance_id
-            let mut legacy_ids = Vec::new_in(&allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            let metadata = I18nMessageMetadata {
-                message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                custom_id: if message.custom_id.is_empty() {
-                    None
-                } else {
-                    Some(message.custom_id.clone())
-                },
-                meaning: if message.meaning.is_empty() {
-                    None
-                } else {
-                    Some(message.meaning.clone())
-                },
-                description: if message.description.is_empty() {
-                    None
-                } else {
-                    Some(message.description.clone())
-                },
-                legacy_ids,
-                message_string: if message.message_string.is_empty() {
-                    None
-                } else {
-                    Some(message.message_string.clone())
-                },
-            };
+            let metadata = I18nMessageMetadata::from_message(allocator, message);
             job.i18n_message_metadata.insert(instance_id, metadata);
 
             // Create I18nStartOp
@@ -1411,35 +1390,7 @@ fn ingest_static_attributes_with_i18n<'a>(
 
             // Store i18n message metadata for later phases (only if not already stored)
             if !job.i18n_message_metadata.contains_key(&instance_id) {
-                let mut legacy_ids = Vec::new_in(&allocator);
-                for id in message.legacy_ids.iter() {
-                    legacy_ids.push(id.clone());
-                }
-
-                let metadata = I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                };
+                let metadata = I18nMessageMetadata::from_message(allocator, message);
                 job.i18n_message_metadata.insert(instance_id, metadata);
             }
 
@@ -1628,7 +1579,19 @@ fn ingest_binding_owned<'a>(
     // For interpolated attributes (e.g., title="{{ 'text' | i18n }}"), use
     // convert_interpolation_to_ir to properly extract pipes from the interpolation.
     let expression = if matches!(&input.value, AngularExpression::Interpolation(_)) {
-        convert_interpolation_to_ir(job, input.value)
+        // Angular: `Object.keys(asMessage(i18nMeta)?.placeholders ?? {})`, i.e. the message's
+        // unique placeholder names in first-seen order.
+        let mut i18n_placeholders: Vec<'_, Ident<'_>> = Vec::new_in(&allocator);
+        if let Some(I18nMeta::Message(message)) = &input.i18n {
+            for node in &message.nodes {
+                if let I18nNode::Placeholder(ph) = node
+                    && !i18n_placeholders.contains(&ph.name)
+                {
+                    i18n_placeholders.push(ph.name);
+                }
+            }
+        }
+        convert_interpolation_to_ir_with_i18n_placeholders(job, input.value, i18n_placeholders)
     } else {
         convert_ast_to_ir(job, input.value)
     };
@@ -1644,35 +1607,7 @@ fn ingest_binding_owned<'a>(
 
         // Store i18n message metadata for later phases (keyed by instance_id)
         if !job.i18n_message_metadata.contains_key(&instance_id) {
-            let mut legacy_ids = Vec::new_in(&allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            let metadata = I18nMessageMetadata {
-                message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                custom_id: if message.custom_id.is_empty() {
-                    None
-                } else {
-                    Some(message.custom_id.clone())
-                },
-                meaning: if message.meaning.is_empty() {
-                    None
-                } else {
-                    Some(message.meaning.clone())
-                },
-                description: if message.description.is_empty() {
-                    None
-                } else {
-                    Some(message.description.clone())
-                },
-                legacy_ids,
-                message_string: if message.message_string.is_empty() {
-                    None
-                } else {
-                    Some(message.message_string.clone())
-                },
-            };
+            let metadata = I18nMessageMetadata::from_message(allocator, message);
             job.i18n_message_metadata.insert(instance_id, metadata);
         }
 
@@ -1953,38 +1888,7 @@ fn ingest_template<'a>(
         if let Some(I18nMeta::Message(ref message)) = template.i18n {
             let instance_id = message.instance_id;
             // Clone legacy_ids using the allocator
-            let mut legacy_ids = Vec::new_in(&allocator);
-            for id in message.legacy_ids.iter() {
-                legacy_ids.push(id.clone());
-            }
-
-            Some((
-                instance_id,
-                I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                },
-            ))
+            Some((instance_id, I18nMessageMetadata::from_message(allocator, message)))
         } else {
             None
         }
@@ -2374,12 +2278,21 @@ fn ingest_content<'a>(
         None
     };
 
+    // Angular: createProjectionOp(id, content.selector, content.i18n, ...)
+    let i18n_placeholder = match &content.i18n {
+        Some(I18nMeta::Node(I18nNode::TagPlaceholder(tag))) => Some(I18nPlaceholder::new(
+            tag.start_name,
+            if tag.is_void { None } else { Some(tag.close_name) },
+        )),
+        _ => None,
+    };
+
     let op = CreateOp::Projection(ProjectionOp {
         base: CreateOpBase { source_span: Some(content.source_span), ..Default::default() },
         xref,
         slot: None,
         projection_slot_index: 0, // Will be set during projection phase
-        i18n_placeholder: None,
+        i18n_placeholder,
         selector: Some(content.selector.clone()),
         fallback,
         fallback_i18n_placeholder: None,
@@ -4437,35 +4350,7 @@ fn ingest_control_flow_insertion_point<'a, 'b>(
 
             // Store i18n message metadata for later phases (only if not already stored)
             if !job.i18n_message_metadata.contains_key(&instance_id) {
-                let mut legacy_ids = Vec::new_in(&allocator);
-                for id in message.legacy_ids.iter() {
-                    legacy_ids.push(id.clone());
-                }
-
-                let metadata = I18nMessageMetadata {
-                    message_id: if message.id.is_empty() { None } else { Some(message.id.clone()) },
-                    custom_id: if message.custom_id.is_empty() {
-                        None
-                    } else {
-                        Some(message.custom_id.clone())
-                    },
-                    meaning: if message.meaning.is_empty() {
-                        None
-                    } else {
-                        Some(message.meaning.clone())
-                    },
-                    description: if message.description.is_empty() {
-                        None
-                    } else {
-                        Some(message.description.clone())
-                    },
-                    legacy_ids,
-                    message_string: if message.message_string.is_empty() {
-                        None
-                    } else {
-                        Some(message.message_string.clone())
-                    },
-                };
+                let metadata = I18nMessageMetadata::from_message(allocator, message);
                 job.i18n_message_metadata.insert(instance_id, metadata);
             }
 
@@ -4597,6 +4482,7 @@ mod tests {
             id: Ident::from(""),
             legacy_ids: Vec::new_in(&&allocator),
             message_string: Ident::from(""),
+            associated_message_id: Ident::from(""),
         });
 
         let result = convert_i18n_meta_to_placeholder(

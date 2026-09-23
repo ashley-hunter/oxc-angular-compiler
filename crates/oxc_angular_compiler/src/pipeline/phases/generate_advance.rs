@@ -13,7 +13,7 @@ use oxc_diagnostics::OxcDiagnostic;
 use rustc_hash::FxHashMap;
 
 use crate::ir::expression::IrExpression;
-use crate::ir::ops::{AdvanceOp, CreateOp, SlotId, UpdateOp, UpdateOpBase, XrefId};
+use crate::ir::ops::{AdvanceOp, CreateOp, I18nSlotHandle, SlotId, UpdateOp, UpdateOpBase, XrefId};
 use crate::output::ast::{OutputExpression, OutputStatement};
 use crate::pipeline::compilation::ComponentCompilationJob;
 
@@ -58,6 +58,12 @@ fn build_slot_map<'a>(create_ops: &crate::ir::list::CreateOpList<'a>) -> FxHashM
             CreateOp::DeclareLet(let_op) => (Some(let_op.xref), let_op.slot),
             CreateOp::I18nStart(i18n) => (Some(i18n.xref), i18n.slot),
             CreateOp::I18n(i18n) => (Some(i18n.xref), i18n.slot),
+            // Angular maps every op that consumes a slot, including these.
+            CreateOp::ConditionalBranch(branch) => (Some(branch.xref), branch.slot),
+            CreateOp::I18nAttributes(attrs) => match attrs.handle {
+                I18nSlotHandle::Single(slot) => (Some(attrs.xref), Some(slot)),
+                I18nSlotHandle::Range(start, _) => (Some(attrs.xref), Some(start)),
+            },
             _ => (None, None),
         };
 
