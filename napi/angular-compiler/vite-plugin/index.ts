@@ -602,7 +602,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             }
 
             const decodedComponentId = decodeURIComponent(componentId)
-            const atIndex = decodedComponentId.indexOf('@')
+            const atIndex = decodedComponentId.lastIndexOf('@')
 
             // Validate component ID format: should be "filePath@ClassName"
             if (atIndex === -1) {
@@ -1023,7 +1023,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
             )
             const classNamesInFile = new Set<string>()
             for (const componentId of templateUpdateKeys) {
-              const atIdx = componentId.indexOf('@')
+              const atIdx = componentId.lastIndexOf('@')
               if (atIdx === -1) continue
               classNamesInFile.add(componentId.slice(atIdx + 1))
             }

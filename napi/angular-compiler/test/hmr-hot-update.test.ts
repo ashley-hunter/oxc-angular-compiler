@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { Plugin, ModuleNode, HmrContext } from 'vite'
-import { normalizePath, resolveConfig } from 'vite'
+import { normalizePath, parseSync, resolveConfig } from 'vite'
 import { afterAll, beforeAll, describe, it, expect, vi } from 'vitest'
 
 import { angular } from '../vite-plugin/index.js'
@@ -383,6 +383,40 @@ describe('pendingHmrUpdates race condition', () => {
     expect(bBody).toContain('BComponent')
   })
 
+  it('serves the HMR module for a component whose path contains @', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithServer(plugin)
+
+    const scopedDir = join(tempDir, 'packages', '@company', 'app')
+    mkdirSync(scopedDir, { recursive: true })
+    const scopedPath = normalizePath(join(scopedDir, 'scoped.component.ts'))
+    const source = `
+      import { Component } from '@angular/core';
+      @Component({ selector: 'app-scoped', template: '<p>S</p>' })
+      export class ScopedComponent {}
+    `
+    writeFileSync(scopedPath, source)
+
+    if (!plugin.transform || typeof plugin.transform === 'function') {
+      throw new Error('Expected plugin transform handler')
+    }
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      source,
+      scopedPath,
+    )
+
+    writeFileSync(scopedPath, source.replace('<p>S</p>', '<p>S!</p>'))
+    const ctx = createMockHmrContext(scopedPath, [{ id: scopedPath }], mockServer)
+    await callHandleHotUpdate(plugin, ctx)
+
+    const middleware = (mockServer.middlewares.use as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    const body = await invokeAngularMiddleware(middleware, `${scopedPath}@ScopedComponent`)
+
+    expect(body).toContain('function ScopedComponent_UpdateMetadata(ScopedComponent')
+    expect(parseSync('hmr.js', body).errors).toEqual([])
+  })
+
   it("dispatches HMR for both components when only one component's inline styles change", async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithServer(plugin)
@@ -525,6 +559,55 @@ describe('pendingHmrUpdates race condition', () => {
     // A second request must also return '' (pending slot consumed first time).
     const dropBody2 = await invokeAngularMiddleware(middleware, `${stalePath}@DropComponent`)
     expect(dropBody2).toBe('')
+  })
+
+  it('prunes only the removed class when the file path contains @', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithServer(plugin)
+
+    const scopedDir = join(tempDir, 'packages', '@company', 'prune')
+    mkdirSync(scopedDir, { recursive: true })
+    const stalePath = normalizePath(join(scopedDir, 'stale.component.ts'))
+    const originalSource = `
+      import { Component } from '@angular/core';
+      @Component({ selector: 'app-keep', template: '<keep/>' })
+      export class KeepComponent {}
+      @Component({ selector: 'app-drop', template: '<drop/>' })
+      export class DropComponent {}
+    `
+    writeFileSync(stalePath, originalSource)
+
+    if (!plugin.transform || typeof plugin.transform === 'function') {
+      throw new Error('Expected plugin transform handler')
+    }
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      originalSource,
+      stalePath,
+    )
+
+    writeFileSync(stalePath, originalSource.replace('<keep/>', '<keep-edited/>'))
+    const ctx = createMockHmrContext(stalePath, [{ id: stalePath }], mockServer)
+    await callHandleHotUpdate(plugin, ctx)
+
+    const reducedSource = `
+      import { Component } from '@angular/core';
+      @Component({ selector: 'app-keep', template: '<keep-edited/>' })
+      export class KeepComponent {}
+    `
+    writeFileSync(stalePath, reducedSource)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      reducedSource,
+      stalePath,
+    )
+
+    const middleware = (mockServer.middlewares.use as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+
+    expect(await invokeAngularMiddleware(middleware, `${stalePath}@DropComponent`)).toBe('')
+    const keepBody = await invokeAngularMiddleware(middleware, `${stalePath}@KeepComponent`)
+    expect(keepBody).toContain('function KeepComponent_UpdateMetadata(KeepComponent')
+    expect(keepBody).toContain('keep-edited')
   })
 
   it('triggers full reload when a multi-component .ts changes outside template/styles', async () => {
