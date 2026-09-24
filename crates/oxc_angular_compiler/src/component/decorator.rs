@@ -22,6 +22,7 @@ use crate::directive::{
     extract_output_metadata_in, merge_by_class_property, parse_decorator_io,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
+use crate::util::is_metadata_property;
 
 /// Extract component metadata from a class with decorators.
 ///
@@ -81,7 +82,9 @@ pub fn extract_component_metadata<'a>(
 
     // Parse each property in the config object
     for prop in &config_obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop
+            && is_metadata_property(prop)
+        {
             let key_name = get_property_key_name(&prop.key, consts)?;
 
             match key_name.as_str() {
@@ -493,7 +496,9 @@ fn extract_host_metadata<'a>(
     };
 
     for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop
+            && is_metadata_property(prop)
+        {
             let Some(key_name) = get_property_key_name(&prop.key, consts) else {
                 continue;
             };
@@ -595,7 +600,9 @@ fn extract_single_host_directive<'a>(
             let mut is_forward_reference = false;
 
             for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+                if let ObjectPropertyKind::ObjectProperty(prop) = prop
+                    && is_metadata_property(prop)
+                {
                     let Some(key_name) = get_property_key_name(&prop.key, consts) else {
                         continue;
                     };

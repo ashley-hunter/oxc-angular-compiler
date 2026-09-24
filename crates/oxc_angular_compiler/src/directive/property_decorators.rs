@@ -23,6 +23,7 @@ use super::evaluator::{Evaluator, Value};
 use super::metadata::{QueryPredicate, R3InputMetadata, R3QueryMetadata};
 use crate::output::ast::OutputExpression;
 use crate::output::oxc_converter::convert_oxc_expression;
+use crate::util::is_metadata_property;
 
 // ============================================================================
 // Helper Functions
@@ -372,7 +373,9 @@ fn parse_literal_input_config<'a>(
             let mut config = InputConfig::default();
 
             for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+                if let ObjectPropertyKind::ObjectProperty(prop) = prop
+                    && is_metadata_property(prop)
+                {
                     let Some(key_name) = get_property_key_name(&prop.key) else {
                         continue;
                     };
@@ -463,6 +466,7 @@ fn options_alias<'a>(options: Option<&Argument<'a>>) -> Option<Ident<'a>> {
     let mut alias = None;
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop
+            && is_metadata_property(prop)
             && get_property_key_name(&prop.key).is_some_and(|key| key == "alias")
         {
             alias = extract_string_value(&prop.value);
@@ -948,7 +952,9 @@ fn parse_query_config<'a>(
     if let Some(second_arg) = call.arguments.get(1) {
         if let Argument::ObjectExpression(obj) = second_arg {
             for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+                if let ObjectPropertyKind::ObjectProperty(prop) = prop
+                    && is_metadata_property(prop)
+                {
                     let Some(key_name) = get_property_key_name(&prop.key) else {
                         continue;
                     };
@@ -1071,7 +1077,9 @@ fn try_parse_signal_query<'a>(
     if let Some(second_arg) = call_expr.arguments.get(1) {
         if let Argument::ObjectExpression(obj) = second_arg {
             for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+                if let ObjectPropertyKind::ObjectProperty(prop) = prop
+                    && is_metadata_property(prop)
+                {
                     let Some(key_name) = get_property_key_name(&prop.key) else {
                         continue;
                     };
