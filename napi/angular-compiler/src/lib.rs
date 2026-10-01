@@ -607,7 +607,6 @@ pub fn compile_for_hmr_sync(
                 styles: encapsulated_styles.as_deref(),
                 declarations_js,
                 consts_js: output.consts_js.as_deref(),
-                include_full_metadata: false,
             });
 
             HmrCompileResult { hmr_module, component_id, template_js, errors: vec![] }

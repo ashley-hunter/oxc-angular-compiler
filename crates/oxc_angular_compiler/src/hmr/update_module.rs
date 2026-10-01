@@ -29,9 +29,6 @@ pub struct HmrUpdateModuleOptions<'a> {
     /// This must be included to ensure the template function's constant references
     /// match the component definition's consts array.
     pub consts_js: Option<&'a str>,
-
-    /// Whether to include full component metadata.
-    pub include_full_metadata: bool,
 }
 
 /// Generate an HMR update module for a component.

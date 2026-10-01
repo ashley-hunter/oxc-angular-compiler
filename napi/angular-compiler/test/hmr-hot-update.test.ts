@@ -417,6 +417,42 @@ describe('pendingHmrUpdates race condition', () => {
     expect(parseSync('hmr.js', body).errors).toEqual([])
   })
 
+  it('serves the HMR module for a component whose path contains %', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithServer(plugin)
+
+    const percentDir = join(tempDir, 'packages', '100%', 'app')
+    mkdirSync(percentDir, { recursive: true })
+    const percentPath = join(percentDir, 'percent.component.ts')
+    const source = `
+      import { Component } from '@angular/core';
+      @Component({ selector: 'app-pct', template: '<p>P</p>' })
+      export class PercentComponent {}
+    `
+    writeFileSync(percentPath, source)
+
+    if (!plugin.transform || typeof plugin.transform === 'function') {
+      throw new Error('Expected plugin transform handler')
+    }
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      source,
+      percentPath,
+    )
+
+    writeFileSync(percentPath, source.replace('<p>P</p>', '<p>P!</p>'))
+    const ctx = createMockHmrContext(percentPath, [{ id: percentPath }], mockServer)
+    await callHandleHotUpdate(plugin, ctx)
+
+    // The middleware must decode the `c` param exactly once: a literal `%` in
+    // the path survives one decode but turns into an escape sequence under two.
+    const middleware = (mockServer.middlewares.use as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    const body = await invokeAngularMiddleware(middleware, `${percentPath}@PercentComponent`)
+
+    expect(body).toContain('function PercentComponent_UpdateMetadata(PercentComponent')
+    expect(parseSync('hmr.js', body).errors).toEqual([])
+  })
+
   it("dispatches HMR for both components when only one component's inline styles change", async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithServer(plugin)
