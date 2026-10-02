@@ -3542,6 +3542,7 @@ pub fn compile_host_bindings_for_linker(
     component_name: &str,
     selector: Option<&str>,
     pool_starting_index: u32,
+    core_namespace: &str,
 ) -> Option<LinkerHostBindingOutput> {
     let allocator = Allocator::default();
     let result = compile_host_bindings_from_input(
@@ -3553,7 +3554,7 @@ pub fn compile_host_bindings_for_linker(
         None, // Linker always targets latest Angular version
     )?;
 
-    let emitter = JsEmitter::new();
+    let emitter = JsEmitter::with_core_namespace(core_namespace);
 
     let host_vars = result.host_vars.unwrap_or(0);
 
@@ -3613,6 +3614,7 @@ pub fn compile_template_for_linker<'a>(
     component_name: &str,
     file_path: &str,
     preserve_whitespaces: bool,
+    core_namespace: &str,
 ) -> Result<LinkerTemplateOutput, std::vec::Vec<OxcDiagnostic>> {
     use crate::pipeline::ingest::{IngestOptions, ingest_component_with_options};
     use oxc_allocator::FromIn;
@@ -3689,7 +3691,7 @@ pub fn compile_template_for_linker<'a>(
     let decls = job.root.decl_count.unwrap_or(0);
     let vars = job.root.vars.unwrap_or(0);
 
-    let emitter = JsEmitter::new();
+    let emitter = JsEmitter::with_core_namespace(core_namespace);
 
     // Emit consts array as JS expression
     let consts_js = if !job.consts.is_empty() {

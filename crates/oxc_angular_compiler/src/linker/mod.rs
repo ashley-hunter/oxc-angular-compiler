@@ -1394,6 +1394,7 @@ fn link_directive(
             type_name,
             selector,
             0, // directives have no template, so pool starts at 0
+            ns,
         ) {
             if host_output.host_vars > 0 {
                 parts.push(format!("hostVars: {}", host_output.host_vars));
@@ -1706,6 +1707,7 @@ fn link_component(
         type_name,
         filename,
         preserve_whitespaces,
+        ns,
     )
     .ok()?;
 
@@ -1753,6 +1755,7 @@ fn link_component(
             type_name,
             selector,
             template_output.next_pool_index,
+            ns,
         ) {
             if host_output.host_vars > 0 {
                 parts.push(format!("hostVars: {}", host_output.host_vars));
@@ -2490,6 +2493,26 @@ MyComponent.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "
             "Should contain parsed selectors, got:\n{}",
             result.code
         );
+    }
+
+    /// Minifiers rename the `@angular/core` namespace import, so generated code must use
+    /// the file's namespace rather than `i0`.
+    #[test]
+    fn test_link_component_uses_minified_namespace() {
+        let allocator = Allocator::default();
+        let code = r#"
+import * as e from "@angular/core";
+class C {
+}
+class D {
+}
+D.ɵdir = e.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "20.0.0", ngImport: e, type: D, selector: "[d]", host: { properties: { "class.on": "on" } } });
+C.ɵcmp = e.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "20.0.0", ngImport: e, type: C, selector: "c", host: { properties: { "class.on": "on" }, listeners: { "click": "go()" } }, template: "<div (click)=\"go()\" [title]=\"t\">{{ a | uppercase }} {{ [a, b] }}</div>@if (a) {<span i18n>Hi {{ a }}</span>} @defer {<b></b>}" });
+"#;
+        let result = link(&allocator, code, "test.mjs");
+        assert!(result.linked, "Component should be linked");
+        assert!(result.code.contains("e.\u{0275}\u{0275}elementStart"), "got:\n{}", result.code);
+        assert!(!result.code.contains("i0"), "Should not reference i0, got:\n{}", result.code);
     }
 
     #[test]

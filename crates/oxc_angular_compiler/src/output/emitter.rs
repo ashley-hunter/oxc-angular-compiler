@@ -368,12 +368,20 @@ fn get_source_span(expr: &OutputExpression<'_>) -> Option<Span> {
 pub struct JsEmitter {
     /// Whether to escape $ in strings.
     escape_dollar_in_strings: bool,
+    /// Name to print instead of `i0` for the `@angular/core` namespace.
+    core_namespace: Option<String>,
 }
 
 impl JsEmitter {
     /// Create a new JavaScript emitter.
     pub fn new() -> Self {
-        Self { escape_dollar_in_strings: false }
+        Self { escape_dollar_in_strings: false, core_namespace: None }
+    }
+
+    /// Print `ns` instead of `i0` for the `@angular/core` namespace. The linker needs this
+    /// because a minified library may import `@angular/core` under any name.
+    pub fn with_core_namespace(ns: &str) -> Self {
+        Self { escape_dollar_in_strings: false, core_namespace: Some(ns.to_string()) }
     }
 
     /// Emit an expression to a string.
@@ -642,7 +650,11 @@ impl JsEmitter {
             OutputExpression::ReadVar(e) => {
                 // Variable references are key for source mapping - map the variable name
                 let var_span = e.source_span.and_then(|span| ctx.span_to_source_span(span));
-                ctx.print_with_span(&e.name, var_span);
+                let name = match &self.core_namespace {
+                    Some(ns) if e.name == "i0" => ns.as_str(),
+                    _ => e.name.as_str(),
+                };
+                ctx.print_with_span(name, var_span);
             }
             OutputExpression::ReadProp(e) => {
                 self.visit_expression(&e.receiver, ctx);
