@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import { linkAngularPackageSync } from '../index.js'
+import { angularLinkerPlugin } from '../vite-plugin/angular-linker-plugin.js'
 
 /**
  * Minimal Angular partial declaration fixtures that simulate the structure
@@ -124,6 +125,20 @@ describe('Angular linker - chunk file linking', () => {
 
     expect(result.linked).toBe(true)
     expect(result.code).not.toContain('\u0275\u0275ngDeclare')
+  })
+
+  it('should link through the Vite plugin when \u0275 is written as an escape', async () => {
+    // esbuild's default `--charset=ascii` minify writes `ɵ` in identifiers as `\u0275`.
+    const code = PIPE_CHUNK.replaceAll('\u0275', '\\u0275')
+    const plugin = angularLinkerPlugin() as any
+    const result = await plugin.transform.handler.call(
+      {},
+      code,
+      'node_modules/@angular/common/fesm2022/_pipes-chunk.mjs',
+    )
+
+    expect(result?.code).toContain('definePipe')
+    expect(result.code).not.toContain('ngDeclare')
   })
 
   it('should return linked: false for files without declarations', () => {

@@ -19,7 +19,8 @@ import type { Plugin } from 'vite'
  * 2. During Vite's transform pipeline for non-optimized node_modules files
  */
 
-const LINKER_DECLARATION_PREFIX = '\u0275\u0275ngDeclare'
+// No `ɵɵ` prefix: minifiers may write it as `\u0275` escapes.
+const LINKER_DECLARATION_PREFIX = 'ngDeclare'
 
 // Skip these packages - they don't need linking
 const SKIP_REGEX = /[\\/]@angular[\\/](?:compiler|core)[\\/]/

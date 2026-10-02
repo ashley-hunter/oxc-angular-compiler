@@ -82,8 +82,9 @@ pub struct LinkResult {
 /// Scans the code for `ɵɵngDeclare*` calls and replaces them with their
 /// fully compiled equivalents.
 pub fn link(allocator: &Allocator, code: &str, filename: &str) -> LinkResult {
-    // Quick check: if no declarations, return early
-    if !code.contains("\u{0275}\u{0275}ngDeclare") {
+    // Quick check: if no declarations, return early. Match without the `ɵɵ` prefix because
+    // minifiers may write it as `\u0275` escapes; the AST below has them decoded.
+    if !code.contains("ngDeclare") {
         return LinkResult { code: code.to_string(), map: None, linked: false };
     }
 
@@ -4052,5 +4053,23 @@ MyDir.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "20.0.0
             "Flags should be 1 (DESCENDANTS only, no EMIT_DISTINCT_CHANGES_ONLY), got:\n{}",
             result.code
         );
+    }
+
+    #[test]
+    fn test_link_unicode_escaped_identifiers() {
+        // esbuild's default `--charset=ascii` writes `ɵ` in identifiers as `\u0275`.
+        let utf8 = r#"
+import * as e from "@angular/core";
+class Hi { static ɵfac = e.ɵɵngDeclareFactory({ minVersion: "12.0.0", version: "21.0.0", ngImport: e, type: Hi, deps: [], target: e.ɵɵFactoryTarget.Directive }); static ɵdir = e.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", type: Hi, isStandalone: true, selector: "[libHi]", inputs: { on: "on" }, host: { properties: { "class.on": "on" } }, ngImport: e }); }
+e.ɵɵngDeclareClassMetadata({ minVersion: "12.0.0", version: "21.0.0", ngImport: e, type: Hi, decorators: [{ type: Directive, args: [{ selector: "[libHi]" }] }] });
+class Greet { static ɵcmp = e.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "21.0.0", type: Greet, isStandalone: true, selector: "lib-greet", ngImport: e, template: '<p [title]="name">Hello {{ name }}</p>' }); }
+"#;
+        let escaped = utf8.replace('\u{0275}', "\\u0275");
+        let allocator = Allocator::default();
+        let expected = link(&allocator, utf8, "test.mjs");
+        let result = link(&allocator, &escaped, "test.mjs");
+        assert!(expected.linked);
+        assert!(result.linked, "Escaped input should be linked, got:\n{}", result.code);
+        assert_eq!(result.code.replace("\\u0275", "\u{0275}"), expected.code);
     }
 }
