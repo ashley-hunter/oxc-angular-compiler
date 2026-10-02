@@ -121,3 +121,45 @@ MyControl.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21
     let result = link(&allocator, code, "test.mjs");
     insta::assert_snapshot!(result.code);
 }
+
+/// Helper to build a ɵɵngDeclareComponent source with a given `styles` array.
+fn make_component_source_with_styles(styles: &str) -> String {
+    format!(
+        r#"import * as i0 from "@angular/core";
+export class MyCmp {{}}
+MyCmp.ɵcmp = i0.ɵɵngDeclareComponent({{ minVersion: "14.0.0", version: "17.0.0", type: MyCmp, selector: "my-cmp", template: "<div></div>", styles: [{styles}] }});"#
+    )
+}
+
+#[test]
+fn test_link_styles_template_literal_matches_string_literal() {
+    for (template_styles, string_styles) in [
+        ("`.a { color: red }`", r#"".a { color: red }""#),
+        (r#"`.a { content: "\\f101\n" }`"#, r#"".a { content: \"\\f101\n\" }""#),
+    ] {
+        let allocator = Allocator::default();
+        let template =
+            link(&allocator, &make_component_source_with_styles(template_styles), "test.mjs");
+        let string =
+            link(&allocator, &make_component_source_with_styles(string_styles), "test.mjs");
+        assert!(template.code.contains("styles: ["), "styles dropped:\n{}", template.code);
+        assert_eq!(template.code, string.code);
+    }
+}
+
+#[test]
+fn test_link_host_bindings_template_literal_matches_string_literal() {
+    let make = |prop: &str, listener: &str| {
+        format!(
+            r#"import * as i0 from "@angular/core";
+export class MyDir {{}}
+MyDir.ɵdir = i0.ɵɵngDeclareDirective({{ minVersion: "14.0.0", version: "17.0.0", type: MyDir, selector: "[myDir]", host: {{ properties: {{ "id": {prop} }}, listeners: {{ "click": {listener} }} }} }});"#
+        )
+    };
+    let allocator = Allocator::default();
+    let template = link(&allocator, &make("`this.dirId`", "`onClick($event)`"), "test.mjs");
+    let string = link(&allocator, &make(r#""this.dirId""#, r#""onClick($event)""#), "test.mjs");
+    assert!(template.code.contains("dirId"), "host property dropped:\n{}", template.code);
+    assert!(template.code.contains("onClick"), "host listener dropped:\n{}", template.code);
+    assert_eq!(template.code, string.code);
+}

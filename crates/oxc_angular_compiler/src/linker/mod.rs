@@ -417,29 +417,28 @@ fn get_metadata_object<'a>(call: &'a CallExpression<'a>) -> Option<&'a ObjectExp
     })
 }
 
-/// Extract a string property value from an object expression.
+/// Extract a static string from an expression.
 /// Handles both regular string literals (`"..."`) and template literals with no expressions (`` `...` ``).
-fn get_string_property<'a>(obj: &'a ObjectExpression<'a>, name: &str) -> Option<&'a str> {
-    for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop
-            && matches!(&prop.key, PropertyKey::StaticIdentifier(ident) if ident.name == name)
-        {
-            match &prop.value {
-                Expression::StringLiteral(lit) => {
-                    return Some(lit.value.as_str());
-                }
-                Expression::TemplateLiteral(tl) if tl.expressions.is_empty() => {
-                    if let Some(quasi) = tl.quasis.first()
-                        && let Some(cooked) = &quasi.value.cooked
-                    {
-                        return Some(cooked.as_str());
-                    }
-                }
-                _ => {}
-            }
+fn as_static_string<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
+    match expr {
+        Expression::StringLiteral(lit) => Some(lit.value.as_str()),
+        Expression::TemplateLiteral(tl) if tl.expressions.is_empty() => {
+            tl.quasis.first()?.value.cooked.as_deref()
         }
+        _ => None,
     }
-    None
+}
+
+/// Extract a string property value from an object expression.
+fn get_string_property<'a>(obj: &'a ObjectExpression<'a>, name: &str) -> Option<&'a str> {
+    obj.properties.iter().find_map(|prop| match prop {
+        ObjectPropertyKind::ObjectProperty(prop)
+            if matches!(&prop.key, PropertyKey::StaticIdentifier(ident) if ident.name == name) =>
+        {
+            as_static_string(&prop.value)
+        }
+        _ => None,
+    })
 }
 
 /// Extract the source text of a property value from an object expression.
@@ -1557,11 +1556,8 @@ fn extract_host_metadata_input(
                 PropertyKey::StringLiteral(s) => s.value.to_string(),
                 _ => continue,
             };
-            let value = match &p.value {
-                Expression::StringLiteral(s) => s.value.to_string(),
-                _ => continue,
-            };
-            input.properties.push((key, value));
+            let Some(value) = as_static_string(&p.value) else { continue };
+            input.properties.push((key, value.to_string()));
         }
     }
 
@@ -1573,11 +1569,8 @@ fn extract_host_metadata_input(
                 PropertyKey::StringLiteral(s) => s.value.to_string(),
                 _ => continue,
             };
-            let value = match &p.value {
-                Expression::StringLiteral(s) => s.value.to_string(),
-                _ => continue,
-            };
-            input.listeners.push((key, value));
+            let Some(value) = as_static_string(&p.value) else { continue };
+            input.listeners.push((key, value.to_string()));
         }
     }
 
@@ -2040,8 +2033,7 @@ fn link_component(
                 ArrayExpressionElement::SpreadElement(_) => continue,
                 _ => el.to_expression(),
             };
-            if let Expression::StringLiteral(s) = expr {
-                let style = s.value.as_str();
+            if let Some(style) = as_static_string(expr) {
                 if is_emulated {
                     let scoped =
                         crate::styles::shim_css_text(style, "_ngcontent-%COMP%", "_nghost-%COMP%");
