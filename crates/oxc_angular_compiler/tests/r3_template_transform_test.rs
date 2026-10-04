@@ -1190,6 +1190,28 @@ mod let_declarations {
         assert_eq!(result[0][0], HumanValue::from("LetDeclaration"));
         assert_eq!(result[0][1], HumanValue::from("foo"));
     }
+
+    #[test]
+    fn should_report_syntax_errors_in_the_let_declaration_value() {
+        // TS: it('should report syntax errors in the let declaration value', ...)
+        let errors = get_transform_errors("@let foo = {one: 1;");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Missing expected } at the end of the expression [{one: 1]")),
+            "Expected missing-brace error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn should_report_a_let_declaration_with_no_value() {
+        // TS: it('should report a let declaration with no value', ...)
+        let errors = get_transform_errors("@let foo =  ;");
+        assert!(
+            errors.iter().any(|e| e.contains("@let declaration value cannot be empty")),
+            "Expected empty-value error, got: {errors:?}"
+        );
+    }
 }
 
 // ============================================================================

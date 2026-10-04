@@ -547,6 +547,11 @@ impl<'a> HtmlParser<'a> {
                     self.add_to_parent(node);
                 }
             }
+            HtmlTokenType::IncompleteLet => {
+                if let Some(node) = self.parse_incomplete_let_declaration() {
+                    self.add_to_parent(node);
+                }
+            }
             HtmlTokenType::ExpansionFormStart => {
                 if let Some(node) = self.parse_expansion() {
                     self.add_to_parent(node);
@@ -1315,6 +1320,43 @@ impl<'a> HtmlParser<'a> {
             value_span,
         };
 
+        Some(HtmlNode::LetDeclaration(Box::new_in(let_decl, &self.allocator)))
+    }
+
+    /// Parses an incomplete @let declaration, reporting it and salvaging a node
+    /// when it has a name (Angular's `_consumeIncompleteLet`).
+    fn parse_incomplete_let_declaration(&mut self) -> Option<HtmlNode<'a>> {
+        let token = self.advance()?; // consume IncompleteLet
+        let (start, end) = (token.start, token.end);
+        let name = token.value().to_string();
+
+        let name_string = if name.is_empty() { String::new() } else { format!(" \"{name}\"") };
+        let err = self.make_error(
+            start,
+            format!(
+                "Incomplete @let declaration{name_string}. @let declarations must be written as `@let <name> = <value>;`"
+            ),
+        );
+        self.errors.push(err);
+
+        if name.is_empty() {
+            return None;
+        }
+
+        // The name span runs from the last occurrence of the name to the end of the token.
+        let token_text = &self.source_file.content[start as usize..end as usize];
+        let name_offset = token_text.rfind(name.as_str()).unwrap_or(0);
+        let name_start = start + u32::try_from(name_offset).unwrap_or(0);
+        let value_span = self.make_span(start, start);
+        let value = BindingParser::new(self.allocator).parse_binding("", value_span).ast;
+
+        let let_decl = HtmlLetDeclaration {
+            name: Ident::from_in(name, self.allocator),
+            value,
+            span: self.make_span(start, end),
+            name_span: self.make_span(name_start, end),
+            value_span,
+        };
         Some(HtmlNode::LetDeclaration(Box::new_in(let_decl, &self.allocator)))
     }
 

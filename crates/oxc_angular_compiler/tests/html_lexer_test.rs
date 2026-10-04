@@ -1624,6 +1624,105 @@ mod let_declarations {
         let let_start = result.tokens.iter().find(|t| t.token_type == HtmlTokenType::LetStart);
         assert_eq!(let_start.unwrap().value(), "foo");
     }
+
+    #[test]
+    fn should_parse_let_declaration_using_escaped_quotes_in_a_string() {
+        // TS: it('should parse @let declaration using escaped quotes in a string', ...)
+        let result = tokenize_and_humanize_parts(r#"@let foo = '\';\'' + "\",";"#);
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::LetStart, vec!["foo".to_string()]),
+                (HtmlTokenType::LetValue, vec![r#"'\';\'' + "\",""#.to_string()]),
+                (HtmlTokenType::LetEnd, vec![]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_parse_let_declaration_using_function_calls_in_its_value() {
+        // TS: it('should parse @let declaration using function calls in its value', ...)
+        let result = tokenize_and_humanize_parts("@let foo = fn(a, b) + fn2(c, d, e);");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::LetStart, vec!["foo".to_string()]),
+                (HtmlTokenType::LetValue, vec!["fn(a, b) + fn2(c, d, e)".to_string()]),
+                (HtmlTokenType::LetEnd, vec![]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_parse_a_let_declaration_containing_complex_expression() {
+        // TS: it('should parse a @let declaration containing complex expression', ...)
+        let result = tokenize_and_humanize_parts(
+            r#"@let foo = fn({a: 1, b: [otherFn([{c: ";"}], 321, {d: [',']})]});"#,
+        );
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::LetStart, vec!["foo".to_string()]),
+                (
+                    HtmlTokenType::LetValue,
+                    vec![r#"fn({a: 1, b: [otherFn([{c: ";"}], 321, {d: [',']})]})"#.to_string()]
+                ),
+                (HtmlTokenType::LetEnd, vec![]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_report_incomplete_let_without_equals_after_name() {
+        // No upstream spec case; Angular's _consumeLetDeclaration marks the
+        // start token INCOMPLETE_LET whenever the `=` is missing after a name.
+        let result = tokenize_and_humanize_parts("@let foo bar = 123;");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::IncompleteLet, vec!["foo".to_string()]),
+                (HtmlTokenType::Text, vec!["bar = 123;".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+
+        let result = tokenize_and_humanize_parts("@let foo");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::IncompleteLet, vec!["foo".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_report_incomplete_let_when_not_followed_by_whitespace() {
+        // No upstream spec case for EOF/punctuation after `@let`; Angular's
+        // _consumeLetDeclaration emits INCOMPLETE_LET for any non-whitespace
+        // following character, not just identifier characters.
+        let result = tokenize_and_humanize_parts("@let");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::IncompleteLet, vec!["@let".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+
+        let result = tokenize_and_humanize_parts("@let;");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::IncompleteLet, vec!["@let".to_string()]),
+                (HtmlTokenType::Text, vec![";".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
 }
 
 // ============================================================================

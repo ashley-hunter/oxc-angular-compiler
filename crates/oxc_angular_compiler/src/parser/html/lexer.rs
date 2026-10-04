@@ -1000,30 +1000,28 @@ impl<'a> HtmlLexer<'a> {
 
         // Check for @let declarations (only if tokenize_let is enabled)
         if self.tokenize_let && self.peek() == '@' && self.starts_with("@let") {
-            // Make sure "@let" is followed by whitespace (not "@letter")
-            let next_char_index = self.index as usize + 4;
-            if next_char_index < self.input.len() {
-                let next_char = self.input[next_char_index..].chars().next().unwrap_or(chars::EOF);
-                if chars::is_whitespace(next_char) {
-                    self.scan_let_start(start);
-                    return;
+            // Angular requires at least one whitespace after `@let`. Any other
+            // following character (including EOF) produces INCOMPLETE_LET.
+            let next_char = self
+                .input
+                .get(self.index as usize + 4..)
+                .and_then(|s| s.chars().next())
+                .unwrap_or(chars::EOF);
+            if chars::is_whitespace(next_char) {
+                self.scan_let_start(start);
+            } else {
+                // Consume "@let"
+                for _ in 0..4 {
+                    self.advance();
                 }
-                // @let not followed by whitespace - emit INCOMPLETE_LET and continue
-                // This handles cases like "@letFoo" where @let is immediately followed by identifier
-                if chars::is_identifier_part(next_char) {
-                    // Consume "@let"
-                    for _ in 0..4 {
-                        self.advance();
-                    }
-                    self.tokens.push(HtmlToken::with_part(
-                        HtmlTokenType::IncompleteLet,
-                        "@let",
-                        start,
-                        self.index,
-                    ));
-                    return;
-                }
+                self.tokens.push(HtmlToken::with_part(
+                    HtmlTokenType::IncompleteLet,
+                    "@let",
+                    start,
+                    self.index,
+                ));
             }
+            return;
         }
 
         // Check for block start (@if, @for, etc.)
@@ -1281,7 +1279,15 @@ impl<'a> HtmlLexer<'a> {
         if self.peek() == '=' {
             self.advance();
         } else {
-            // No equals sign - incomplete
+            // No equals sign - emit INCOMPLETE_LET covering "@let <name>",
+            // like Angular (upstream marks the same start token incomplete,
+            // so its span ends at the name, not at the skipped whitespace).
+            self.tokens.push(HtmlToken::with_part(
+                HtmlTokenType::IncompleteLet,
+                &var_name,
+                start,
+                name_end,
+            ));
             return;
         }
 
@@ -1364,12 +1370,13 @@ impl<'a> HtmlLexer<'a> {
             self.advance();
             self.tokens.push(HtmlToken::empty(HtmlTokenType::LetEnd, semi_start, self.index));
         } else {
-            // Incomplete declaration: INCOMPLETE_LET, LET_VALUE
+            // Incomplete declaration: INCOMPLETE_LET, LET_VALUE. Like Angular, the
+            // INCOMPLETE_LET span runs to the end of the consumed value.
             self.tokens.push(HtmlToken::with_part(
                 HtmlTokenType::IncompleteLet,
                 &var_name,
                 start,
-                name_end,
+                value_end,
             ));
             self.tokens.push(HtmlToken::with_part(
                 HtmlTokenType::LetValue,
