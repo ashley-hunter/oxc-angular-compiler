@@ -750,7 +750,7 @@ fn find_last_import_end(program_body: &[Statement<'_>]) -> Option<usize> {
 }
 
 /// Build the `ɵsetClassMetadata(...)` declaration string for a non-`@Component`
-/// decorated class (`@Directive`/`@Pipe`/`@Injectable`/`@NgModule`).
+/// decorated class (`@Directive`/`@Pipe`/`@Injectable`/`@NgModule`/`@Service`).
 ///
 /// Mirrors the `@Component` metadata block (without template/style inlining):
 /// emits the decorator metadata, `ctorParameters` (reflected from the class, with
@@ -758,12 +758,16 @@ fn find_last_import_end(program_body: &[Statement<'_>]) -> Option<usize> {
 /// (real `@Input`/`@Output`/query plus synthesized initializer-API). Returns an
 /// empty string when metadata emission is disabled. Matches ngc, which emits
 /// `setClassMetadata` for all decorated classes (needed for TestBed overrides).
+///
+/// The decorators array lists ALL of the class's `@angular/core` decorators in
+/// source order — ngtsc's `extractClassMetadata` filters on `isAngularDecorator`
+/// (imported from `@angular/core`), so a duplicate `@Directive` or a co-located
+/// `@Injectable` appears alongside the decorator that was compiled (issue #521).
 #[allow(clippy::too_many_arguments)]
 fn build_set_class_metadata_decls<'a>(
     allocator: &'a Allocator,
     class: &oxc_ast::ast::Class<'a>,
     class_name: &str,
-    decorator: &oxc_ast::ast::Decorator<'a>,
     options: &TransformOptions,
     source: &'a str,
     string_consts: &crate::directive::StringConsts<'a>,
@@ -771,6 +775,15 @@ fn build_set_class_metadata_decls<'a>(
     namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> String {
     if !options.emit_class_metadata || options.advanced_optimizations {
+        return String::new();
+    }
+
+    let angular_decorators: std::vec::Vec<_> = class
+        .decorators
+        .iter()
+        .filter(|d| crate::directive::is_angular_core_decorator(d, Some(string_consts)))
+        .collect();
+    if angular_decorators.is_empty() {
         return String::new();
     }
 
@@ -782,8 +795,9 @@ fn build_set_class_metadata_decls<'a>(
         r#type: type_expr,
         decorators: build_decorator_metadata_array(
             &allocator,
-            &[decorator],
+            &angular_decorators,
             Some(source),
+            None,
             None,
             None,
             Some(string_consts),
@@ -1062,15 +1076,79 @@ fn find_angular_decorator<'a>(
     None
 }
 
+/// Whether `decorator`'s options object opts out of AOT compilation via
+/// `jit`.
+///
+/// Mirrors ngtsc's `extractDirectiveMetadata` / `NgModuleDecoratorHandler.analyze`
+/// (`shared.ts:176`, `ng_module/handler.ts:352`): mere presence of the `jit`
+/// property forces JIT — `directive.has('jit')` — regardless of the value.
+fn decorator_forces_jit(decorator: &oxc_ast::ast::Decorator<'_>) -> bool {
+    let Expression::CallExpression(call) = &decorator.expression else { return false };
+    let Some(Argument::ObjectExpression(config)) = call.arguments.first() else {
+        return false;
+    };
+    for prop in &config.properties {
+        let ObjectPropertyKind::ObjectProperty(prop) = prop else { continue };
+        if !crate::util::is_metadata_property(prop) {
+            continue;
+        }
+        let is_jit = match &prop.key {
+            PropertyKey::StaticIdentifier(id) => id.name.as_str() == "jit",
+            PropertyKey::StringLiteral(s) => s.value.as_str() == "jit",
+            _ => false,
+        };
+        if is_jit {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `@Component`/`@Directive`/`@NgModule` decorator on `class` that sets
+/// `jit: true`, if any.
+///
+/// Checked in the same order the compilation dispatch below picks a decorator:
+/// `@Component` → `@Directive` → `@Pipe` → `@NgModule` → `@Service` →
+/// `@Injectable`. A `@Pipe` in between stops the search because the pipe
+/// branch compiles the class and upstream's `PipeHandler` has no `jit` opt-out;
+/// `@Service`/`@Injectable` don't either.
+fn find_jit_forced_decorator<'a>(
+    class: &'a oxc_ast::ast::Class<'a>,
+    string_consts: &crate::directive::StringConsts<'_>,
+) -> Option<(AngularDecoratorKind, &'a oxc_ast::ast::Decorator<'a>)> {
+    let decorators = &class.decorators;
+    let consts = Some(string_consts);
+    if let Some(decorator) = find_component_decorator(decorators, string_consts) {
+        return decorator_forces_jit(decorator)
+            .then_some((AngularDecoratorKind::Component, decorator));
+    }
+    if let Some(decorator) = find_directive_decorator(decorators, consts) {
+        return decorator_forces_jit(decorator)
+            .then_some((AngularDecoratorKind::Directive, decorator));
+    }
+    // Upstream's PipeHandler has no `jit` opt-out: a @Pipe always compiles,
+    // and its presence wins the dispatch below regardless of other decorators.
+    if find_pipe_decorator(decorators, consts).is_some() {
+        return None;
+    }
+    if let Some(decorator) = find_ng_module_decorator(decorators, consts) {
+        return decorator_forces_jit(decorator)
+            .then_some((AngularDecoratorKind::NgModule, decorator));
+    }
+    None
+}
+
 /// Extract constructor parameter info for JIT ctorParameters generation.
 ///
 /// Like Angular's JIT transform (`downlevel_decorators_transform.ts`), a
 /// parameter decorator goes into `ctorParameters` only when it's Angular's,
-/// imported from `@angular/core` (see
-/// [`crate::directive::angular_param_decorator`]), listed as written
-/// (`{ type: Inj }`, `{ type: ng.Optional }`). Any other one stays a decorator
-/// of the class, lowered as `__param(index, decorator)`; those are returned
-/// second, in source order.
+/// imported from `@angular/core` — the gate is the import alone, not the
+/// decorator name (`isAngularDecorator`, see
+/// [`crate::directive::is_angular_core_decorator`]), so even `@Component()` on
+/// a parameter counts, listed as written (`{ type: Inj }`,
+/// `{ type: ng.Optional }`). Any other one stays a decorator of the class,
+/// lowered as `__param(index, decorator)`; those are returned second, in
+/// source order.
 fn extract_jit_ctor_params(
     source: &str,
     class: &oxc_ast::ast::Class<'_>,
@@ -1101,9 +1179,12 @@ fn extract_jit_ctor_params(
             .and_then(|ann| extract_type_name_from_annotation(&ann.type_annotation));
 
         // Angular's decorators go into ctorParameters, by their written name.
+        // The gate is the `@angular/core` import alone, like ngtsc's
+        // `isAngularDecorator`: `@Component()` or a custom name imported from
+        // it on a parameter counts too.
         let mut decorators = std::vec::Vec::new();
         for decorator in &param.decorators {
-            if crate::directive::angular_param_decorator(decorator, Some(consts)).is_none() {
+            if !crate::directive::is_angular_core_decorator(decorator, Some(consts)) {
                 let expr = decorator.expression.span();
                 other_decorators.push(format!(
                     "__param({index}, {})",
@@ -1349,6 +1430,19 @@ fn classify_initializer_api(
 /// Without this prefixing, the synthesized `static propDecorators` would reference
 /// an undefined identifier and throw `ReferenceError` at module-evaluation time.
 pub(crate) const JIT_ANGULAR_CORE_NS: &str = "i0";
+
+/// Identifiers referenced inside constructor parameters — types and
+/// decorators. Used for jit-forced classes, whose parameters are re-emitted
+/// as `ctorParameters`/`__param` entries and therefore keep their imports
+/// live (TypeScript's import elision likewise sees the rewritten AST).
+#[derive(Default)]
+struct JitCtorParamIdentifiers<'a>(rustc_hash::FxHashSet<&'a str>);
+
+impl<'a> oxc_ast_visit::Visit<'a> for JitCtorParamIdentifiers<'a> {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        self.0.insert(it.name.as_str());
+    }
+}
 
 /// Every identifier a file has, like TypeScript's `SourceFile.identifiers`.
 #[derive(Default)]
@@ -1659,6 +1753,12 @@ fn build_ctor_parameters_text(params: &[JitCtorParam]) -> Option<String> {
 
     let mut entries = std::vec::Vec::new();
     for param in params {
+        // ngtsc emits bare `null` for a param with neither type nor
+        // decorators (downlevel_decorators_transform.ts).
+        if param.type_name.is_none() && param.decorators.is_empty() {
+            entries.push("null".to_string());
+            continue;
+        }
         let mut parts = std::vec::Vec::new();
 
         // type
@@ -2016,6 +2116,236 @@ fn strip_typescript(allocator: &Allocator, path: &str, code: &str) -> String {
     codegen_ret.code
 }
 
+/// Collect the [`JitClassInfo`] for one class: all class-level decorator spans
+/// and texts (the primary Angular decorator's text rewritten for resources,
+/// the rest verbatim), constructor parameters, and member decorators.
+///
+/// Shared by the whole-file JIT path and the `jit: true` opt-out in the AOT
+/// path (`find_jit_forced_decorator`), which upstream registers in
+/// `jitDeclarationRegistry` and downlevels through the same JIT transform.
+#[allow(clippy::too_many_arguments)]
+fn collect_jit_class_info<'a>(
+    allocator: &'a Allocator,
+    source: &str,
+    class: &oxc_ast::ast::Class<'a>,
+    class_name: String,
+    stmt_start: u32,
+    is_exported: bool,
+    is_default_export: bool,
+    angular_decorator: &oxc_ast::ast::Decorator<'a>,
+    decorator_kind: AngularDecoratorKind,
+    resource_counter: &mut u32,
+    resource_imports: &mut std::vec::Vec<(String, String)>,
+    string_consts: &crate::directive::StringConsts<'a>,
+    core_namespace: &str,
+) -> JitClassInfo {
+    let mut all_class_decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
+    let mut all_class_decorator_texts: std::vec::Vec<String> = std::vec::Vec::new();
+
+    for dec in &class.decorators {
+        all_class_decorator_spans.push(dec.span);
+
+        // Check if this is the Angular decorator that needs special text transformation
+        if dec.span == angular_decorator.span {
+            let text = build_jit_decorator_text(
+                allocator,
+                source,
+                dec,
+                decorator_kind,
+                resource_counter,
+                resource_imports,
+                string_consts,
+            );
+            all_class_decorator_texts.push(text);
+        } else {
+            // Non-Angular decorator: extract expression text from source (without @)
+            let expr_start = dec.expression.span().start;
+            let expr_end = dec.expression.span().end;
+            all_class_decorator_texts
+                .push(source[expr_start as usize..expr_end as usize].to_string());
+        }
+    }
+
+    // Extract constructor parameters for ctorParameters, and the other
+    // parameter decorators for the class's `__decorate`.
+    let (ctor_params, param_decorator_texts) =
+        extract_jit_ctor_params(source, class, string_consts);
+
+    // Extract Angular and non-Angular member decorators
+    let (member_decorators, non_angular_member_decorators) =
+        extract_all_jit_member_decorators(source, class, string_consts, core_namespace);
+
+    JitClassInfo {
+        class_name,
+        all_class_decorator_spans,
+        stmt_start,
+        class_start: class.span.start,
+        class_body_end: class.body.span.end,
+        is_exported,
+        is_default_export,
+        is_abstract: class.r#abstract,
+        ctor_params,
+        member_decorators,
+        all_class_decorator_texts,
+        param_decorator_texts,
+        non_angular_member_decorators,
+    }
+}
+
+/// Generate the text edits that downlevel one class to JIT output:
+/// decorator removal, `export class X` → `let X = class X` restructuring,
+/// `ctorParameters`/`propDecorators` statics, member/class `__decorate` calls,
+/// and the re-export.
+///
+/// `extra_statics` (e.g. `static ɵfac/ɵprov` for a class that is also
+/// `@Injectable`, which still compiles when `jit: true` opts the primary
+/// decorator out) is inserted before `ctorParameters`, matching upstream where
+/// the Ivy transform runs first and the JIT transform appends its statics.
+/// `after_class_extra` (e.g. the injectable's `setClassMetadata`) is appended
+/// after the export statement, matching Ivy's compile-statement placement.
+fn jit_class_edits(
+    source: &str,
+    class: &oxc_ast::ast::Class<'_>,
+    jit_info: &JitClassInfo,
+    extra_statics: &str,
+    after_class_extra: &str,
+    edits: &mut std::vec::Vec<Edit>,
+) {
+    // Remove ALL class-level decorators (including @ and trailing whitespace)
+    for decorator_span in &jit_info.all_class_decorator_spans {
+        let mut end = decorator_span.end as usize;
+        let bytes = source.as_bytes();
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        edits.push(Edit::delete(decorator_span.start, end as u32));
+    }
+
+    // Remove ALL member decorators and constructor param decorators
+    {
+        let mut decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
+        super::decorator::collect_all_constructor_decorator_spans(class, &mut decorator_spans);
+        super::decorator::collect_all_member_decorator_spans(class, &mut decorator_spans);
+        for span in &decorator_spans {
+            let mut end = span.end as usize;
+            let bytes = source.as_bytes();
+            while end < bytes.len() {
+                let c = bytes[end];
+                if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            edits.push(Edit::delete(span.start, end as u32));
+        }
+    }
+
+    // Class restructuring: `export class X` → `let X = class X`
+    // For abstract classes, also strip the `abstract` keyword since class expressions can't be abstract.
+    let class_keyword_start = if jit_info.is_abstract {
+        let rest = &source[jit_info.class_start as usize..];
+        let offset = rest.find("class").unwrap_or(0);
+        jit_info.class_start + offset as u32
+    } else {
+        jit_info.class_start
+    };
+
+    if jit_info.is_exported || jit_info.is_default_export {
+        edits.push(Edit::replace(
+            jit_info.stmt_start,
+            class_keyword_start,
+            format!("let {} = ", jit_info.class_name),
+        ));
+    } else {
+        edits.push(Edit::replace(
+            jit_info.class_start,
+            class_keyword_start,
+            format!("let {} = ", jit_info.class_name),
+        ));
+    }
+
+    // Add extra (Ivy) statics, then ctorParameters and propDecorators inside
+    // the class body (before closing `}`).
+    {
+        let mut class_statics = String::new();
+        if !extra_statics.is_empty() {
+            class_statics.push_str(&format!("\n{};", extra_statics));
+        }
+        if let Some(ctor_text) = build_ctor_parameters_text(&jit_info.ctor_params) {
+            class_statics.push_str(&format!("\n{};", ctor_text));
+        }
+        if let Some(prop_text) = build_prop_decorators_text(&jit_info.member_decorators) {
+            class_statics.push_str(&format!("\n{};", prop_text));
+        }
+        if !class_statics.is_empty() {
+            class_statics.push('\n');
+            edits.push(Edit::insert(jit_info.class_body_end - 1, class_statics));
+        }
+    }
+
+    // After class body, add member __decorate calls, then class __decorate call, then export
+    let mut after_class = String::from(";\n");
+
+    // Emit __decorate() for non-Angular member decorators (before class __decorate).
+    // Match TypeScript's ordering: instance (prototype) members first, then static members.
+    // Within each group, preserve source declaration order.
+    for member_dec in jit_info
+        .non_angular_member_decorators
+        .iter()
+        .filter(|m| !m.is_static)
+        .chain(jit_info.non_angular_member_decorators.iter().filter(|m| m.is_static))
+    {
+        let target = if member_dec.is_static {
+            jit_info.class_name.clone()
+        } else {
+            format!("{}.prototype", jit_info.class_name)
+        };
+        // TypeScript uses `null` for methods/accessors (reads existing descriptor)
+        // and `void 0` for properties (no existing descriptor).
+        let desc = if member_dec.is_property { "void 0" } else { "null" };
+        after_class.push_str(&format!(
+            "__decorate([{}], {}, \"{}\", {});\n",
+            member_dec.decorator_texts.join(", "),
+            target,
+            member_dec.member_name,
+            desc
+        ));
+    }
+
+    // Emit class-level __decorate() with ALL class decorators
+    let all_decorator_text = jit_info
+        .all_class_decorator_texts
+        .iter()
+        .chain(&jit_info.param_decorator_texts)
+        .map(String::as_str)
+        .collect::<std::vec::Vec<_>>()
+        .join(",\n    ");
+    after_class.push_str(&format!(
+        "{} = __decorate([\n    {}\n], {});\n",
+        jit_info.class_name, all_decorator_text, jit_info.class_name
+    ));
+
+    if jit_info.is_exported {
+        after_class.push_str(&format!("export {{ {} }};\n", jit_info.class_name));
+    } else if jit_info.is_default_export {
+        after_class.push_str(&format!("export default {};\n", jit_info.class_name));
+    }
+
+    // Ivy compile statements (setClassMetadata for a co-located @Injectable)
+    // land after the class statement, i.e. after the downleveled export.
+    if !after_class_extra.is_empty() {
+        after_class.push_str(after_class_extra);
+    }
+
+    edits.push(Edit::insert(jit_info.class_body_end, after_class));
+}
+
 /// JIT mode produces output compatible with Angular's JIT runtime compiler:
 /// - Decorators are downleveled using `__decorate` from tslib
 /// - `templateUrl` is replaced with `angular:jit:template:file;` imports
@@ -2110,58 +2440,21 @@ fn transform_angular_file_jit(
             continue;
         }
 
-        // Collect ALL class-level decorator spans and texts (in source order)
-        let mut all_class_decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
-        let mut all_class_decorator_texts: std::vec::Vec<String> = std::vec::Vec::new();
-
-        for dec in &class.decorators {
-            all_class_decorator_spans.push(dec.span);
-
-            // Check if this is the Angular decorator that needs special text transformation
-            if dec.span == angular_decorator.span {
-                let text = build_jit_decorator_text(
-                    &allocator,
-                    source,
-                    dec,
-                    decorator_kind,
-                    &mut resource_counter,
-                    &mut resource_imports,
-                    &string_consts,
-                );
-                all_class_decorator_texts.push(text);
-            } else {
-                // Non-Angular decorator: extract expression text from source (without @)
-                let expr_start = dec.expression.span().start;
-                let expr_end = dec.expression.span().end;
-                all_class_decorator_texts
-                    .push(source[expr_start as usize..expr_end as usize].to_string());
-            }
-        }
-
-        // Extract constructor parameters for ctorParameters, and the other
-        // parameter decorators for the class's `__decorate`.
-        let (ctor_params, param_decorator_texts) =
-            extract_jit_ctor_params(source, class, &string_consts);
-
-        // Extract Angular and non-Angular member decorators
-        let (member_decorators, non_angular_member_decorators) =
-            extract_all_jit_member_decorators(source, class, &string_consts, &core_namespace);
-
-        jit_classes.push(JitClassInfo {
+        jit_classes.push(collect_jit_class_info(
+            allocator,
+            source,
+            class,
             class_name,
-            all_class_decorator_spans,
             stmt_start,
-            class_start: class.span.start,
-            class_body_end: class.body.span.end,
             is_exported,
             is_default_export,
-            is_abstract: class.r#abstract,
-            ctor_params,
-            member_decorators,
-            all_class_decorator_texts,
-            param_decorator_texts,
-            non_angular_member_decorators,
-        });
+            angular_decorator,
+            decorator_kind,
+            &mut resource_counter,
+            &mut resource_imports,
+            &string_consts,
+            &core_namespace,
+        ));
 
         result.component_count +=
             if matches!(decorator_kind, AngularDecoratorKind::Component) { 1 } else { 0 };
@@ -2254,129 +2547,7 @@ fn transform_angular_file_jit(
             continue;
         };
 
-        // 4a. Remove ALL class-level decorators (including @ and trailing whitespace)
-        for decorator_span in &jit_info.all_class_decorator_spans {
-            let mut end = decorator_span.end as usize;
-            let bytes = source.as_bytes();
-            while end < bytes.len() {
-                let c = bytes[end];
-                if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            edits.push(Edit::delete(decorator_span.start, end as u32));
-        }
-
-        // 4b. Remove ALL member decorators and constructor param decorators
-        {
-            let mut decorator_spans: std::vec::Vec<Span> = std::vec::Vec::new();
-            super::decorator::collect_all_constructor_decorator_spans(class, &mut decorator_spans);
-            super::decorator::collect_all_member_decorator_spans(class, &mut decorator_spans);
-            for span in &decorator_spans {
-                let mut end = span.end as usize;
-                let bytes = source.as_bytes();
-                while end < bytes.len() {
-                    let c = bytes[end];
-                    if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-                        end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                edits.push(Edit::delete(span.start, end as u32));
-            }
-        }
-
-        // 4c. Class restructuring: `export class X` → `let X = class X`
-        // For abstract classes, also strip the `abstract` keyword since class expressions can't be abstract.
-        let class_keyword_start = if jit_info.is_abstract {
-            let rest = &source[jit_info.class_start as usize..];
-            let offset = rest.find("class").unwrap_or(0);
-            jit_info.class_start + offset as u32
-        } else {
-            jit_info.class_start
-        };
-
-        if jit_info.is_exported || jit_info.is_default_export {
-            edits.push(Edit::replace(
-                jit_info.stmt_start,
-                class_keyword_start,
-                format!("let {} = ", jit_info.class_name),
-            ));
-        } else {
-            edits.push(Edit::replace(
-                jit_info.class_start,
-                class_keyword_start,
-                format!("let {} = ", jit_info.class_name),
-            ));
-        }
-
-        // 4d. Add ctorParameters and propDecorators inside class body (before closing `}`)
-        {
-            let mut class_statics = String::new();
-            if let Some(ctor_text) = build_ctor_parameters_text(&jit_info.ctor_params) {
-                class_statics.push_str(&format!("\n{};", ctor_text));
-            }
-            if let Some(prop_text) = build_prop_decorators_text(&jit_info.member_decorators) {
-                class_statics.push_str(&format!("\n{};", prop_text));
-            }
-            if !class_statics.is_empty() {
-                class_statics.push('\n');
-                edits.push(Edit::insert(jit_info.class_body_end - 1, class_statics));
-            }
-        }
-
-        // 4e. After class body, add member __decorate calls, then class __decorate call, then export
-        let mut after_class = String::from(";\n");
-
-        // Emit __decorate() for non-Angular member decorators (before class __decorate).
-        // Match TypeScript's ordering: instance (prototype) members first, then static members.
-        // Within each group, preserve source declaration order.
-        for member_dec in jit_info
-            .non_angular_member_decorators
-            .iter()
-            .filter(|m| !m.is_static)
-            .chain(jit_info.non_angular_member_decorators.iter().filter(|m| m.is_static))
-        {
-            let target = if member_dec.is_static {
-                jit_info.class_name.clone()
-            } else {
-                format!("{}.prototype", jit_info.class_name)
-            };
-            // TypeScript uses `null` for methods/accessors (reads existing descriptor)
-            // and `void 0` for properties (no existing descriptor).
-            let desc = if member_dec.is_property { "void 0" } else { "null" };
-            after_class.push_str(&format!(
-                "__decorate([{}], {}, \"{}\", {});\n",
-                member_dec.decorator_texts.join(", "),
-                target,
-                member_dec.member_name,
-                desc
-            ));
-        }
-
-        // Emit class-level __decorate() with ALL class decorators
-        let all_decorator_text = jit_info
-            .all_class_decorator_texts
-            .iter()
-            .chain(&jit_info.param_decorator_texts)
-            .map(String::as_str)
-            .collect::<std::vec::Vec<_>>()
-            .join(",\n    ");
-        after_class.push_str(&format!(
-            "{} = __decorate([\n    {}\n], {});\n",
-            jit_info.class_name, all_decorator_text, jit_info.class_name
-        ));
-
-        if jit_info.is_exported {
-            after_class.push_str(&format!("export {{ {} }};\n", jit_info.class_name));
-        } else if jit_info.is_default_export {
-            after_class.push_str(&format!("export default {};\n", jit_info.class_name));
-        }
-
-        edits.push(Edit::insert(jit_info.class_body_end, after_class));
+        jit_class_edits(source, class, jit_info, "", "", &mut edits);
     }
 
     // Apply all edits
@@ -2445,7 +2616,14 @@ pub fn transform_angular_file(
     // Run import elision analysis on the original program.
     // This identifies type-only imports that can be removed.
     // Must run BEFORE transformation to capture correct type vs value references.
-    let import_elision = ImportElisionAnalyzer::analyze(&parser_ret.program);
+    // `ɵsetClassMetadata` names ctor-param decorators (`{type: Optional}`),
+    // `@Inject` tokens (`args: [TOKEN]`) and member decorators (`{type: Input}`)
+    // by their imported names, so those imports must stay whenever metadata
+    // will be emitted (ngtsc keeps them too).
+    let import_elision = ImportElisionAnalyzer::analyze(
+        &parser_ret.program,
+        options.emit_class_metadata && !options.advanced_optimizations,
+    );
 
     // Collect class definitions by class name.
     // Each entry is (class_name, static_definitions_to_insert, external_declarations)
@@ -2458,6 +2636,26 @@ pub fn transform_angular_file(
     // Collect class positions from original AST for edit-based output.
     // (class_name, effective_start, class_body_end)
     let mut class_positions: Vec<(String, u32, u32)> = Vec::new();
+
+    // Classes that opted out of AOT via `jit: true` in their decorator
+    // metadata: downleveled like JIT-mode classes (no Ivy definitions) while
+    // the rest of the file still compiles AOT. Mirrors ngtsc's
+    // `jitDeclarationRegistry` + `angularJitApplicationTransform` wiring.
+    let mut jit_classes: std::vec::Vec<JitClassInfo> = std::vec::Vec::new();
+    let mut jit_edits: std::vec::Vec<Edit> = std::vec::Vec::new();
+    let mut jit_resource_counter: u32 = 0;
+    let mut jit_resource_imports: std::vec::Vec<(String, String)> = std::vec::Vec::new();
+    // Lazily computed on the first jit-forced class; the name synthesized
+    // propDecorators use to reference `@angular/core` (`i0.Input`).
+    let mut jit_core_namespace: Option<(String, bool)> = None;
+    // Set when a jit-forced class also carries @Injectable: the emitted
+    // ɵfac/ɵprov reference `i0`, so the registry's `import * as i0` must be
+    // emitted even when no AOT-compiled class exists.
+    let mut jit_emitted_i0_statics = false;
+    // Import elision must keep symbols referenced by the downleveled output
+    // (ctorParameters types/decorators, __param entries) even though their
+    // source positions look elidable; accumulated here for the elision pass.
+    let mut import_elision_mut = import_elision;
 
     // File-level namespace registry to collect all module imports
     let mut file_namespace_registry = NamespaceRegistry::new(allocator);
@@ -2583,6 +2781,129 @@ pub fn transform_angular_file(
                     )));
                     continue;
                 }
+            }
+
+            // `jit: true` in the decorator opts the class out of AOT
+            // compilation. ngtsc registers it in `jitDeclarationRegistry`,
+            // produces no analysis (no ɵcmp/ɵdir/ɵmod/ɵfac/setClassMetadata)
+            // and downlevels the decorators through the JIT transform
+            // (compiler.ts:848-870). Same here: the class is lowered like a
+            // JIT-mode class while the rest of the file still compiles AOT.
+            if class.id.is_some()
+                && let Some((jit_kind, jit_decorator)) =
+                    find_jit_forced_decorator(class, &string_consts)
+            {
+                let core_namespace = jit_core_namespace
+                    .get_or_insert_with(|| jit_angular_core_namespace(&parser_ret.program))
+                    .0
+                    .clone();
+                let (is_exported, is_default_export) = match stmt {
+                    Statement::ExportDeclaration(_) => (true, false),
+                    Statement::ExportDefaultDeclaration(_) => (false, true),
+                    _ => (false, false),
+                };
+                let info = collect_jit_class_info(
+                    allocator,
+                    source,
+                    class,
+                    class.id.as_ref().map_or_else(String::new, |id| id.name.to_string()),
+                    stmt_start,
+                    is_exported,
+                    is_default_export,
+                    jit_decorator,
+                    jit_kind,
+                    &mut jit_resource_counter,
+                    &mut jit_resource_imports,
+                    &string_consts,
+                    &core_namespace,
+                );
+
+                // A co-located @Injectable still compiles: upstream's
+                // InjectableHandler runs independently of the jitForced
+                // short-circuit, so the class keeps its ɵfac/ɵprov (and
+                // setClassMetadata) alongside the downleveled decorators.
+                let mut extra_statics = String::new();
+                let mut after_class_extra = String::new();
+                if let Some(mut injectable_metadata) = extract_injectable_metadata_in(
+                    allocator,
+                    class,
+                    Some(source),
+                    Some(&string_consts),
+                ) {
+                    // Same namespace resolution the standalone-@Injectable
+                    // branch applies to factory deps.
+                    if let Some(ref mut deps) = injectable_metadata.deps {
+                        resolve_factory_dep_namespaces(
+                            &allocator,
+                            deps,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
+                    }
+                    if let Some(inj_def) = generate_injectable_definition_from_decorator(
+                        &allocator,
+                        &injectable_metadata,
+                        options.compilation_mode,
+                    ) {
+                        jit_emitted_i0_statics = true;
+                        let emitter = JsEmitter::new();
+                        extra_statics = format!(
+                            "static ɵfac = {};\nstatic ɵprov = {};",
+                            emitter.emit_expression(&inj_def.fac_definition),
+                            emitter.emit_expression(&inj_def.prov_definition)
+                        );
+                        let type_argument_count =
+                            class.type_parameters.as_ref().map_or(0, |tp| tp.params.len() as u32);
+                        result.dts_declarations.push(dts::generate_injectable_dts(
+                            &injectable_metadata,
+                            type_argument_count,
+                        ));
+                        // `build_set_class_metadata_decls` lists every
+                        // @angular/core class decorator itself, so the
+                        // metadata covers the injectable alongside the
+                        // jit-forced decorator.
+                        after_class_extra = build_set_class_metadata_decls(
+                            &allocator,
+                            class,
+                            &info.class_name,
+                            options,
+                            source,
+                            &string_consts,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
+                    }
+                }
+
+                jit_class_edits(
+                    source,
+                    class,
+                    &info,
+                    &extra_statics,
+                    &after_class_extra,
+                    &mut jit_edits,
+                );
+                jit_classes.push(info);
+
+                // Identifiers used only in constructor parameters (types,
+                // param decorators) survive in the emitted ctorParameters /
+                // __param, so their imports must be kept — the same result
+                // TypeScript's elision produces on ngtsc's rewritten AST.
+                let mut param_idents = JitCtorParamIdentifiers::default();
+                for element in &class.body.body {
+                    if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
+                        && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                    {
+                        oxc_ast_visit::Visit::visit_formal_parameters(
+                            &mut param_idents,
+                            &method.value.params,
+                        );
+                    }
+                }
+                for name in param_idents.0 {
+                    import_elision_mut.preserve(&name);
+                }
+                continue;
             }
 
             // Compute implicit_standalone based on Angular version
@@ -2778,9 +3099,24 @@ pub fn transform_angular_file(
                             // Add class metadata for TestBed support (after debug info, before HMR)
                             // Only emit when enabled and not in advanced optimizations mode
                             if options.emit_class_metadata && !options.advanced_optimizations {
-                                if let Some(decorator) =
-                                    find_component_decorator(&class.decorators, &string_consts)
-                                {
+                                // List ALL of the class's `@angular/core` decorators, in
+                                // source order — ngtsc's `extractClassMetadata` filters on
+                                // `isAngularDecorator` (imported from `@angular/core`), so
+                                // a second `@Component` (kept on the emitted class like
+                                // ngtsc's `__decorate` entry) or a co-located `@Injectable`
+                                // appears alongside the decorator that was compiled
+                                // (issue #521).
+                                let angular_decorators: std::vec::Vec<_> = class
+                                    .decorators
+                                    .iter()
+                                    .filter(|d| {
+                                        crate::directive::is_angular_core_decorator(
+                                            d,
+                                            Some(&string_consts),
+                                        )
+                                    })
+                                    .collect();
+                                if !angular_decorators.is_empty() {
                                     let emitter = JsEmitter::new();
 
                                     // Build the type expression: reference to the class
@@ -2804,10 +3140,11 @@ pub fn transform_angular_file(
                                         r#type: type_expr,
                                         decorators: build_decorator_metadata_array(
                                             &allocator,
-                                            &[decorator],
+                                            &angular_decorators,
                                             Some(source),
                                             Some(template),
                                             Some(metadata.styles.as_slice()),
+                                            component_decorator,
                                             Some(&string_consts),
                                         ),
                                         ctor_parameters: build_ctor_params_metadata_in(
@@ -3078,22 +3415,16 @@ pub fn transform_angular_file(
 
                     // Emit setClassMetadata for TestBed support (overrideDirective +
                     // signal members), mirroring the @Component path.
-                    let decls_after_class =
-                        find_directive_decorator(&class.decorators, Some(&string_consts))
-                            .map(|decorator| {
-                                build_set_class_metadata_decls(
-                                    &allocator,
-                                    class,
-                                    &class_name,
-                                    decorator,
-                                    options,
-                                    source,
-                                    &string_consts,
-                                    &import_map,
-                                    &mut file_namespace_registry,
-                                )
-                            })
-                            .unwrap_or_default();
+                    let decls_after_class = build_set_class_metadata_decls(
+                        &allocator,
+                        class,
+                        &class_name,
+                        options,
+                        source,
+                        &string_consts,
+                        &import_map,
+                        &mut file_namespace_registry,
+                    );
 
                     class_positions.push((
                         class_name.clone(),
@@ -3194,22 +3525,16 @@ pub fn transform_angular_file(
                         ));
 
                         // Emit setClassMetadata for TestBed support (overridePipe).
-                        let decls_after_class =
-                            find_pipe_decorator(&class.decorators, Some(&string_consts))
-                                .map(|decorator| {
-                                    build_set_class_metadata_decls(
-                                        &allocator,
-                                        class,
-                                        &class_name,
-                                        decorator,
-                                        options,
-                                        source,
-                                        &string_consts,
-                                        &import_map,
-                                        &mut file_namespace_registry,
-                                    )
-                                })
-                                .unwrap_or_default();
+                        let decls_after_class = build_set_class_metadata_decls(
+                            &allocator,
+                            class,
+                            &class_name,
+                            options,
+                            source,
+                            &string_consts,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
 
                         class_positions.push((
                             class_name.clone(),
@@ -3324,26 +3649,21 @@ pub fn transform_angular_file(
 
                         // Emit setClassMetadata for TestBed support (overrideModule),
                         // appended after the NgModule's external declarations.
-                        if let Some(decorator) =
-                            find_ng_module_decorator(&class.decorators, Some(&string_consts))
-                        {
-                            let metadata = build_set_class_metadata_decls(
-                                &allocator,
-                                class,
-                                &class_name,
-                                decorator,
-                                options,
-                                source,
-                                &string_consts,
-                                &import_map,
-                                &mut file_namespace_registry,
-                            );
-                            if !metadata.is_empty() {
-                                if !external_decls.is_empty() {
-                                    external_decls.push('\n');
-                                }
-                                external_decls.push_str(&metadata);
+                        let metadata = build_set_class_metadata_decls(
+                            &allocator,
+                            class,
+                            &class_name,
+                            options,
+                            source,
+                            &string_consts,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
+                        if !metadata.is_empty() {
+                            if !external_decls.is_empty() {
+                                external_decls.push('\n');
                             }
+                            external_decls.push_str(&metadata);
                         }
 
                         // NgModule: external_decls go AFTER the class (they reference the class name)
@@ -3433,7 +3753,6 @@ pub fn transform_angular_file(
                             &allocator,
                             class,
                             &class_name,
-                            service_decorator,
                             options,
                             source,
                             &string_consts,
@@ -3511,22 +3830,16 @@ pub fn transform_angular_file(
                         ));
 
                         // Emit setClassMetadata for TestBed support.
-                        let decls_after_class =
-                            find_injectable_decorator(&class.decorators, Some(&string_consts))
-                                .map(|decorator| {
-                                    build_set_class_metadata_decls(
-                                        &allocator,
-                                        class,
-                                        &class_name,
-                                        decorator,
-                                        options,
-                                        source,
-                                        &string_consts,
-                                        &import_map,
-                                        &mut file_namespace_registry,
-                                    )
-                                })
-                                .unwrap_or_default();
+                        let decls_after_class = build_set_class_metadata_decls(
+                            &allocator,
+                            class,
+                            &class_name,
+                            options,
+                            source,
+                            &string_consts,
+                            &import_map,
+                            &mut file_namespace_registry,
+                        );
 
                         class_positions.push((
                             class_name.clone(),
@@ -3547,13 +3860,62 @@ pub fn transform_angular_file(
     // All edits reference positions in the original source and are applied in one pass.
 
     // 5a. Import elision edits (collected first for namespace insert position check)
-    let elision_edits = import_elision_edits(source, &parser_ret.program, &import_elision);
+    let elision_edits = import_elision_edits(source, &parser_ret.program, &import_elision_mut);
 
     // 5b. Namespace import insertion
     // Must be computed before merging other edits, since we need to check if the
     // insert position falls inside an import elision edit span.
-    let namespace_imports = file_namespace_registry.generate_import_statements();
-    let ns_edit = if !namespace_imports.is_empty() && !class_definitions.is_empty() {
+    //
+    // jit-forced classes additionally need tslib's `__decorate`/`__param`, the
+    // `@angular/core` namespace for synthesized signal-API propDecorators, and
+    // the `angular:jit:*` resource imports — same as `transform_angular_file_jit`.
+    // Helpers the file already imports are skipped so the transform stays
+    // idempotent.
+    let mut additional_imports = String::new();
+    let mut jit_needs_core_ns = false;
+    if !jit_classes.is_empty() {
+        let needs_param = jit_classes.iter().any(|c| !c.param_decorator_texts.is_empty());
+        let mut tslib_names: Vec<&str> =
+            if needs_param { vec!["__decorate", "__param"] } else { vec!["__decorate"] };
+        tslib_names.retain(|name| {
+            !matches!(import_map.get(&Ident::from(*name)),
+                Some(info) if info.source_module.as_str() == "tslib")
+        });
+        if !tslib_names.is_empty() {
+            additional_imports
+                .push_str(&format!("import {{ {} }} from \"tslib\";\n", tslib_names.join(", ")));
+        }
+        let (core_namespace, core_namespace_imported) = jit_core_namespace
+            .clone()
+            .unwrap_or_else(|| jit_angular_core_namespace(&parser_ret.program));
+        jit_needs_core_ns = !core_namespace_imported
+            && jit_classes_need_angular_core_namespace(&jit_classes, &core_namespace);
+        // When synthesized references need `@angular/core` under a name other
+        // than `i0`, it must be imported here — `i0` itself is covered by the
+        // namespace registry below.
+        if jit_needs_core_ns && core_namespace != "i0" {
+            additional_imports
+                .push_str(&format!("import * as {core_namespace} from \"@angular/core\";\n"));
+        }
+        for (import_name, specifier) in &jit_resource_imports {
+            additional_imports
+                .push_str(&format!("import {} from \"{}\";\n", import_name, specifier));
+        }
+    }
+
+    // The registry's `import * as i0` (and any `i1…` aliases) is only emitted
+    // when something references it: compiled definitions, or ɵfac/ɵprov on a
+    // jit-forced class, or synthesized `i0.*` propDecorators.
+    let emit_ns_imports = !class_definitions.is_empty()
+        || jit_emitted_i0_statics
+        || (jit_needs_core_ns
+            && jit_core_namespace.map(|(name, _)| name == "i0").unwrap_or_default());
+    if emit_ns_imports {
+        additional_imports.push_str(&file_namespace_registry.generate_import_statements());
+    }
+    let ns_edit = if !additional_imports.is_empty()
+        && (!class_definitions.is_empty() || !jit_classes.is_empty())
+    {
         let ns_insert_pos = find_last_import_end(&parser_ret.program.body);
         if let Some(insert_pos) = ns_insert_pos {
             let bytes = source.as_bytes();
@@ -3581,9 +3943,9 @@ pub fn transform_angular_file(
                     actual_pos = edit.end as usize;
                 }
             }
-            Some(Edit::insert(actual_pos as u32, namespace_imports).with_priority(10))
+            Some(Edit::insert(actual_pos as u32, additional_imports).with_priority(10))
         } else {
-            Some(Edit::insert(0, namespace_imports).with_priority(10))
+            Some(Edit::insert(0, additional_imports).with_priority(10))
         }
     } else {
         None
@@ -3591,6 +3953,10 @@ pub fn transform_angular_file(
 
     // 5c. Merge all edits
     let mut edits: Vec<Edit> = elision_edits;
+
+    // jit-forced class downleveling (decorator removal, `let X = class X`
+    // restructuring, __decorate calls) — same edits the JIT path emits.
+    edits.append(&mut jit_edits);
 
     // Decorator removal edits
     for span in &decorator_spans_to_remove {
@@ -5595,6 +5961,179 @@ export class SecondComponent {}
         assert!(
             result.code.contains("class SecondComponent"),
             "Code should contain SecondComponent"
+        );
+    }
+
+    /// The decorators array inside `ɵsetClassMetadata(...)` on a single line,
+    /// for whitespace-insensitive comparison.
+    fn set_class_metadata_decorators(code: &str) -> String {
+        let start = code.find("ɵsetClassMetadata(").expect("code should contain ɵsetClassMetadata");
+        code[start..].split_whitespace().collect()
+    }
+
+    #[test]
+    fn test_duplicate_component_decorators() {
+        // Issue #521: two @Component decorators on one class. ngtsc gives no
+        // diagnostic — it compiles the FIRST @Component, leaves the second on
+        // the class (downleveled by TS into `__decorate`), and lists BOTH in
+        // `setClassMetadata`'s decorators array.
+        let allocator = Allocator::default();
+        let source = r#"import {Component} from '@angular/core';
+@Component({selector: 'a-cmp', template: 'first'})
+@Component({selector: 'b-cmp', template: 'second'})
+export class C {}
+"#;
+
+        let result = transform_angular_file(&allocator, "c.ts", source, None, None);
+
+        assert_eq!(result.component_count, 1);
+        assert!(!result.has_errors(), "diagnostics: {:?}", result.diagnostics);
+
+        // The first decorator is compiled: ɵcmp selects 'a-cmp' with the first template.
+        assert!(
+            result.code.contains("selectors:[[\"a-cmp\"]]"),
+            "ɵcmp should compile the first @Component, but got:\n{}",
+            result.code
+        );
+
+        // The second decorator stays on the emitted class (like ngtsc's
+        // __decorate entry for the decorator the compiler did not take).
+        assert!(
+            result.code.contains("@Component({selector: 'b-cmp', template: 'second'})"),
+            "the second @Component should be preserved on the class, but got:\n{}",
+            result.code
+        );
+
+        // setClassMetadata lists BOTH decorators in source order.
+        let metadata = set_class_metadata_decorators(&result.code);
+        assert!(
+            metadata.contains(
+                "ɵsetClassMetadata(C,[{type:Component,args:[{selector:\"a-cmp\",template:\"first\"}]},{type:Component,args:[{selector:\"b-cmp\",template:\"second\"}]}]"
+            ),
+            "setClassMetadata should list both @Component decorators, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_duplicate_directive_decorators() {
+        // Same as the @Component duplicate: ngtsc compiles the first
+        // @Directive and lists both in setClassMetadata.
+        let allocator = Allocator::default();
+        let source = r#"import {Directive} from '@angular/core';
+@Directive({selector: '[a-dir]'})
+@Directive({selector: '[b-dir]'})
+export class D {}
+"#;
+
+        let result = transform_angular_file(&allocator, "d.ts", source, None, None);
+
+        assert!(!result.has_errors(), "diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains("selectors:[[\"\",\"a-dir\",\"\"]]"),
+            "ɵdir should compile the first @Directive, but got:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("@Directive({selector: '[b-dir]'})"),
+            "the second @Directive should be preserved on the class, but got:\n{}",
+            result.code
+        );
+        let metadata = set_class_metadata_decorators(&result.code);
+        assert!(
+            metadata.contains(
+                "[{type:Directive,args:[{selector:\"[a-dir]\"}]},{type:Directive,args:[{selector:\"[b-dir]\"}]}]"
+            ),
+            "setClassMetadata should list both @Directive decorators, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_duplicate_injectable_decorators() {
+        // A standalone @Injectable lists both decorators in setClassMetadata.
+        let allocator = Allocator::default();
+        let source = r#"import {Injectable} from '@angular/core';
+@Injectable({providedIn: 'root'})
+@Injectable({providedIn: 'platform'})
+export class S {}
+"#;
+
+        let result = transform_angular_file(&allocator, "s.ts", source, None, None);
+
+        assert!(!result.has_errors(), "diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains("@Injectable({providedIn: 'platform'})"),
+            "the second @Injectable should be preserved on the class, but got:\n{}",
+            result.code
+        );
+        let metadata = set_class_metadata_decorators(&result.code);
+        assert!(
+            metadata.contains(
+                "[{type:Injectable,args:[{providedIn:\"root\"}]},{type:Injectable,args:[{providedIn:\"platform\"}]}]"
+            ),
+            "setClassMetadata should list both @Injectable decorators, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_co_located_injectable_decorator_in_class_metadata() {
+        // ngtsc's `isAngularDecorator` filter admits every decorator imported
+        // from `@angular/core`, so a co-located @Injectable is listed in
+        // setClassMetadata too (it is also the one removed alongside the
+        // compiled @Component's).
+        let allocator = Allocator::default();
+        let source = r#"import {Component, Injectable} from '@angular/core';
+@Component({selector: 'a-cmp', template: 'x'})
+@Injectable()
+export class C {}
+"#;
+
+        let result = transform_angular_file(&allocator, "c.ts", source, None, None);
+
+        assert!(!result.has_errors(), "diagnostics: {:?}", result.diagnostics);
+        assert!(
+            !result.code.contains("@Injectable"),
+            "the @Injectable decorator is compiled into ɵprov and removed, but got:\n{}",
+            result.code
+        );
+        let metadata = set_class_metadata_decorators(&result.code);
+        assert!(
+            metadata.contains(
+                "[{type:Component,args:[{selector:\"a-cmp\",template:\"x\"}]},{type:Injectable}]"
+            ),
+            "setClassMetadata should list @Component and @Injectable, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_non_angular_decorator_not_in_class_metadata() {
+        // A decorator not imported from `@angular/core` is not Angular's:
+        // ngtsc's `isAngularDecorator` filter excludes it from setClassMetadata
+        // while the decorator itself stays on the emitted class.
+        let allocator = Allocator::default();
+        let source = r#"import {Component} from '@angular/core';
+declare function MyDec(): ClassDecorator;
+@Component({selector: 'a-cmp', template: 'x'})
+@MyDec()
+export class C {}
+"#;
+
+        let result = transform_angular_file(&allocator, "c.ts", source, None, None);
+
+        assert!(!result.has_errors(), "diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains("@MyDec()"),
+            "the non-Angular decorator should be preserved on the class, but got:\n{}",
+            result.code
+        );
+        let metadata = set_class_metadata_decorators(&result.code);
+        assert!(
+            !metadata.contains("MyDec"),
+            "setClassMetadata should not list a non-Angular decorator, but got:\n{}",
+            result.code
         );
     }
 

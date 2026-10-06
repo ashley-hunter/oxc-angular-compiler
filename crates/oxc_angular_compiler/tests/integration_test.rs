@@ -3689,8 +3689,10 @@ export class TestComponent {
     );
 }
 
-/// Test that constructor parameter decorators (@Optional, @Inject, etc.) are elided from imports.
-/// Angular removes these decorators during compilation and encodes them in factory metadata.
+/// Test that constructor parameter decorators (@Optional, @Inject, etc.) keep their imports
+/// while `ɵsetClassMetadata` is emitted (the default), and are elided once it is disabled.
+/// The metadata's `ctorParameters` callback names them as bare identifiers, so dropping the
+/// imports leaves unbound references (issue #520). ngtsc keeps them too.
 #[test]
 fn test_import_elision_ctor_param_decorators() {
     let allocator = Allocator::default();
@@ -3727,16 +3729,15 @@ export class BitLabelComponent {
         .unwrap();
     println!("Angular core import line: {import_line}");
 
-    // Optional should be elided (only used as ctor param decorator)
+    // ctorParameters emits `{type: Optional}` / `{type: Inject, args: [DOCUMENT]}`
+    // bare, so both imports must be retained while setClassMetadata is emitted.
     assert!(
-        !import_line.contains("Optional"),
-        "Optional should be elided from imports. Import line: {import_line}"
+        import_line.contains("Optional"),
+        "Optional should be kept in imports (named by setClassMetadata). Import line: {import_line}"
     );
-
-    // Inject should be elided (only used as ctor param decorator)
     assert!(
-        !import_line.contains("Inject"),
-        "Inject should be elided from imports. Import line: {import_line}"
+        import_line.contains("Inject"),
+        "Inject should be kept in imports (named by setClassMetadata). Import line: {import_line}"
     );
 
     // ElementRef should be elided (only used in type annotation, DI comes from namespace)
@@ -3751,17 +3752,43 @@ export class BitLabelComponent {
         "Component should be in imports. Import line: {import_line}"
     );
 
-    // Find the @angular/common import line (if it exists)
+    // DOCUMENT is named bare inside ctorParameters `args`, so its import stays too.
     let common_import =
         code.lines().find(|l| l.starts_with("import") && l.contains("@angular/common"));
+    let common_line =
+        common_import.unwrap_or_else(|| panic!("DOCUMENT import missing. Code: {code}"));
+    assert!(
+        common_line.contains("DOCUMENT"),
+        "DOCUMENT should be kept in imports (named by setClassMetadata). Import line: {common_line}"
+    );
 
-    // DOCUMENT should be elided (only used in @Inject argument)
-    // If the import line exists, it should not contain DOCUMENT
-    // Or the entire import should be removed
-    if let Some(common_line) = common_import {
+    // With class metadata emission disabled, the same imports are elided again.
+    let no_metadata = ComponentTransformOptions {
+        emit_class_metadata: false,
+        ..ComponentTransformOptions::default()
+    };
+    let result =
+        transform_angular_file(&allocator, "test.component.ts", source, Some(&no_metadata), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code = &result.code;
+    assert!(!code.contains("setClassMetadata"), "metadata should not be emitted: {code}");
+
+    let import_line = code
+        .lines()
+        .find(|l| l.starts_with("import") && l.contains("@angular/core") && !l.contains("* as"))
+        .unwrap();
+    for decorator in ["Optional", "Inject"] {
+        assert!(
+            !import_line.contains(decorator),
+            "{decorator} should be elided when no setClassMetadata is emitted. Import line: {import_line}"
+        );
+    }
+    if let Some(common_line) =
+        code.lines().find(|l| l.starts_with("import") && l.contains("@angular/common"))
+    {
         assert!(
             !common_line.contains("DOCUMENT"),
-            "DOCUMENT should be elided from imports. Import line: {common_line}"
+            "DOCUMENT should be elided when no setClassMetadata is emitted. Import line: {common_line}"
         );
     }
 }
@@ -6186,6 +6213,40 @@ export class D {
     );
 }
 
+/// @HostListener on a TS `accessor` field is a host listener: ngtsc's
+/// `reflectClassMember` reports auto-accessors as PropertyDeclarations, so
+/// `filterToMembersWithDecorator` collects them (typescript.ts:695). A
+/// `static accessor` stays excluded per the `!member.isStatic` filter.
+#[test]
+fn test_host_listener_on_accessor_member() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive, HostListener } from '@angular/core';
+
+@Directive({ selector: '[d]' })
+export class D {
+    @HostListener('click', ['$event']) accessor onClick = ($event: any) => {};
+    @HostListener('scroll') static accessor onScroll = () => {};
+}
+";
+
+    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code = &result.code;
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Instance accessor member produces a listener.
+    assert!(
+        compact.contains(r#"ɵɵlistener("click""#),
+        "instance @HostListener on an accessor should emit a listener. Got:\n{code}"
+    );
+    // Static accessor member is ignored, like other static members.
+    assert!(
+        !compact.contains(r#"listener("scroll""#),
+        "static @HostListener on an accessor should not emit a listener. Got:\n{code}"
+    );
+}
+
 /// `setClassMetadata`'s `propDecorators` mirrors ngtsc's `extractClassMetadata`
 /// (metadata.ts): static and ECMAScript-private members are excluded, and
 /// string-literal member keys are emitted quoted (`shouldQuoteName`).
@@ -6193,8 +6254,8 @@ export class D {
 fn test_set_class_metadata_prop_decorators_member_shape() {
     let allocator = Allocator::default();
     let source = r"
-import { Component, Input } from '@angular/core';
-import { input } from '@angular/core';
+import { Component, HostBinding, Input } from '@angular/core';
+import { signal } from '@angular/core';
 
 @Component({
     selector: 'test-comp',
@@ -6203,10 +6264,10 @@ import { input } from '@angular/core';
 })
 export class TestComponent {
     @Input() instanceProp: any;
-    @Input() static staticProp: any;
+    @HostBinding('class.b') static staticProp: any;
     @Input() #priv: any;
     @Input() 'str-key': any;
-    static statSignal = input(0);
+    static statSignal = signal(0);
 }
 ";
 
@@ -9244,6 +9305,153 @@ export class MyService {
     }
 
     insta::assert_snapshot!("jit_angular_param_decorators_on_members", result.code);
+}
+
+#[test]
+fn test_jit_any_angular_core_param_decorator_goes_to_ctor_parameters() {
+    // Issue #538: ngtsc's `isAngularDecorator` on constructor parameters checks
+    // only the `@angular/core` import, not the decorator name
+    // (`downlevel_decorators_transform.ts:475`). So a `@angular/core` decorator
+    // whose name isn't a DI one — `@Component()`, or any name imported from it
+    // (`@CustomDec`) — is listed in `ctorParameters` instead of staying a
+    // `__param` decorator. Only a foreign decorator is lowered as
+    // `__param(index, dec)`.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, Component as Cmp, Inject, Injectable } from '@angular/core';
+import { Inject as ForeignInject } from 'not-angular';
+
+const TOKEN = 'token';
+
+@Component({ selector: 'app-test', template: '' })
+export class TestComponent {
+    constructor(
+        @Inject(TOKEN) known: any,
+        @Cmp() componentDec: any,
+        @Injectable customDec: any,
+        @ForeignInject(TOKEN) foreign: any,
+    ) {}
+}
+";
+
+    let options = ComponentTransformOptions { jit: true, ..Default::default() };
+    let result =
+        transform_angular_file(&allocator, "test.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // All @angular/core decorators land in ctorParameters, listed as written.
+    assert!(
+        compact.contains(
+            "{type:undefined,decorators:[{type:Inject,args:[TOKEN]}]},\
+             {type:undefined,decorators:[{type:Cmp}]},\
+             {type:undefined,decorators:[{type:Injectable}]},"
+        ),
+        "Angular core param decorators should be in ctorParameters. Got:\n{}",
+        result.code
+    );
+
+    // The foreign @Inject is not Angular's: upstream emits `null` for a param
+    // with no type and no (Angular) decorators, and it's lowered as __param.
+    assert!(
+        compact.contains("type:Injectable}]},\nnull]")
+            || compact.contains("type:Injectable}]},null]"),
+        "foreign-decorated param should be emitted as null. Got:\n{}",
+        result.code
+    );
+    assert!(
+        compact.contains("__param(3,ForeignInject(TOKEN))"),
+        "Foreign @Inject should be lowered as __param. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !compact.contains("__param(0,")
+            && !compact.contains("__param(1,")
+            && !compact.contains("__param(2,"),
+        "Angular core param decorators must not be lowered as __param. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("jit_angular_core_param_decorators_ctor_parameters", result.code);
+}
+
+#[test]
+fn test_class_metadata_lists_any_angular_core_decorator() {
+    // Issue #538: `setClassMetadata`'s `ctorParameters` and `propDecorators`
+    // filter member/param decorators by the `@angular/core` import alone
+    // (`metadata.ts:174-176` and `:190-191` — `isAngularDecorator`), not by a
+    // decorator-name list. A member decorated `@Component()` and a parameter
+    // decorated `@Injectable()` (both imported from `@angular/core`) are
+    // listed; a same-named decorator from another module is not.
+    //
+    // Note: ngtsc rejects a non-DI `@angular/core` decorator on a ctor param
+    // in DI analysis (DECORATOR_UNEXPECTED), so upstream never emits this
+    // metadata — oxc lists it, matching the metadata filter's own semantics.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, Inject, Injectable } from '@angular/core';
+import { Inject as ForeignInject } from 'not-angular';
+
+const TOKEN = 'token';
+
+@Component({ selector: 'app-test', template: '' })
+export class TestComponent {
+    @Component()
+    componentMember: any;
+
+    @Inject(TOKEN)
+    knownMember: any;
+
+    @ForeignInject(TOKEN)
+    foreignMember: any;
+
+    constructor(
+        @Inject(TOKEN) known: any,
+        @Injectable() customDec: any,
+        @ForeignInject(TOKEN) foreign: any,
+    ) {}
+}
+";
+
+    let options = ComponentTransformOptions::default();
+    let result =
+        transform_angular_file(&allocator, "test.component.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // propDecorators: any @angular/core member decorator counts, even
+    // @Component(); the foreign one doesn't.
+    assert!(
+        compact.contains("componentMember:[{type:Component}]"),
+        "@Component() member should be in propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(
+        compact.contains("knownMember:[{type:Inject,args:[TOKEN]}]"),
+        "@Inject member should be in propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !compact.contains("foreignMember:["),
+        "foreign-decorated member should not be in propDecorators. Got:\n{}",
+        result.code
+    );
+
+    // ctorParameters: same import-only gate; a param with only foreign
+    // decorators still gets `decorators: []`, like ngtsc.
+    assert!(
+        compact.contains(
+            "{type:undefined,decorators:[{type:Inject,args:[TOKEN]}]},\
+             {type:undefined,decorators:[{type:Injectable}]},\
+             {type:undefined,decorators:[]}"
+        ),
+        "ctorParameters should list @angular/core decorators and [] for the foreign one. Got:\n{}",
+        result.code
+    );
+
+    insta::assert_snapshot!("class_metadata_angular_core_decorators", result.code);
 }
 
 // =========================================================================
@@ -12304,6 +12512,77 @@ export class UnresolvedComponent {}
     assert!(
         cmp_def.contains(r#"selectors:[["ng-component"]]"#),
         "Selector should fall back to `ng-component`.\nɵcmp:\n{cmp_def}"
+    );
+}
+
+// =============================================================================
+// Issue #514: `selector: ''` on @Component falls back to `ng-component`
+// =============================================================================
+// ngtsc maps `selector: ''` to the default selector (`resolved === '' ?
+// defaultSelector : resolved` in annotations/directive/src/shared.ts). For
+// components the default is `ng-component`, identical to a missing selector;
+// for directives the default is `null`, which raises NG2004 (directive
+// diagnostics are tracked separately — OXC emits no `selectors` entry here,
+// which is also the closest non-error output).
+
+#[test]
+fn component_empty_selector_falls_back_to_ng_component() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({ selector: '', template: '' })
+export class C {}
+"#;
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let cmp_start = result.code.find("ɵɵdefineComponent({").expect("ɵcmp missing");
+    let cmp_section = &result.code[cmp_start..];
+    let cmp_end = cmp_section.find("})").expect("ɵcmp not terminated");
+    let cmp_def = &cmp_section[..cmp_end];
+    assert!(
+        cmp_def.contains(r#"selectors:[["ng-component"]]"#),
+        "Empty selector should fall back to `ng-component`.\nɵcmp:\n{cmp_def}"
+    );
+
+    // The .d.ts selector type parameter must also fall back.
+    let decl = result.dts_declarations.iter().find(|d| d.class_name == "C").expect("d.ts missing");
+    assert!(
+        decl.members.contains("\"ng-component\""),
+        "d.ts selector should be `ng-component`.\nMembers:\n{}",
+        decl.members
+    );
+}
+
+#[test]
+fn directive_empty_selector_emits_no_invalid_selectors() {
+    // Upstream, `selector: ''` on @Directive resolves to the `null` default
+    // selector and raises NG2004. Until directive diagnostics land, the best
+    // OXC can do is not emit an invalid `selectors` array like `[[""]]` —
+    // and it must NOT fall back to `ng-component` (that fallback is
+    // component-only).
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+@Directive({ selector: '' })
+export class D {}
+"#;
+    let result = transform_angular_file(&allocator, "d.directive.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let dir_start = result.code.find("ɵɵdefineDirective({").expect("ɵdir missing");
+    let dir_section = &result.code[dir_start..];
+    let dir_end = dir_section.find("})").expect("ɵdir not terminated");
+    let dir_def = &dir_section[..dir_end];
+    assert!(
+        !dir_def.contains("selectors"),
+        "Empty directive selector must not emit `selectors`.\nɵdir:\n{dir_def}"
+    );
+    assert!(
+        !dir_def.contains("ng-component"),
+        "Directives must not get the component default selector.\nɵdir:\n{dir_def}"
     );
 }
 
@@ -15532,5 +15811,565 @@ export class CounterService {}
         decl.members.contains("static ɵprov: i0.ɵɵInjectableDeclaration<CounterService>;"),
         "Should contain ɵprov. Got:\n{}",
         decl.members
+    );
+}
+
+// ============================================================================
+// Issue #515: `jit: true` in decorator metadata opts a class out of AOT
+// ============================================================================
+// ngtsc's extractDirectiveMetadata / NgModuleDecoratorHandler return jitForced
+// when the decorator's options object has `jit`, producing no analysis (no
+// ɵcmp/ɵdir/ɵmod/ɵfac/setClassMetadata) and registering the class in
+// jitDeclarationRegistry so the JIT transform downlevels its decorators.
+
+#[test]
+fn test_jit_true_component_skips_aot() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({ jit: true, selector: 'c', template: '<p>{{x}}</p>' })
+export class C { x = 1 }
+";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    for forbidden in ["ɵcmp", "ɵfac", "ɵsetClassMetadata"] {
+        assert!(
+            !result.code.contains(forbidden),
+            "jit:true class must not emit {forbidden}. Got:\n{}",
+            result.code
+        );
+    }
+    assert!(
+        result.code.contains("import { __decorate } from \"tslib\""),
+        "Should import __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("let C = class C {"),
+        "Class should be restructured as a class expression. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code
+            .contains("C = __decorate([\n    Component({ jit: true, selector: 'c', template: '<p>{{x}}</p>' })\n], C);"),
+        "Should downlevel the decorator via __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("export { C };"), "Should re-export. Got:\n{}", result.code);
+    // No Ivy fields in the .d.ts either.
+    assert!(result.dts_declarations.is_empty(), "jit:true must not emit d.ts Ivy fields");
+}
+
+#[test]
+fn test_jit_true_directive_skips_aot() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive } from '@angular/core';
+
+@Directive({ jit: true, selector: '[d]' })
+export class D {}
+";
+    let result = transform_angular_file(&allocator, "d.directive.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    for forbidden in ["ɵdir", "ɵfac", "ɵsetClassMetadata"] {
+        assert!(
+            !result.code.contains(forbidden),
+            "jit:true directive must not emit {forbidden}. Got:\n{}",
+            result.code
+        );
+    }
+    assert!(
+        result
+            .code
+            .contains("D = __decorate([\n    Directive({ jit: true, selector: '[d]' })\n], D);"),
+        "Should downlevel via __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(result.dts_declarations.is_empty());
+}
+
+#[test]
+fn test_jit_true_ng_module_skips_aot() {
+    let allocator = Allocator::default();
+    let source = r"
+import { NgModule } from '@angular/core';
+
+@NgModule({ jit: true, declarations: [] })
+export class M {}
+";
+    let result = transform_angular_file(&allocator, "m.module.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    for forbidden in ["ɵmod", "ɵinj", "ɵfac", "ɵsetClassMetadata"] {
+        assert!(
+            !result.code.contains(forbidden),
+            "jit:true NgModule must not emit {forbidden}. Got:\n{}",
+            result.code
+        );
+    }
+    assert!(
+        result
+            .code
+            .contains("M = __decorate([\n    NgModule({ jit: true, declarations: [] })\n], M);"),
+        "Should downlevel via __decorate. Got:\n{}",
+        result.code
+    );
+    assert!(result.dts_declarations.is_empty());
+}
+
+#[test]
+fn test_jit_true_mixed_file() {
+    // A jit:true class and a normal component in the same file: only the
+    // jit:true class is skipped; the other still compiles AOT.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({ jit: true, selector: 'jit-c', template: 'jit' })
+export class JitComp {}
+
+@Component({ selector: 'aot-c', template: 'aot' })
+export class AotComp {}
+";
+    let result = transform_angular_file(&allocator, "mix.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert_eq!(result.component_count, 1, "Only the AOT component counts");
+    assert!(
+        result.code.contains("JitComp = __decorate("),
+        "JitComp should be downleveled. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("AotComp.ɵcmp") || result.code.contains("static ɵcmp"),
+        "AotComp should still compile. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("JitComp.ɵfac"),
+        "JitComp must not get ɵfac. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_jit_true_member_and_ctor_metadata() {
+    // Member decorators become propDecorators, constructor parameters become
+    // ctorParameters, and their imports stay live (upstream: TypeScript's
+    // import elision sees the rewritten AST).
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, Input, Inject, Optional } from '@angular/core';
+import { SomeService } from './svc';
+
+@Component({ jit: true, selector: 'c', template: 'hi' })
+export class C {
+    @Input() x = 1;
+    constructor(private s: SomeService, @Optional() @Inject('TOK') private t?: string) {}
+}
+";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(
+        result.code.contains("import { SomeService } from './svc';"),
+        "ctor type import must survive elision. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("import { Component, Input, Inject, Optional }"),
+        "Angular imports must survive. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("static ctorParameters"), "Got:\n{}", result.code);
+    assert!(result.code.contains("{ type: SomeService }"), "Got:\n{}", result.code);
+    assert!(
+        result.code.contains("{ type: Optional }") && result.code.contains("type: Inject"),
+        "Param decorators belong in ctorParameters. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("static propDecorators")
+            && result.code.contains("x: [{ type: Input }]"),
+        "@Input belongs in propDecorators. Got:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("@Input"),
+        "Member decorator must be removed. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_jit_true_with_injectable() {
+    // Upstream's InjectableHandler runs independently of the jitForced
+    // short-circuit: a @Component({jit:true}) + @Injectable class keeps its
+    // ɵfac/ɵprov and setClassMetadata while its decorators are downleveled.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, Injectable } from '@angular/core';
+
+@Component({ jit: true, selector: 'c', template: 'hi' })
+@Injectable()
+export class C {}
+";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    assert!(result.code.contains("static ɵfac"), "ɵfac expected. Got:\n{}", result.code);
+    assert!(result.code.contains("static ɵprov"), "ɵprov expected. Got:\n{}", result.code);
+    assert!(!result.code.contains("ɵcmp"), "No ɵcmp. Got:\n{}", result.code);
+    assert!(
+        result.code.contains("Injectable()") && result.code.contains("C = __decorate("),
+        "Both decorators should be downleveled. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("import * as i0 from '@angular/core'"),
+        "ɵfac/ɵprov need i0. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn test_jit_false_still_forces_jit() {
+    // Upstream checks `directive.has('jit')` — presence, not value — so
+    // `jit: false` (type-invalid input) still opts out of AOT.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({ jit: false, selector: 'c', template: 'hi' })
+export class C {}
+";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert_eq!(result.component_count, 0);
+    assert!(!result.code.contains("static ɵcmp"), "Got:\n{}", result.code);
+    assert!(result.code.contains("__decorate"), "Got:\n{}", result.code);
+}
+
+#[test]
+fn test_jit_true_signal_apis() {
+    // Signal initializer APIs synthesize propDecorators referencing the
+    // @angular/core namespace — the i0 import must be added for a jit:true
+    // class even though nothing else in the file needs it.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, input } from '@angular/core';
+
+@Component({ jit: true, selector: 'c', template: 'hi' })
+export class C {
+    x = input.required<string>();
+}
+";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(
+        result.code.contains("import * as i0 from '@angular/core'"),
+        "Synthesized i0.Input needs the namespace import. Got:\n{}",
+        result.code
+    );
+    assert!(result.code.contains("type: i0.Input"), "Got:\n{}", result.code);
+}
+
+#[test]
+fn test_jit_true_no_stray_i0_import() {
+    // A jit:true class without signal APIs / @Injectable references no i0 —
+    // no @angular/core namespace import should be added.
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive } from '@angular/core';
+
+@Directive({ jit: true, selector: '[d]' })
+export class D {}
+";
+    let result = transform_angular_file(&allocator, "d.ts", source, None, None);
+    assert!(
+        !result.code.contains("import * as i0"),
+        "Unused i0 import must not be emitted. Got:\n{}",
+        result.code
+    );
+}
+
+// ============================================================================
+// Angular decorators on `static` members (INCORRECTLY_DECLARED_ON_STATIC_MEMBER)
+// ============================================================================
+// ngtsc's `extractDirectiveMetadata` rejects inputs, outputs and queries on
+// static members (shared.ts `parseInputFields` / `parseOutputFields` /
+// `parseQueriesOfClassFields`). `decorator_io_errors` mirrors those checks for
+// @Component/@Directive/@Pipe classes. HostBinding/HostListener on statics are
+// ignored upstream (`filterToMembersWithDecorator` drops static members), so
+// they stay silent.
+
+fn expect_diagnostics(source: &str) -> Vec<String> {
+    let allocator = Allocator::default();
+    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
+    result.diagnostics.iter().map(|d| format!("{d}")).collect()
+}
+
+#[test]
+fn test_static_input_member_is_diagnostic() {
+    // `@Input` on a static field, setter and signal/model initializer all map
+    // to the same upstream error, with the member and class names.
+    for member in [
+        "@Input() static x = 0;",
+        "@Input() static set x(v: number) {}",
+        "static x = input(0);",
+        "static x = input.required<number>();",
+        "static x = model(0);",
+    ] {
+        let source = format!(
+            "import {{ Directive, Input, input, model }} from '@angular/core';\n\
+             @Directive({{ selector: '[d]' }})\n\
+             export class D {{\n    {member}\n}}"
+        );
+        let diagnostics = expect_diagnostics(&source);
+        let expected = "Input \"x\" is incorrectly declared as static member of \"D\".";
+        assert!(
+            diagnostics.iter().any(|d| d.contains(expected)),
+            "`{member}` should report {expected:?}. Got: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn test_static_input_on_component_is_diagnostic_and_pipe_is_silent() {
+    // extractDirectiveMetadata runs for @Component, but upstream's
+    // PipeDecoratorHandler never calls it: io/query checks don't apply to
+    // pipes, so a static input or a `queries:` field on a pipe is ignored.
+    let source = "import { Component, Input } from '@angular/core';\n\
+                  @Component({ selector: 'c', template: '' })\n\
+                  export class C {\n    @Input() static x = 0;\n}";
+    let diagnostics = expect_diagnostics(source);
+    let expected = "Input \"x\" is incorrectly declared as static member of \"C\".";
+    assert!(
+        diagnostics.iter().any(|d| d.contains(expected)),
+        "@Component should report {expected:?}. Got: {diagnostics:?}"
+    );
+
+    for source in [
+        "import { Input, Pipe } from '@angular/core';\n\
+         @Pipe({ name: 'p' })\n\
+         export class P {\n    @Input() static x = 0;\n}",
+        "import { Pipe, ViewChild } from '@angular/core';\n\
+         @Pipe({ name: 'p', queries: { q: new ViewChild(42) } })\n\
+         export class P {}",
+    ] {
+        let diagnostics = expect_diagnostics(source);
+        assert!(
+            diagnostics.is_empty(),
+            "@Pipe members and metadata should not get io/query diagnostics. Got: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn test_static_output_member_is_diagnostic() {
+    // `model()` is covered by the input test: ngtsc's `parseInputFields` runs
+    // first, so a static model reports the Input error, not the Output one.
+    // Members without an initializer — a bare declaration and a method — hit
+    // the same check (tryParseDecoratorOutput accepts any member kind).
+    for member in [
+        "@Output() static y = new EventEmitter();",
+        "@Output() static y: EventEmitter<number>;",
+        "@Output() static emit() {}",
+        "static y = output<number>();",
+        "static y = outputFromObservable(of(0));",
+    ] {
+        let source = format!(
+            "import {{ Directive, EventEmitter, Output, model, output }} from '@angular/core';\n\
+             import {{ outputFromObservable }} from '@angular/core/rxjs-interop';\n\
+             @Directive({{ selector: '[d]' }})\n\
+             export class D {{\n    {member}\n}}"
+        );
+        let diagnostics = expect_diagnostics(&source);
+        let expected = "Output is incorrectly declared on a static class member.";
+        assert!(
+            diagnostics.iter().any(|d| d.contains(expected)),
+            "`{member}` should report {expected:?}. Got: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn test_query_decorator_on_method_reports_property_type_member() {
+    // `isPropertyTypeMember` (shared.ts) runs before the static check, so a
+    // query decorator on a method — static or not — is DECORATOR_UNEXPECTED,
+    // while a query on an accessor counts as a property member upstream.
+    for member in [
+        "@ViewChild('a') m() {}",
+        "@ViewChild('a') static m() {}",
+        "@ViewChild('a') constructor() {}",
+    ] {
+        let source = format!(
+            "import {{ Directive, ViewChild }} from '@angular/core';\n\
+             @Directive({{ selector: '[d]' }})\n\
+             export class D {{\n    {member}\n}}"
+        );
+        let diagnostics = expect_diagnostics(&source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("Query decorator must go on a property-type member")),
+            "`{member}` should report the property-type error. Got: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn test_query_on_accessor_member_compiles() {
+    // A TS `accessor` field reflects upstream as a property member
+    // (`isPropertyTypeMember`): decorator and signal queries on it compile.
+    let allocator = Allocator::default();
+    for (member, instr) in [
+        ("@ViewChild('el') accessor z: any;", "ɵɵviewQuery"),
+        ("accessor z = viewChild('el');", "ɵɵviewQuerySignal"),
+        ("@ContentChild('el') accessor c: any;", "ɵɵcontentQuery"),
+        ("accessor c = contentChild('el');", "ɵɵcontentQuerySignal"),
+    ] {
+        let source = format!(
+            "import {{ Component, ViewChild, ContentChild, viewChild, contentChild }} \
+             from '@angular/core';\n\
+             @Component({{ selector: 'c', template: '' }})\n\
+             export class C {{\n    {member}\n}}"
+        );
+        let result = transform_angular_file(&allocator, "test.ts", &source, None, None);
+        assert!(!result.has_errors(), "`{member}` should not error: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains(instr),
+            "`{member}` should emit `{instr}(...)`. Got:\n{}",
+            result.code
+        );
+    }
+}
+
+#[test]
+fn test_static_query_member_is_diagnostic() {
+    for member in [
+        "@ViewChild('el') static z: any;",
+        "@ViewChildren('el') static z: any;",
+        "@ContentChild('el') static z: any;",
+        "@ContentChildren('el') static z: any;",
+        "static z = viewChild('el');",
+        "static z = viewChildren('el');",
+        "static z = contentChild.required('el');",
+        "static z = contentChildren('el');",
+    ] {
+        let source = format!(
+            "import {{ Component, ContentChild, ContentChildren, ViewChild, ViewChildren, \
+             contentChild, contentChildren, viewChild, viewChildren }} from '@angular/core';\n\
+             @Component({{ selector: 'c', template: '' }})\n\
+             export class C {{\n    {member}\n}}"
+        );
+        let diagnostics = expect_diagnostics(&source);
+        let expected = "Query is incorrectly declared on a static class member.";
+        assert!(
+            diagnostics.iter().any(|d| d.contains(expected)),
+            "`{member}` should report {expected:?}. Got: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn test_static_host_binding_and_listener_produce_no_diagnostic() {
+    // ngtsc's `filterToMembersWithDecorator` drops static members before host
+    // metadata is collected: @HostBinding/@HostListener on statics are ignored
+    // upstream, not an error (#544), so no diagnostic is emitted for them.
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive, HostBinding, HostListener } from '@angular/core';
+
+@Directive({ selector: '[d]' })
+export class D {
+    @HostBinding('class.b') static b = true;
+    @HostListener('scroll') static onScroll() {}
+}
+";
+    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
+    assert!(
+        !result.has_errors(),
+        "@HostBinding/@HostListener on statics must not produce a diagnostic: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn test_static_member_checks_keep_ngtsc_error_order() {
+    // `tryParseInputFieldMapping` reports a decorator+initializer collision
+    // before `parseInputFields` gets to the static check.
+    let diagnostics = expect_diagnostics(
+        "import { Directive, Input, input } from '@angular/core';\n\
+         @Directive({ selector: '[d]' })\n\
+         export class D {\n    @Input() static x = input(0);\n}",
+    );
+    assert!(
+        diagnostics.iter().any(|d| d.contains("Using @Input with a signal input is not allowed.")),
+        "@Input + input() should report the collision, not the static error. Got: {diagnostics:?}"
+    );
+
+    // `tryParseInitializerBasedOutput` rejects output.required() before the
+    // static check (INITIALIZER_API_NO_REQUIRED_FUNCTION).
+    let diagnostics = expect_diagnostics(
+        "import { Directive, output } from '@angular/core';\n\
+         @Directive({ selector: '[d]' })\n\
+         export class D {\n    static y = output.required();\n}",
+    );
+    assert!(
+        diagnostics.iter().any(|d| d.contains("Output does not support \".required()\".")),
+        "output.required() should report the required() error. Got: {diagnostics:?}"
+    );
+
+    // `tryParseSignalQueryFromInitializer` reports its own errors and the
+    // decorator+signal collision before the static check.
+    let diagnostics = expect_diagnostics(
+        "import { Directive, viewChild } from '@angular/core';\n\
+         @Directive({ selector: '[d]' })\n\
+         export class D {\n    static z = viewChild();\n}",
+    );
+    assert!(
+        diagnostics.iter().any(|d| d.contains("No locator specified.")),
+        "viewChild() without a locator should error. Got: {diagnostics:?}"
+    );
+    let diagnostics = expect_diagnostics(
+        "import { Directive, ViewChild, viewChild } from '@angular/core';\n\
+         @Directive({ selector: '[d]' })\n\
+         export class D {\n    @ViewChild('a') static z = viewChild('b');\n}",
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.contains("Using @ViewChild with a signal-based query is not allowed.")),
+        "@ViewChild + viewChild() should report the collision. Got: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn test_instance_input_output_query_members_have_no_static_diagnostic() {
+    // The same declarations without `static` stay valid.
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, EventEmitter, Input, Output, ViewChild, input, output, viewChild }
+    from '@angular/core';
+
+@Component({ selector: 'c', template: '' })
+export class C {
+    @Input() x = 0;
+    @Output() y = new EventEmitter<number>();
+    @ViewChild('el') z: any;
+    xi = input(0);
+    yo = output<number>();
+    vq = viewChild('el');
+}
+";
+    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
+    assert!(
+        !result.has_errors(),
+        "instance members must not produce the static-member diagnostic: {:?}",
+        result.diagnostics
     );
 }
