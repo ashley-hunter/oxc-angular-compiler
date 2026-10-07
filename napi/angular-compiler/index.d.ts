@@ -212,6 +212,28 @@ export interface DtsDeclaration {
    * Newline-separated `static` property declarations.
    */
   members: string
+  /**
+   * Module specifier for every namespace alias the members reference
+   * (alias → specifier, `@angular/core` included). Consumers must emit
+   * `import * as <alias> from "<specifier>"` for each — or rewrite the
+   * member heads to their own canonical aliases.
+   */
+  namespaceImports: Record<string, string>
+}
+
+/** One class's `.d.ts` declarations for [`inject_dts_declarations`]. */
+export interface DtsInjectDeclaration {
+  /** The class the members belong to. */
+  className: string
+  /** Newline-separated `static …;` member declarations. */
+  members: string
+  /** alias → module specifier for every namespace the members reference. */
+  namespaceImports?: Record<string, string>
+  /**
+   * The source module the declaration was compiled from; used to resolve
+   * relative specifiers in `namespace_imports` for identity.
+   */
+  sourceFile?: string
 }
 
 /**
@@ -551,6 +573,19 @@ export interface HostMetadataInput {
   /** Special attribute for static style binding. */
   styleAttr?: string
 }
+
+/**
+ * Inject Ivy `.d.ts` member declarations into an emitted declaration file.
+ *
+ * Splices each declaration's `static` members into the matching class body
+ * and emits the namespace imports they reference, canonicalized one alias
+ * per module identity. See `dts_inject` in `oxc_angular_compiler` for the
+ * full contract.
+ */
+export declare function injectDtsDeclarations(
+  source: string,
+  declarations: Array<DtsInjectDeclaration>,
+): string
 
 /**
  * Input for compiling an injector.
@@ -946,9 +981,13 @@ export interface TransformResult {
    * This enables library builds to include proper Ivy type declarations
    * for template type-checking by consumers.
    *
-   * The declarations use `i0` as the namespace alias for `@angular/core`.
-   * Consumers must ensure their `.d.ts` files include:
-   * `import * as i0 from "@angular/core";`
+   * The declarations reference `@angular/core` through the same
+   * namespace alias the JS emit used — `i0` uniquified (`i0_1`, …)
+   * against every identifier in the original `.ts` file, matching
+   * upstream's declaration `ImportManager`, which never reuses an
+   * existing import. Consumers must ensure their `.d.ts` files include
+   * a matching `import * as <ns> from "@angular/core";` — the alias can
+   * be read back from the member text (`<ns>.ɵɵ…Declaration`).
    */
   dtsDeclarations: Array<DtsDeclaration>
 }

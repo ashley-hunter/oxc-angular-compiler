@@ -346,6 +346,12 @@ pub struct DtsDeclaration {
     /// The static member declarations to add to the class body in `.d.ts`.
     /// Newline-separated `static` property declarations.
     pub members: String,
+    /// Module specifier for every namespace alias the members reference
+    /// (alias → specifier, `@angular/core` included). Consumers must emit
+    /// `import * as <alias> from "<specifier>"` for each — or rewrite the
+    /// member heads to their own canonical aliases.
+    #[napi(ts_type = "Record<string, string>")]
+    pub namespace_imports: HashMap<String, String>,
 }
 
 /// Result of transforming an Angular file.
@@ -387,10 +393,50 @@ pub struct TransformResult {
     /// This enables library builds to include proper Ivy type declarations
     /// for template type-checking by consumers.
     ///
-    /// The declarations use `i0` as the namespace alias for `@angular/core`.
-    /// Consumers must ensure their `.d.ts` files include:
-    /// `import * as i0 from "@angular/core";`
+    /// The declarations reference `@angular/core` through the same
+    /// namespace alias the JS emit used — `i0` uniquified (`i0_1`, …)
+    /// against every identifier in the original `.ts` file, matching
+    /// upstream's declaration `ImportManager`, which never reuses an
+    /// existing import. Consumers must ensure their `.d.ts` files include
+    /// a matching `import * as <ns> from "@angular/core";` — the alias can
+    /// be read back from the member text (`<ns>.ɵɵ…Declaration`).
     pub dts_declarations: Vec<DtsDeclaration>,
+}
+
+/// One class's `.d.ts` declarations for [`inject_dts_declarations`].
+#[derive(Default)]
+#[napi(object)]
+pub struct DtsInjectDeclaration {
+    /// The class the members belong to.
+    pub class_name: String,
+    /// Newline-separated `static …;` member declarations.
+    pub members: String,
+    /// alias → module specifier for every namespace the members reference.
+    #[napi(ts_type = "Record<string, string>")]
+    pub namespace_imports: Option<HashMap<String, String>>,
+    /// The source module the declaration was compiled from; used to resolve
+    /// relative specifiers in `namespace_imports` for identity.
+    pub source_file: Option<String>,
+}
+
+/// Inject Ivy `.d.ts` member declarations into an emitted declaration file.
+///
+/// Splices each declaration's `static` members into the matching class body
+/// and emits the namespace imports they reference, canonicalized one alias
+/// per module identity. See `dts_inject` in `oxc_angular_compiler` for the
+/// full contract.
+#[napi]
+pub fn inject_dts_declarations(source: String, declarations: Vec<DtsInjectDeclaration>) -> String {
+    let declarations: Vec<oxc_angular_compiler::DtsInjectDeclaration> = declarations
+        .into_iter()
+        .map(|d| oxc_angular_compiler::DtsInjectDeclaration {
+            class_name: d.class_name,
+            members: d.members,
+            namespace_imports: d.namespace_imports.unwrap_or_default().into_iter().collect(),
+            source_file: d.source_file,
+        })
+        .collect();
+    oxc_angular_compiler::inject_dts_declarations(&source, &declarations)
 }
 
 /// Compile an Angular template to JavaScript.
@@ -1171,7 +1217,11 @@ impl Task for TransformAngularFileTask {
             dts_declarations: result
                 .dts_declarations
                 .into_iter()
-                .map(|d| DtsDeclaration { class_name: d.class_name, members: d.members })
+                .map(|d| DtsDeclaration {
+                    class_name: d.class_name,
+                    members: d.members,
+                    namespace_imports: d.namespace_imports,
+                })
                 .collect(),
         })
     }
@@ -1423,7 +1473,7 @@ pub fn compile_pipe_sync(
                 }
 
                 let r3_metadata = builder.build();
-                let result = compile_pipe(&allocator, &r3_metadata);
+                let result = compile_pipe(&allocator, "i0", &r3_metadata);
                 let emitter = JsEmitter::new();
                 let code = emitter.emit_expression(&result.expression);
 
@@ -1970,7 +2020,7 @@ pub fn compile_injector_sync(input: InjectorCompileInput) -> InjectorNapiCompile
         };
     };
 
-    let result = compile_injector(&allocator, &metadata);
+    let result = compile_injector(&allocator, "i0", &metadata);
     let emitter = JsEmitter::new();
     let code = emitter.emit_expression(&result.expression);
 
@@ -2135,7 +2185,11 @@ pub fn compile_class_metadata_sync(
     };
 
     // Compile to output expression
-    let result = compile_class_metadata(&allocator, &metadata);
+    let result = compile_class_metadata(
+        &allocator,
+        namespace_registry.angular_core_ns().as_str(),
+        &metadata,
+    );
 
     // Emit to JavaScript
     let emitter = JsEmitter::new();
@@ -2384,7 +2438,7 @@ fn compile_factory_impl(input: FactoryCompileInput) -> FactoryNapiCompileResult 
     });
 
     // Compile and emit
-    let result = compile_factory_function(&allocator, &metadata, &factory_name);
+    let result = compile_factory_function(&allocator, "i0", &metadata, &factory_name);
     let emitter = JsEmitter::new();
     let code = emitter.emit_expression(&result.expression);
 
