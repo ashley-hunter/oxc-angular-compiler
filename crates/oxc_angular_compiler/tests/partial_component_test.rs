@@ -332,3 +332,166 @@ export class BarComponent {}
     let code = compile_partial(&allocator, "bar.component.ts", source);
     assert!(!code.contains("dependencies:"), "no imports → no dependencies field, got:\n{code}");
 }
+
+// ---- queries (issue #513) --------------------------------------------------
+
+/// Member-decorator queries on a component land in the partial declaration:
+/// `queries` for content queries, `viewQueries` for view queries — the same
+/// shape directives emit (upstream builds the component map on top of the
+/// directive map).
+#[test]
+fn partial_component_emits_view_and_content_queries() {
+    let allocator = Allocator::default();
+    let source = "import { Component, ViewChild, ContentChild, ElementRef } from '@angular/core';
+
+@Component({ selector: 'c', template: '<div #a></div>' })
+export class C {
+  @ViewChild('a') q!: ElementRef;
+  @ContentChild('b') c!: unknown;
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(
+            r#"viewQueries:[{propertyName:"q",first:true,predicate:["a"],descendants:true}]"#
+        ),
+        "expected viewQueries map, got:\n{code}"
+    );
+    assert!(
+        compact.contains(
+            r#"queries:[{propertyName:"c",first:true,predicate:["b"],descendants:true}]"#
+        ),
+        "expected queries map, got:\n{code}"
+    );
+}
+
+/// `queries:` declared in the decorator itself must be emitted too
+/// (ngtsc emits both member decorators and the `queries:` field).
+#[test]
+fn partial_component_emits_decorator_queries_field() {
+    let allocator = Allocator::default();
+    let source = "import { Component, ViewChildren, QueryList, ElementRef } from '@angular/core';
+
+@Component({
+  selector: 'c',
+  template: '<div #a></div>',
+  queries: { items: new ViewChildren('a') },
+})
+export class C {
+  items!: QueryList<ElementRef>;
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact
+            .contains(r#"viewQueries:[{propertyName:"items",predicate:["a"],descendants:true}]"#),
+        "expected decorator queries in viewQueries, got:\n{code}"
+    );
+}
+
+/// Signal queries (`viewChild(...)`) emit `isSignal: true` and bump
+/// `minVersion` to 17.2.0 — the linker version that understands them
+/// (directive.ts:146-149).
+#[test]
+fn partial_component_signal_queries_bump_min_version() {
+    let allocator = Allocator::default();
+    let source =
+        "import { Component, viewChild, contentChildren, ElementRef } from '@angular/core';
+
+@Component({ selector: 'c', template: '<div #a></div>' })
+export class C {
+  q = viewChild<ElementRef>('a');
+  cs = contentChildren<ElementRef>('b');
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(r#"viewQueries:[{propertyName:"q",first:true,predicate:["a"],descendants:true,isSignal:true}]"#),
+        "expected signal viewQuery, got:\n{code}"
+    );
+    // `descendants` is omitted: it defaults to false for contentChildren
+    // (query_functions.ts defaultDescendantsValue — true for every query
+    // function except contentChildren).
+    assert!(
+        compact.contains(r#"queries:[{propertyName:"cs",predicate:["b"],isSignal:true}]"#),
+        "expected signal content query, got:\n{code}"
+    );
+    assert!(compact.contains(r#"minVersion:"17.2.0""#), "expected minVersion 17.2.0, got:\n{code}");
+}
+
+/// A `forwardRef(() => Child)` predicate must stay wrapped in the partial
+/// output: the declaration is evaluated at class-definition time, so a bare
+/// `Child` would hit the TDZ when `Child` is declared later. Upstream
+/// re-wraps via `convertFromMaybeForwardRefExpression` (util.ts).
+#[test]
+fn partial_component_preserves_forward_ref_query_predicates() {
+    let allocator = Allocator::default();
+    let source = "import { Component, ViewChild, forwardRef } from '@angular/core';
+import { ChildDir } from './child';
+
+@Component({ selector: 'c', template: '<div></div>' })
+export class C {
+  @ViewChild(forwardRef(() => ChildDir)) q!: ChildDir;
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    assert!(
+        code.contains("predicate:i0.forwardRef(function") && code.contains("return ChildDir"),
+        "expected forwardRef-wrapped predicate, got:\n{code}"
+    );
+}
+
+/// Same for signal queries — `viewChild(forwardRef(() => T))` keeps its
+/// wrapper and still emits `isSignal: true`.
+#[test]
+fn partial_component_signal_query_preserves_forward_ref() {
+    let allocator = Allocator::default();
+    let source = "import { Component, viewChild, forwardRef } from '@angular/core';
+import { ChildDir } from './child';
+
+@Component({ selector: 'c', template: '<div></div>' })
+export class C {
+  q = viewChild(forwardRef(() => ChildDir));
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    assert!(
+        code.contains("predicate:i0.forwardRef(function") && code.contains("isSignal:true"),
+        "expected forwardRef-wrapped signal predicate, got:\n{code}"
+    );
+}
+
+/// Round-trip: the linked ɵɵdefineComponent must carry the queries so
+/// `@ViewChild`/`@ContentChild` actually resolve at runtime (the issue's
+/// user-visible symptom).
+#[test]
+fn linked_component_gets_queries() {
+    let allocator = Allocator::default();
+    let source = "import { Component, ViewChild, ContentChild, ElementRef } from '@angular/core';
+
+@Component({ selector: 'c', template: '<div #a></div>' })
+export class C {
+  @ViewChild('a') q!: ElementRef;
+  @ContentChild('b') c!: unknown;
+}
+";
+    let code = compile_partial(&allocator, "test.ts", source);
+    // `.ts` — the partial output still carries TS syntax (field type
+    // annotations); a bundler would strip types before the linker sees it.
+    let linked = link(&allocator, &code, "test.ts");
+    assert!(linked.linked, "linker should accept the partial output, emitted:\n{code}");
+    let compact: String = linked.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("viewQuery:"),
+        "linked output should wire the view query, got:\n{}",
+        linked.code
+    );
+    assert!(
+        compact.contains("contentQueries:"),
+        "linked output should wire the content query, got:\n{}",
+        linked.code
+    );
+}
