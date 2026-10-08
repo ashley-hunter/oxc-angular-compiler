@@ -851,8 +851,21 @@ fn ingest_node<'a>(job: &mut ComponentCompilationJob<'a>, view_xref: XrefId, nod
         R3Node::IfBlockBranch(_) => {
             // If branches are handled by the parent if block
         }
-        R3Node::Component(_) | R3Node::Directive(_) | R3Node::HostElement(_) => {
-            // Components, directives, and host elements are resolved during binding/type checking
+        R3Node::Component(component) => {
+            // Only a selectorless parse produces these, and the pipeline cannot compile
+            // them. Angular's ingest skips them without a word; reporting the node keeps
+            // a template from compiling to less than it contains.
+            job.diagnostics.push(
+                OxcDiagnostic::error(format!(
+                    "Selectorless component <{}> cannot be compiled: selectorless components \
+                     are not supported.",
+                    component.component_name
+                ))
+                .with_label(component.source_span),
+            );
+        }
+        R3Node::Directive(_) | R3Node::HostElement(_) => {
+            // Directives and host elements are resolved during binding/type checking
         }
     }
 }

@@ -434,7 +434,9 @@ impl<'a> HtmlToR3Transform<'a> {
                 }
                 return None;
             }
-            if raw_name == "link" {
+            // Like `script` and `style` above, the preparser lowercases the name before
+            // it looks for `link` and `ng-content` (`preparseElement`).
+            if raw_name.eq_ignore_ascii_case("link") {
                 // Collect stylesheet URLs
                 if let Some(href) = self.get_stylesheet_href(element) {
                     self.style_urls.push(href);
@@ -588,7 +590,7 @@ impl<'a> HtmlToR3Transform<'a> {
         // Check for ng-content
         // Reference: r3_template_transform.ts lines 191-204
         // Children are passed directly without extra whitespace filtering
-        if raw_name == "ng-content" {
+        if raw_name.eq_ignore_ascii_case("ng-content") {
             let selector = self.get_ng_content_selector(element);
             self.ng_content_selectors.push(selector);
 
@@ -684,24 +686,10 @@ impl<'a> HtmlToR3Transform<'a> {
 
         let name = Ident::from_in(resolved_name.as_str(), &self.allocator);
 
-        // Check if this is a component (uppercase first letter or underscore)
-        let first_char = raw_name.chars().next().unwrap_or('a');
-        let is_component = first_char.is_ascii_uppercase() || first_char == '_';
-
-        let mut result = if is_component {
-            // Parsed components already checked the host tag. An uppercase element
-            // from a non-selectorless parse (`<Link>`) still uses the element name.
-            if !element.is_component {
-                let tag_name_lower = raw_name.to_ascii_lowercase();
-                if UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag_name_lower.as_str()) {
-                    self.report_error(
-                        &format!("Tag name \"{raw_name}\" cannot be used as a component tag"),
-                        element.start_span,
-                    );
-                    return None;
-                }
-            }
-
+        // Only the lexer decides that a tag is a selectorless component, and only when
+        // selectorless parsing is enabled. An element name is otherwise kept as written,
+        // whatever its case: `<View>` is an element named "View".
+        let mut result = if element.is_component {
             // Validate selectorless references
             self.validate_selectorless_references(&references);
 

@@ -611,3 +611,30 @@ describe('object spread in template bindings', () => {
     expect(result.code).toContain('ctx.b')
   })
 })
+
+describe('capitalised element names', () => {
+  it('compiles <View> as an element instead of dropping the template', async () => {
+    const source = `import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '<View><text>hi</text></View>' })
+export class X {}`
+
+    const result = await transformAngularFile(source, '/x/a.ts', {})
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.code).toMatch(/decls:\s*3/)
+    expect(result.code).toMatch(/ɵɵelementStart\(0,\s*"View"\)\(1,\s*"text"\)/)
+    expect(result.code).toMatch(/ɵɵtext\(2,\s*"hi"\)/)
+  })
+
+  it('compiles capitalised elements with optional end tags without hanging', async () => {
+    const source = `import { Component } from '@angular/core';
+@Component({ selector: 'x', template: '<UL><LI>a<LI>b</UL>' })
+export class X {}`
+
+    const result = await transformAngularFile(source, '/x/a.ts', {})
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.code).toMatch(/decls:\s*5/)
+    expect(result.code).toMatch(/ɵɵelementStart\(0,\s*"UL"\)\(1,\s*"LI"\)/)
+  })
+})

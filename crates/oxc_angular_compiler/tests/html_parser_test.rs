@@ -1416,6 +1416,86 @@ mod case_sensitivity {
         assert!(!errors.is_empty());
         assert!(errors[0].contains("Unexpected closing tag"));
     }
+
+    #[test]
+    fn should_match_closing_tags_case_sensitive() {
+        // TS: it('should match closing tags case sensitive', ...)
+        let allocator = Allocator::default();
+        let result = HtmlParser::new(&allocator, "<DiV><P></p></dIv>", "TestComp").parse();
+        let errors: Vec<_> = result
+            .errors
+            .iter()
+            .map(|e| (e.msg.split('.').next().unwrap_or_default(), e.span.start.offset))
+            .collect();
+        assert_eq!(
+            errors,
+            vec![("Unexpected closing tag \"p\"", 8), ("Unexpected closing tag \"dIv\"", 12)]
+        );
+    }
+
+    /// An element with an optional end tag is closed by the next one whatever its case.
+    /// The open element used to be looked up by its lowercased name, never found, and
+    /// the parser looped forever.
+    #[test]
+    fn should_close_capitalised_elements_with_optional_end_tags() {
+        assert_eq!(
+            parse_and_humanize("<UL><LI>a<LI>b</UL>"),
+            vec![element("UL", 0), element("LI", 1), text("a", 2), element("LI", 1), text("b", 2),]
+        );
+        assert_eq!(
+            parse_and_humanize("<P>a<P>b"),
+            vec![element("P", 0), text("a", 1), element("P", 0), text("b", 1)]
+        );
+        assert_eq!(
+            parse_and_humanize("<Tr><Td>a<Td>b"),
+            vec![element("Tr", 0), element("Td", 1), text("a", 2), element("Td", 1), text("b", 2),]
+        );
+        // The two spellings close each other.
+        assert_eq!(
+            parse_and_humanize("<li>a<LI>b<Li>c"),
+            vec![
+                element("li", 0),
+                text("a", 1),
+                element("LI", 0),
+                text("b", 1),
+                element("Li", 0),
+                text("c", 1),
+            ]
+        );
+    }
+
+    /// `<STYLE>`, `<SCRIPT>`, `<TEXTAREA>` and `<TITLE>` hold raw text like their lowercase
+    /// forms. Their closing tag is matched ignoring case and closes the element as it
+    /// was opened.
+    #[test]
+    fn should_parse_capitalised_raw_text_elements() {
+        assert_eq!(
+            parse_and_humanize("<STYLE>p > a{}</STYLE>"),
+            vec![element("STYLE", 0), text("p > a{}", 1)]
+        );
+        assert_eq!(
+            parse_and_humanize("<Script>if (a < b) {}</script>"),
+            vec![element("Script", 0), text("if (a < b) {}", 1)]
+        );
+        assert_eq!(
+            parse_and_humanize("<TEXTAREA><b>x</b></TEXTAREA>"),
+            vec![element("TEXTAREA", 0), text("<b>x</b>", 1)]
+        );
+        assert_eq!(
+            parse_and_humanize("<Title>a</TITLE><p>b</p>"),
+            vec![element("Title", 0), text("a", 1), element("p", 0), text("b", 1)]
+        );
+    }
+
+    /// A tag name starts with a letter. `<_x>` is text, so its closing tag closes nothing.
+    #[test]
+    fn should_not_start_a_tag_with_an_underscore() {
+        assert_eq!(parse_and_humanize("a <_b c"), vec![text("a <_b c", 0)]);
+        let (nodes, errors) = parse_with_errors("<_under>c</_under>");
+        assert_eq!(nodes, vec![text("<_under>c", 0)]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("Unexpected closing tag \"_under\"."), "{errors:?}");
+    }
 }
 
 // ============================================================================

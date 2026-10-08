@@ -446,9 +446,11 @@ impl<'a> HtmlParser<'a> {
     fn auto_close_element_if_needed(&mut self, new_tag: &str) {
         // Keep closing elements while the current one should be auto-closed
         loop {
+            // The name as written: tag definitions are looked up case-insensitively, but
+            // the element is found again by its own name, which keeps its case (`<LI>`).
             let current_tag = if let Some(&container_idx) = self.container_stack.last() {
                 if let ContainerIndex::Element(elem_idx) = container_idx {
-                    self.elements[elem_idx].name.as_str().to_lowercase()
+                    self.elements[elem_idx].name.to_string()
                 } else {
                     break;
                 }
