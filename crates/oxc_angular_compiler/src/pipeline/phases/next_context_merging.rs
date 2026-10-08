@@ -25,6 +25,7 @@ use crate::pipeline::compilation::ComponentCompilationJob;
 /// This optimization reduces the number of runtime calls by combining
 /// multiple nextContext(1) calls into a single nextContext(n) call.
 pub fn merge_next_context_expressions(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     // Collect view xrefs
     let view_xrefs: Vec<_> = job.all_views().map(|v| v.xref).collect();
 

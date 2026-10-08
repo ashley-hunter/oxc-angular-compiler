@@ -789,9 +789,9 @@ impl<'a> IrExpression<'a> {
                     ArrowFunctionExpr {
                         params,
                         body: Box::new_in(e.body.clone_in(allocator), &allocator),
-                        // ops are not cloned as they are transient data added during compilation
-                        ops: Vec::new_in(&allocator),
+                        ops: clone_arrow_function_ops(&e.ops, allocator),
                         var_offset: e.var_offset,
+                        hoisted: e.hoisted,
                         source_span: e.source_span,
                     },
                     &allocator,
@@ -1537,13 +1537,14 @@ pub struct VoidExpr<'a> {
 
 /// Arrow function expression.
 ///
-/// Created by the generateArrowFunctions phase to wrap user-defined arrow functions
-/// found in template expressions. Arrow functions in event listeners are preserved
-/// in place (not wrapped) because they need to access $event.
+/// Created during ingestion for every arrow function the user wrote. The
+/// generateArrowFunctions phase then marks the ones to hoist (see `hoisted`); arrow
+/// functions in event listeners stay in place because they need to access $event.
 ///
-/// The `ops` list is used to store Variable ops that are prepended by the
-/// generate_variables phase. These ops are processed during the naming phase
-/// to ensure variables are named in the correct order.
+/// For a hoisted arrow function, `ops` holds the Variable ops prepended by the
+/// generate_variables phase and `body` is its return value. Angular keeps the return
+/// statement in the op list too; here it is separate, as a listener's
+/// `handler_expression` is.
 ///
 /// Ported from Angular's `ir.ArrowFunctionExpr` in `expression.ts`.
 #[derive(Debug)]
@@ -1552,15 +1553,74 @@ pub struct ArrowFunctionExpr<'a> {
     pub params: Vec<'a, crate::output::ast::FnParam<'a>>,
     /// Function body expression.
     pub body: Box<'a, IrExpression<'a>>,
-    /// Operations list for this arrow function.
+    /// Operations list for this arrow function, used only when it is hoisted.
     /// Initially empty, populated by generate_variables phase with Variable ops.
     /// These ops are processed by the naming phase before create/update ops.
     pub ops: Vec<'a, crate::ir::ops::UpdateOp<'a>>,
     /// Variable offset for change detection slot indexing.
     /// Assigned by the var_counting phase.
     pub var_offset: Option<u32>,
+    /// Whether the generateArrowFunctions phase hoisted this arrow function. A hoisted
+    /// arrow is emitted as a shared factory instantiated through `ɵɵarrowFunction`;
+    /// the others (in listeners, or nested in another arrow) are emitted in place.
+    pub hoisted: bool,
     /// Source span.
     pub source_span: Option<Span>,
+}
+
+impl<'a> ArrowFunctionExpr<'a> {
+    /// Lends the ops and the body in the shape the phases use for listener handlers
+    /// (`handler_ops` plus an optional `handler_expression`), so a hoisted arrow function
+    /// is processed by the same code as a listener.
+    pub fn with_handler<R>(
+        &mut self,
+        allocator: &'a oxc_allocator::Allocator,
+        f: impl FnOnce(
+            &mut Vec<'a, crate::ir::ops::UpdateOp<'a>>,
+            &mut Option<Box<'a, IrExpression<'a>>>,
+        ) -> R,
+    ) -> R {
+        let placeholder = Box::new_in(
+            IrExpression::Empty(Box::new_in(EmptyExpr { source_span: None }, &allocator)),
+            &allocator,
+        );
+        let mut body = Some(std::mem::replace(&mut self.body, placeholder));
+        let result = f(&mut self.ops, &mut body);
+        if let Some(body) = body {
+            self.body = body;
+        }
+        result
+    }
+}
+
+/// Clones the ops of an arrow function: the variables prepended to it and the statements
+/// the variable optimizer turns some of them into.
+pub fn clone_arrow_function_ops<'a>(
+    ops: &Vec<'a, crate::ir::ops::UpdateOp<'a>>,
+    allocator: &'a oxc_allocator::Allocator,
+) -> Vec<'a, crate::ir::ops::UpdateOp<'a>> {
+    use crate::ir::ops::{StatementOp, UpdateOp, UpdateVariableOp};
+    let mut cloned = Vec::with_capacity_in(ops.len(), &allocator);
+    for op in ops {
+        match op {
+            UpdateOp::Variable(var) => cloned.push(UpdateOp::Variable(UpdateVariableOp {
+                base: Default::default(),
+                xref: var.xref,
+                kind: var.kind,
+                name: var.name,
+                initializer: Box::new_in(var.initializer.clone_in(allocator), &allocator),
+                flags: var.flags,
+                view: var.view,
+                local: var.local,
+            })),
+            UpdateOp::Statement(stmt) => cloned.push(UpdateOp::Statement(StatementOp {
+                base: Default::default(),
+                statement: crate::output::ast::clone_output_statement(&stmt.statement, allocator),
+            })),
+            _ => {}
+        }
+    }
+    cloned
 }
 
 // ============================================================================

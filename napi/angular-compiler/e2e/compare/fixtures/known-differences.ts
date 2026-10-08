@@ -324,4 +324,8 @@ export const KNOWN_DIFFERENCES: Record<string, KnownDifference> = {
     fields: ['OnPushNoneStyleComponent.ɵcmp'],
     reasons: [CHANGE_DETECTION_V22],
   },
+  'templates/ng-arrow-function-pipe': {
+    fields: ['TestPipe.ɵfac'],
+    reasons: [FACTORY],
+  },
 }

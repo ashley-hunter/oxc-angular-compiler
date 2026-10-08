@@ -43,6 +43,7 @@ struct SavedView {
 /// - `RestoreViewExpr` → resolved to the saved view variable
 /// - `ExpressionRef` → `ReadVariable` if stored expression is PropertyRead(ImplicitReceiver, name) in scope
 pub fn resolve_names(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let root_xref = job.root.xref;
     let allocator = job.allocator;
 
@@ -60,6 +61,32 @@ pub fn resolve_names(job: &mut ComponentCompilationJob<'_>) {
     for view in job.all_views_mut() {
         // SAFETY: We're only reading from expression_store, not modifying it
         let expressions = unsafe { &*expression_store_ptr };
+
+        // Hoisted arrow functions are their own lexical scope, built from the variables
+        // prepended to their ops (resolve_names.ts: `processLexicalScope(unit, expr.ops, null)`).
+        for fn_ptr in view.functions.iter() {
+            // SAFETY: The pointer was collected from this view's operations at the start
+            // of this phase, and the allocator keeps the data alive.
+            let arrow_fn = unsafe { &mut **fn_ptr };
+            let scope = build_scope_from_handler_ops(arrow_fn.ops.iter());
+            for op in arrow_fn.ops.iter_mut() {
+                transform_expressions_in_update_op(
+                    op,
+                    &|expr, _flags| {
+                        resolve_expression(expr, &scope, root_xref, None, &allocator, expressions);
+                    },
+                    VisitorContextFlag::NONE,
+                );
+            }
+            resolve_expression(
+                arrow_fn.body.as_mut(),
+                &scope,
+                root_xref,
+                None,
+                &allocator,
+                expressions,
+            );
+        }
 
         // Process create ops with their own scope (no update scope merged in)
         process_lexical_scope_create(root_xref, &mut view.create, None, &allocator, expressions);

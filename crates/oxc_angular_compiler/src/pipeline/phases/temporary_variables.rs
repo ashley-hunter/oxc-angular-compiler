@@ -60,6 +60,7 @@ use crate::pipeline::compilation::{ComponentCompilationJob, HostBindingCompilati
 /// This also recursively processes handler_ops for Listener, AnimationListener, and TwoWayListener,
 /// as well as track_by_ops for RepeaterCreate operations.
 pub fn generate_temporary_variables(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
 
     // Process all views - both create and update ops (matching TypeScript behavior)
@@ -69,6 +70,17 @@ pub fn generate_temporary_variables(job: &mut ComponentCompilationJob<'_>) {
 
         let mut update_stmts = generate_temporaries_for_update(&mut view.update, &allocator);
         view.update.prepend(&mut update_stmts);
+
+        for fn_ptr in view.functions.iter() {
+            // SAFETY: The pointer was collected from this view's operations at the start
+            // of this phase, and the allocator keeps the data alive.
+            let arrow_fn = unsafe { &mut **fn_ptr };
+            arrow_fn.with_handler(allocator, |ops, body| {
+                let mut stmts =
+                    generate_temporaries_for_handler_ops_with_expression(ops, body, &allocator);
+                prepend_update_ops(ops, &mut stmts, &allocator);
+            });
+        }
     }
 }
 

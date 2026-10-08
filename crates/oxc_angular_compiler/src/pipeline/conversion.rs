@@ -760,6 +760,7 @@ pub fn convert_ast<'a>(
                     body: Box::new_in(body.to_ir(allocator), &allocator),
                     ops: Vec::new_in(&allocator),
                     var_offset: None,
+                    hoisted: false,
                     source_span: convert_source_span(arrow.source_span),
                 },
                 &allocator,

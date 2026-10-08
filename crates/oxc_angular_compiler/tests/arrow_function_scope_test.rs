@@ -2,10 +2,13 @@
 //! parameter (or an enclosing arrow's) before template variables and the
 //! component context: `open.update((o) => !o)` must not emit `(o) => !ctx.o`.
 //!
+//! Arrows in listeners stay in place; everywhere else they are hoisted to a
+//! shared factory and instantiated through `ɵɵarrowFunction`.
+//!
 //! Ported from Angular's `updateParameterReferences` in
-//! `template/pipeline/src/ingest.ts`. The expected strings are ngtsc's output
-//! for the same templates, in this emitter's spelling (parenthesized params
-//! and binary operands).
+//! `template/pipeline/src/ingest.ts` and its `generateArrowFunctions` phase.
+//! The expected strings are ngtsc's output for the same templates, in this
+//! emitter's spelling (parenthesized params and binary operands).
 
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
@@ -154,76 +157,147 @@ fn nested_arrow_parameters_leak_to_later_reads_like_ngtsc() {
     );
 }
 
-// Outside listeners ngtsc hoists the arrow through `ɵɵarrowFunction`, which is not
-// implemented here: the arrow is emitted in place. Its body must still match the
-// body of ngtsc's hoisted function.
+// Outside listeners the arrow is hoisted to a shared factory, `(ctx, view) => arrow`,
+// and instantiated with `ɵɵarrowFunction(varOffset, factory, ctx)`.
+
+#[track_caller]
+fn assert_hoists(template: &str, factory: &str, usage: &str) {
+    let code = compile_tpl(template);
+    assert!(code.contains(factory), "expected `{factory}` for `{template}`, got:\n{code}");
+    assert!(code.contains(usage), "expected `{usage}` for `{template}`, got:\n{code}");
+}
 
 #[test]
 fn property_binding_arrow_reads_its_parameter() {
-    assert_emits(
+    assert_hoists(
         r#"<div [title]="run((o) => !o)"></div>"#,
-        r#"i0.ɵɵproperty("title",ctx.run((o)=>!o));"#,
+        "constarrowFn0=(ctx,view)=>(o)=>!o;",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
     );
-    assert_emits(
+    assert_hoists(
         r#"<div [title]="run((open) => !open)"></div>"#,
-        r#"i0.ɵɵproperty("title",ctx.run((open)=>!open));"#,
-    );
-    assert_emits(
-        r#"<div [title]="run((a) => (b) => a + b + other)"></div>"#,
-        r#"i0.ɵɵproperty("title",ctx.run((a)=>(b)=>((a+b)+ctx.other)));"#,
+        "constarrowFn0=(ctx,view)=>(open)=>!open;",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
     );
 }
 
 #[test]
 fn property_binding_arrow_without_parameters_reads_the_component() {
-    assert_emits(
+    assert_hoists(
         r#"<div [title]="run(() => !open())"></div>"#,
-        r#"i0.ɵɵproperty("title",ctx.run(()=>!ctx.open()));"#,
+        "constarrowFn0=(ctx,view)=>()=>!ctx.open();",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
+    );
+}
+
+/// Only the outermost arrow is hoisted; the arrow it returns stays in place.
+#[test]
+fn nested_arrow_stays_inside_the_hoisted_arrow() {
+    assert_hoists(
+        r#"<div [title]="run((a) => (b) => a + b + other)"></div>"#,
+        "constarrowFn0=(ctx,view)=>(a)=>(b)=>((a+b)+ctx.other);",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
     );
 }
 
 #[test]
 fn property_binding_parameter_shadows_template_variables() {
-    assert_emits(
+    assert_hoists(
         r#"@let v = 1; <div [title]="run((v) => v + other)"></div>{{ v }}"#,
-        r#"i0.ɵɵproperty("title",ctx.run((v)=>(v+ctx.other)));"#,
+        "constarrowFn0=(ctx,view)=>(v)=>(v+ctx.other);",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(2,arrowFn0,ctx)));"#,
     );
-    assert_emits(
-        r#"@for (item of items; track item) { <div [title]="run((item) => item + other)"></div> }"#,
-        r#"i0.ɵɵproperty("title",ctx_r0.run((item)=>(item+ctx_r0.other)));"#,
-    );
-    assert_emits(
+    assert_hoists(
         r#"<input #el /><div [title]="run((el) => el + other)"></div>"#,
-        r#"i0.ɵɵproperty("title",ctx.run((el)=>(el+ctx.other)));"#,
+        "constarrowFn0=(ctx,view)=>(el)=>(el+ctx.other);",
+        r#"i0.ɵɵproperty("title",ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
+    );
+}
+
+/// In an embedded view the hoisted arrow restores the view it was created in, then
+/// walks to the component context itself.
+#[test]
+fn hoisted_arrow_in_an_embedded_view_restores_the_view() {
+    assert_hoists(
+        r#"@for (item of items; track item) {<div [title]="run((item) => item + other)"></div>}"#,
+        "constarrowFn0=(ctx,view)=>(item)=>{i0.ɵɵrestoreView(view);\
+         constctx_r0=i0.ɵɵnextContext();returni0.ɵɵresetView((item+ctx_r0.other));};",
+        r#"constctx_r0=i0.ɵɵnextContext();i0.ɵɵproperty("title",ctx_r0.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
     );
 }
 
 #[test]
-fn property_binding_arrow_reads_template_variables_that_are_not_parameters() {
-    assert_emits(
-        r#"<input #el />@for (item of items; track item) { <div [title]="run((x) => x + item + el.value + other)"></div> }"#,
-        "constitem_r1=ctx.$implicit;constctx_r1=i0.ɵɵnextContext();constel_r3=i0.ɵɵreference(1);",
-    );
-    assert_emits(
-        r#"<input #el />@for (item of items; track item) { <div [title]="run((x) => x + item + el.value + other)"></div> }"#,
-        "ctx_r1.run((x)=>(((x+item_r1)+el_r3.value)+ctx_r1.other))",
+fn hoisted_arrow_reads_template_variables_that_are_not_parameters() {
+    assert_hoists(
+        r#"<input #el />@for (item of items; track item) {<div [title]="run((x) => x + item + el.value + other)"></div>}"#,
+        "constarrowFn0=(ctx,view)=>(x)=>{constitem_r1=i0.ɵɵrestoreView(view).$implicit;\
+         constctx_r1=i0.ɵɵnextContext();constel_r3=i0.ɵɵreference(1);\
+         returni0.ɵɵresetView((((x+item_r1)+el_r3.value)+ctx_r1.other));};",
+        r#"constctx_r1=i0.ɵɵnextContext();i0.ɵɵproperty("title",ctx_r1.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));"#,
     );
 }
 
 #[test]
 fn interpolation_arrow_reads_its_parameters() {
-    assert_emits("{{ run((o) => !o) }}", "i0.ɵɵtextInterpolate(ctx.run((o)=>!o));");
-    assert_emits("{{ run((a, b) => a + b) }}", "i0.ɵɵtextInterpolate(ctx.run((a,b)=>(a+b)));");
-    assert_emits(
-        "{{ run((o) => o || fallback()) }}",
-        "i0.ɵɵtextInterpolate(ctx.run((o)=>(o||ctx.fallback())));",
+    assert_hoists(
+        "{{ run((a, b) => a + b) }}",
+        "constarrowFn0=(ctx,view)=>(a,b)=>(a+b);",
+        "i0.ɵɵtextInterpolate(ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));",
     );
-    assert_emits("{{ run(() => !open()) }}", "i0.ɵɵtextInterpolate(ctx.run(()=>!ctx.open()));");
+    assert_hoists(
+        "{{ run((o) => o || fallback()) }}",
+        "constarrowFn0=(ctx,view)=>(o)=>(o||ctx.fallback());",
+        "i0.ɵɵtextInterpolate(ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));",
+    );
+}
+
+/// Equivalent arrows share one factory but each gets its own var slot.
+#[test]
+fn identical_arrows_share_a_factory() {
+    let code = compile_tpl("{{ run((o) => !o) }}{{ run((o) => !o) }}");
+    assert_eq!(code.matches("constarrowFn").count(), 1, "got:\n{code}");
+    assert!(code.contains("i0.ɵɵarrowFunction(2,arrowFn0,ctx)"), "got:\n{code}");
+    assert!(code.contains("i0.ɵɵarrowFunction(3,arrowFn0,ctx)"), "got:\n{code}");
+}
+
+/// ngtsc hoists an arrow in a `track` expression into the track function, where `ctx`
+/// is not in scope, so that call throws. The arrow is kept in place instead.
+#[test]
+fn track_expression_arrow_stays_in_place() {
+    let code = compile_tpl("@for (item of items; track run((a) => a)) {<i></i>}");
+    assert!(code.contains("returnthis.run((a)=>a);"), "got:\n{code}");
+    assert!(!code.contains("arrowFn"), "got:\n{code}");
+}
+
+/// An `@let` that the optimizer turns into a plain statement still has its arrow
+/// function named, and the arrow keeps its `restoreView` statement.
+#[test]
+fn let_arrows_reading_other_lets() {
+    let code = compile_tpl("@let a = other; @let f = () => a; @let g = () => f() + a; {{ g() }}");
+    assert!(
+        code.contains(
+            "constarrowFn0=(ctx,view)=>()=>{i0.ɵɵrestoreView(view);\
+             consta_r1=i0.ɵɵreadContextLet(0);returni0.ɵɵresetView(a_r1);};"
+        ),
+        "got:\n{code}"
+    );
+    assert!(
+        code.contains(
+            "constarrowFn1=(ctx,view)=>()=>{i0.ɵɵrestoreView(view);\
+             consta_r2=i0.ɵɵreadContextLet(0);constf_r3=i0.ɵɵreadContextLet(2);\
+             returni0.ɵɵresetView((f_r3()+a_r2));};"
+        ),
+        "got:\n{code}"
+    );
 }
 
 #[test]
-fn let_declaration_arrow_reads_its_parameter() {
-    assert_emits("@let fn = (a) => a + other; {{ fn(1) }}", "constfn_r1=(a)=>(a+ctx.other);");
+fn let_declaration_arrow_is_hoisted() {
+    assert_hoists(
+        "@let fn = (a) => a + other; {{ fn(1) }}",
+        "constarrowFn0=(ctx,view)=>(a)=>(a+ctx.other);",
+        "constfn_r1=i0.ɵɵarrowFunction(1,arrowFn0,ctx);",
+    );
 }
 
 #[test]
@@ -252,4 +326,34 @@ export class D {
         code.contains("returnctx.someSignal.update(()=>(ctx.componentProp+1));"),
         "got:\n{code}"
     );
+}
+
+#[test]
+fn directive_host_binding_arrow_is_hoisted() {
+    let allocator = Allocator::default();
+    let options =
+        TransformOptions { compilation_mode: CompilationMode::Full, ..Default::default() };
+    let source = "import {Directive} from '@angular/core';
+@Directive({
+  selector: '[d]',
+  host: {'[attr.with-context]': '((a, b) => a / b + componentProp)(6, 12)'},
+})
+export class D {
+  componentProp = 1;
+}
+";
+    let result = transform_angular_file(&allocator, "test.ts", source, Some(&options), None);
+    assert!(!result.has_errors(), "should not have errors, got: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains("constarrowFn0=(ctx,view)=>(a,b)=>((a/b)+ctx.componentProp);"),
+        "got:\n{code}"
+    );
+    assert!(
+        code.contains(
+            r#"i0.ɵɵattribute("with-context",i0.ɵɵarrowFunction(1,arrowFn0,ctx)(6,12));"#
+        ),
+        "got:\n{code}"
+    );
+    assert!(code.contains("hostVars:2"), "got:\n{code}");
 }

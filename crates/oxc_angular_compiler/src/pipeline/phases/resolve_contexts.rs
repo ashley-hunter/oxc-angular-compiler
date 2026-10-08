@@ -35,6 +35,7 @@ enum ContextAccess {
 /// - `ContextExpr` for current view → kept as ContextExpr (reify handles ctx)
 /// - `ContextExpr` for ancestor view → ReadVariableExpr referencing saved context
 pub fn resolve_contexts(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
     let root_xref = job.root.xref;
 
@@ -54,13 +55,9 @@ pub fn resolve_contexts(job: &mut ComponentCompilationJob<'_>) {
                 // SAFETY: The pointer is valid because it was populated by generate_arrow_functions
                 // and the allocator keeps the data alive.
                 let arrow_fn = unsafe { &mut **fn_ptr };
-                process_lexical_scope_update_vec(
-                    &allocator,
-                    view_xref,
-                    is_root,
-                    &mut arrow_fn.ops,
-                    &errors,
-                );
+                arrow_fn.with_handler(allocator, |ops, body| {
+                    process_listener_handler_ops(allocator, view_xref, is_root, ops, body, &errors);
+                });
             }
 
             process_lexical_scope_create(allocator, view_xref, is_root, &mut view.create, &errors);

@@ -1428,15 +1428,13 @@ impl<'a> OutputExpression<'a> {
                 WrappedNodeExpr { node_id: e.node_id.clone(), source_span: e.source_span },
                 &allocator,
             )),
-            OutputExpression::WrappedIrNode(_) => {
-                // WrappedIrNode expressions wrap IR expressions for deferred processing.
-                // They should be resolved during the reify phase before any cloning occurs.
-                // Return a placeholder undefined literal as a safe fallback.
-                OutputExpression::Literal(Box::new_in(
-                    LiteralExpr { value: LiteralValue::Undefined, source_span: None },
-                    &allocator,
-                ))
-            }
+            OutputExpression::WrappedIrNode(e) => OutputExpression::WrappedIrNode(Box::new_in(
+                WrappedIrExpr {
+                    node: Box::new_in(e.node.clone_in(allocator), &allocator),
+                    source_span: e.source_span,
+                },
+                &allocator,
+            )),
             OutputExpression::SpreadElement(e) => OutputExpression::SpreadElement(Box::new_in(
                 SpreadElementExpr {
                     expr: Box::new_in(e.expr.clone_in(allocator), &allocator),
