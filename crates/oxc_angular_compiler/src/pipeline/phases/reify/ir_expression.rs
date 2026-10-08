@@ -7,9 +7,10 @@ use crate::ast::expression::AngularExpression;
 use crate::ir::expression::{IrExpression, TwoWayBindingSetExpr};
 use crate::ir::ops::XrefId;
 use crate::output::ast::{
-    BinaryOperator, BinaryOperatorExpr, ConditionalExpr, InvokeFunctionExpr, LiteralArrayExpr,
-    LiteralExpr, LiteralMapEntry, LiteralMapExpr, LiteralValue, OutputExpression,
-    ParenthesizedExpr, ReadKeyExpr, ReadPropExpr, ReadVarExpr, SpreadElementExpr,
+    ArrowFunctionBody, ArrowFunctionExpr, BinaryOperator, BinaryOperatorExpr, ConditionalExpr,
+    FnParam, InvokeFunctionExpr, LiteralArrayExpr, LiteralExpr, LiteralMapEntry, LiteralMapExpr,
+    LiteralValue, OutputExpression, ParenthesizedExpr, ReadKeyExpr, ReadPropExpr, ReadVarExpr,
+    SpreadElementExpr,
 };
 use crate::pipeline::expression_store::ExpressionStore;
 use crate::r3::{Identifiers, get_pipe_bind_instruction, get_pure_function_instruction};
@@ -1173,6 +1174,29 @@ pub fn convert_ir_expression<'a>(
                 ParenthesizedExpr {
                     expr: Box::new_in(inner, &allocator),
                     source_span: paren.source_span,
+                },
+                &allocator,
+            ))
+        }
+
+        // Arrow function left in place: emit it with its converted body.
+        IrExpression::ArrowFunction(arrow_fn) => {
+            let mut params = OxcVec::with_capacity_in(arrow_fn.params.len(), &allocator);
+            for param in &arrow_fn.params {
+                params.push(FnParam { name: param.name });
+            }
+            let body = convert_ir_expression(
+                allocator,
+                core_namespace,
+                &arrow_fn.body,
+                expressions,
+                root_xref,
+            );
+            OutputExpression::ArrowFunction(Box::new_in(
+                ArrowFunctionExpr {
+                    params,
+                    body: ArrowFunctionBody::Expression(Box::new_in(body, &allocator)),
+                    source_span: arrow_fn.source_span,
                 },
                 &allocator,
             ))

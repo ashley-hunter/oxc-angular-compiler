@@ -643,12 +643,8 @@ fn assign_var_offsets_in_expr(
         }
 
         IrExpression::ArrowFunction(arrow_fn) => {
-            // Arrow functions consume a var slot and have their own var_offset
-            if !pure_functions_only {
-                arrow_fn.var_offset = Some(*var_count);
-                *var_count += 1;
-            }
-            // Process the body expression
+            // Arrow functions are emitted in place, so they do not consume a var slot;
+            // only a hoisted `ɵɵarrowFunction` would. Process the body expression.
             assign_var_offsets_in_expr(&mut arrow_fn.body, var_count, pure_functions_only);
         }
         IrExpression::Parenthesized(paren) => {

@@ -37,7 +37,7 @@ use crate::ir::expression::{
     BinaryExpr, ConditionalCaseExpr, EmptyExpr, IrBinaryOperator, IrExpression, LexicalReadExpr,
     PipeBindingExpr, ResolvedCallExpr, ResolvedKeyedReadExpr, ResolvedPropertyReadExpr,
     SafeInvokeFunctionExpr, SafeKeyedReadExpr, SafePropertyReadExpr, SlotHandle,
-    TwoWayBindingSetExpr,
+    TwoWayBindingSetExpr, VisitorContextFlag, transform_expressions_in_expression,
 };
 use crate::ir::ops::{
     BindingOp, ConditionalBranchCreateOp, ConditionalOp, ConditionalUpdateOp, CreateOp,
@@ -47,9 +47,10 @@ use crate::ir::ops::{
     RepeaterCreateOp, RepeaterOp, RepeaterVarNames, SlotId, StatementOp, StoreLetOp, TemplateOp,
     TextOp, TwoWayListenerOp, UpdateOp, UpdateOpBase, XrefId,
 };
-use crate::output::ast::OutputExpression;
+use crate::output::ast::{OutputExpression, ReadVarExpr};
 use crate::pipeline::compilation::{AliasVariable, ContextVariable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 
 /// Options for ingesting a component template.
 ///
@@ -630,9 +631,67 @@ fn convert_ast_to_ir<'a>(
             )
         }
 
+        // Convert ArrowFunction - recursively convert the body so the names it reads are
+        // resolved, then keep reads of the arrow's own parameters as plain variables.
+        AngularExpression::ArrowFunction(arrow) => {
+            let arrow = arrow.unbox();
+            let source_span = Some(arrow.source_span.to_span());
+            let mut params = Vec::with_capacity_in(arrow.parameters.len(), &allocator);
+            for param in &arrow.parameters {
+                params.push(crate::output::ast::FnParam { name: param.name });
+            }
+            let body = convert_ast_to_ir(job, arrow.body);
+            let mut expr = IrExpression::ArrowFunction(Box::new_in(
+                crate::ir::expression::ArrowFunctionExpr {
+                    params,
+                    body,
+                    ops: Vec::new_in(&allocator),
+                    var_offset: None,
+                    source_span,
+                },
+                &allocator,
+            ));
+            update_parameter_references(&mut expr, allocator);
+            Box::new_in(expr, &allocator)
+        }
+
         // For all other expressions, store in ExpressionStore and return reference.
         other => store_and_ref_expr(job, other),
     }
+}
+
+/// Replaces reads of an arrow function's parameters with plain variable reads, so the
+/// name resolution phases leave them alone instead of resolving them against template
+/// variables or the component context.
+///
+/// Like Angular, the parameter set only grows: parameters of a nested arrow are added
+/// when that arrow is visited (after its body), and are not removed afterwards.
+///
+/// Ported from Angular's `updateParameterReferences` in `ingest.ts`.
+fn update_parameter_references<'a>(root: &mut IrExpression<'a>, allocator: &'a Allocator) {
+    let parameter_names: RefCell<FxHashSet<Ident<'a>>> = RefCell::new(FxHashSet::default());
+    if let IrExpression::ArrowFunction(arrow) = &*root {
+        parameter_names.borrow_mut().extend(arrow.params.iter().map(|p| p.name));
+    }
+    transform_expressions_in_expression(
+        root,
+        &|expr, _flags| match expr {
+            IrExpression::ArrowFunction(arrow) => {
+                parameter_names.borrow_mut().extend(arrow.params.iter().map(|p| p.name));
+            }
+            IrExpression::LexicalRead(read) if parameter_names.borrow().contains(&read.name) => {
+                *expr = IrExpression::OutputExpr(Box::new_in(
+                    OutputExpression::ReadVar(Box::new_in(
+                        ReadVarExpr { name: read.name, source_span: read.source_span },
+                        &allocator,
+                    )),
+                    &allocator,
+                ));
+            }
+            _ => {}
+        },
+        VisitorContextFlag::NONE,
+    );
 }
 
 /// Converts an AST binary operator to an IR binary operator.
@@ -3842,6 +3901,30 @@ fn host_convert_ast_to_ir<'a>(
                 )),
                 &allocator,
             )
+        }
+
+        // Convert ArrowFunction - recursively convert the body so the names it reads are
+        // resolved, then keep reads of the arrow's own parameters as plain variables.
+        AngularExpression::ArrowFunction(arrow) => {
+            let arrow = arrow.unbox();
+            let source_span = Some(arrow.source_span.to_span());
+            let mut params = Vec::with_capacity_in(arrow.parameters.len(), &allocator);
+            for param in &arrow.parameters {
+                params.push(crate::output::ast::FnParam { name: param.name });
+            }
+            let body = host_convert_ast_to_ir(job, arrow.body);
+            let mut expr = IrExpression::ArrowFunction(Box::new_in(
+                crate::ir::expression::ArrowFunctionExpr {
+                    params,
+                    body,
+                    ops: Vec::new_in(&allocator),
+                    var_offset: None,
+                    source_span,
+                },
+                &allocator,
+            ));
+            update_parameter_references(&mut expr, allocator);
+            Box::new_in(expr, &allocator)
         }
 
         // For all other expressions, store in ExpressionStore and return reference

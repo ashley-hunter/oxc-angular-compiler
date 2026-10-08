@@ -1259,11 +1259,8 @@ fn test_object_spread_at_end() {
 
 #[test]
 fn test_spread_in_arrow_function_body() {
-    // Array spread inside an arrow function binding. Arrow functions fall through to the
-    // ExpressionStore in ingest (not explicitly handled), so the LiteralArray with SpreadElement
-    // reaches convert_angular_expression_with_ctx directly. Before the fix to the LiteralArray
-    // arm in reify/angular_expression.rs, SpreadElement entries were silently unwrapped,
-    // resulting in `() => [ctx.base,"extra"]` instead of `() => [...ctx.base,"extra"]`.
+    // Array spread inside an arrow function binding: the spread must survive, giving
+    // `() => [...ctx.base,"extra"]` rather than `() => [ctx.base,"extra"]`.
     let js = compile_template_to_js(
         r#"<button (click)="handler(() => [...base, 'extra'])">click</button>"#,
         "TestComponent",

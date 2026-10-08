@@ -857,6 +857,19 @@ fn resolve_expression<'a>(
             }
         }
 
+        // Arrow function - resolve the names its body reads. Reads of its own parameters
+        // were already turned into plain variables during ingestion.
+        IrExpression::ArrowFunction(arrow_fn) => {
+            resolve_expression(
+                arrow_fn.body.as_mut(),
+                scope,
+                root_xref,
+                saved_view,
+                allocator,
+                expressions,
+            );
+        }
+
         // Other expression types don't need resolution
         _ => {}
     }
