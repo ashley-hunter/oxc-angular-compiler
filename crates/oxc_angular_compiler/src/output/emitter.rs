@@ -1030,42 +1030,10 @@ impl JsEmitter {
         expr: &super::ast::TaggedTemplateLiteralExpr<'_>,
         ctx: &mut EmitterContext,
     ) {
-        // Downlevel tagged template to function call for compatibility
-        // tag`...` becomes tag(__makeTemplateObject(cooked, raw), expr1, expr2, ...)
-        const MAKE_TEMPLATE_OBJECT_POLYFILL: &str = "(this&&this.__makeTemplateObject||function(e,t){return Object.defineProperty?Object.defineProperty(e,\"raw\",{value:t}):e.raw=t,e})";
-
+        // Emitted natively, as ngtsc does, so the tag receives the same strings array on
+        // every call.
         self.visit_expression(&expr.tag, ctx);
-        ctx.print("(");
-        ctx.print(MAKE_TEMPLATE_OBJECT_POLYFILL);
-        ctx.print("(");
-
-        // Cooked strings
-        ctx.print("[");
-        let elements = &expr.template.elements;
-        for (i, element) in elements.iter().enumerate() {
-            if i > 0 {
-                ctx.print(", ");
-            }
-            ctx.print(&escape_string(&element.text, false));
-        }
-        ctx.print("], ");
-
-        // Raw strings
-        ctx.print("[");
-        for (i, element) in elements.iter().enumerate() {
-            if i > 0 {
-                ctx.print(", ");
-            }
-            ctx.print(&escape_string(&element.raw_text, false));
-        }
-        ctx.print("])");
-
-        // Expressions
-        for expression in &expr.template.expressions {
-            ctx.print(", ");
-            self.visit_expression(expression, ctx);
-        }
-        ctx.print(")");
+        self.visit_template_literal(&expr.template, ctx);
     }
 
     fn visit_localized_string(

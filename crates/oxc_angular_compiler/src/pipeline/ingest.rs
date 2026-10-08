@@ -623,7 +623,58 @@ fn convert_ast_to_ir<'a>(
                     crate::ir::expression::ResolvedTemplateLiteralExpr {
                         elements,
                         expressions,
+                        tagged: false,
                         source_span: Some(tl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TaggedTemplateLiteral the same way, with the tag as the first expression.
+        AngularExpression::TaggedTemplateLiteral(tagged) => {
+            let tagged = tagged.unbox();
+            let source_span = Some(tagged.source_span.to_span());
+            let tl = tagged.template;
+            let mut elements = Vec::with_capacity_in(tl.elements.len(), &allocator);
+            for elem in &tl.elements {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text,
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(tl.expressions.len() + 1, &allocator);
+            expressions.push(convert_ast_to_ir(job, tagged.tag).unbox());
+            for expr in tl.expressions {
+                expressions.push(convert_ast_to_ir(job, expr).unbox());
+            }
+            Box::new_in(
+                IrExpression::ResolvedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::ResolvedTemplateLiteralExpr {
+                        elements,
+                        expressions,
+                        tagged: true,
+                        source_span,
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement (a call argument such as `fn(...args)`) - recursively convert
+        // the operand so the names it reads are resolved, and keep the spread.
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let source_span = Some(spread.source_span.to_span());
+            let expr = convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::Unary(oxc_allocator::Box::new_in(
+                    crate::ir::expression::UnaryExpr {
+                        operator: crate::ir::expression::IrUnaryOperator::Spread,
+                        expr,
+                        source_span,
                     },
                     &allocator,
                 )),
@@ -3897,6 +3948,88 @@ fn host_convert_ast_to_ir<'a>(
                     crate::ir::expression::VoidExpr {
                         expr,
                         source_span: Some(void_expr.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TemplateLiteral - recursively convert inner expressions to preserve pipes.
+        // Without this, template literals fall through to store_and_ref_expr, which stores
+        // the entire literal as a raw AST blob. Any BindingPipe inside is then invisible to
+        // the pipe_creation phase and any @let variable reads inside are never resolved.
+        AngularExpression::TemplateLiteral(tl) => {
+            let tl = tl.unbox();
+            let mut elements = Vec::with_capacity_in(tl.elements.len(), &allocator);
+            for elem in &tl.elements {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text,
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(tl.expressions.len(), &allocator);
+            for expr in tl.expressions {
+                let converted = host_convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::ResolvedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::ResolvedTemplateLiteralExpr {
+                        elements,
+                        expressions,
+                        tagged: false,
+                        source_span: Some(tl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TaggedTemplateLiteral the same way, with the tag as the first expression.
+        AngularExpression::TaggedTemplateLiteral(tagged) => {
+            let tagged = tagged.unbox();
+            let source_span = Some(tagged.source_span.to_span());
+            let tl = tagged.template;
+            let mut elements = Vec::with_capacity_in(tl.elements.len(), &allocator);
+            for elem in &tl.elements {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text,
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(tl.expressions.len() + 1, &allocator);
+            expressions.push(host_convert_ast_to_ir(job, tagged.tag).unbox());
+            for expr in tl.expressions {
+                expressions.push(host_convert_ast_to_ir(job, expr).unbox());
+            }
+            Box::new_in(
+                IrExpression::ResolvedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::ResolvedTemplateLiteralExpr {
+                        elements,
+                        expressions,
+                        tagged: true,
+                        source_span,
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement (a call argument such as `fn(...args)`) - recursively convert
+        // the operand so the names it reads are resolved, and keep the spread.
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let source_span = Some(spread.source_span.to_span());
+            let expr = host_convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::Unary(oxc_allocator::Box::new_in(
+                    crate::ir::expression::UnaryExpr {
+                        operator: crate::ir::expression::IrUnaryOperator::Spread,
+                        expr,
+                        source_span,
                     },
                     &allocator,
                 )),

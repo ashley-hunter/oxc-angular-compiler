@@ -1203,6 +1203,7 @@ fn resolve_angular_expression<'a>(
                     crate::ir::expression::ResolvedTemplateLiteralExpr {
                         elements,
                         expressions: resolved_exprs,
+                        tagged: false,
                         source_span: Some(tl.source_span.to_span()),
                     },
                     &allocator,

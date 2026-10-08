@@ -1080,6 +1080,15 @@ pub fn convert_ir_expression<'a>(
                 crate::ir::expression::IrUnaryOperator::Minus => {
                     crate::output::ast::UnaryOperator::Minus
                 }
+                crate::ir::expression::IrUnaryOperator::Spread => {
+                    return OutputExpression::SpreadElement(Box::new_in(
+                        SpreadElementExpr {
+                            expr: Box::new_in(expr, &allocator),
+                            source_span: unary.source_span,
+                        },
+                        &allocator,
+                    ));
+                }
             };
             OutputExpression::UnaryOperator(Box::new_in(
                 crate::output::ast::UnaryOperatorExpr {
@@ -1150,6 +1159,15 @@ pub fn convert_ir_expression<'a>(
                     expressions,
                     root_xref,
                 ));
+            }
+
+            if rtl.tagged {
+                return crate::pipeline::conversion::tagged_template_literal(
+                    allocator,
+                    elements,
+                    output_expressions,
+                    rtl.source_span,
+                );
             }
 
             OutputExpression::TemplateLiteral(Box::new_in(

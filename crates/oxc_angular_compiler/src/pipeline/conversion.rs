@@ -200,7 +200,7 @@ pub fn convert_unary_operator(op: AstUnaryOperator) -> OutputUnaryOperator {
 /// - `${` to prevent interpolation syntax
 /// - Backslashes to preserve escape sequences
 /// - Carriage returns and line feeds to their escape sequences
-fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
+pub(crate) fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
     // Fast path: if no escaping needed, return as-is
     if !cooked.contains(['`', '$', '\\', '\r', '\n']) {
         return Ident::from(allocator.alloc_str(cooked));
@@ -767,6 +767,32 @@ pub fn convert_ast<'a>(
             )))
         }
     }
+}
+
+/// Builds a tagged template from the converted parts of a tagged
+/// `ResolvedTemplateLiteral`, whose first expression is the tag.
+pub(crate) fn tagged_template_literal<'a>(
+    allocator: &'a Allocator,
+    mut elements: Vec<'a, crate::output::ast::TemplateLiteralElement<'a>>,
+    mut expressions: Vec<'a, crate::output::ast::OutputExpression<'a>>,
+    source_span: Option<oxc_span::Span>,
+) -> crate::output::ast::OutputExpression<'a> {
+    let tag = expressions.remove(0);
+    // The elements hold cooked text; a tagged template is emitted from its raw text.
+    for element in &mut elements {
+        element.raw_text = cooked_to_raw_text(allocator, &element.text);
+    }
+    crate::output::ast::OutputExpression::TaggedTemplateLiteral(Box::new_in(
+        crate::output::ast::TaggedTemplateLiteralExpr {
+            tag: Box::new_in(tag, &allocator),
+            template: Box::new_in(
+                crate::output::ast::TemplateLiteralExpr { elements, expressions, source_span },
+                &allocator,
+            ),
+            source_span,
+        },
+        &allocator,
+    ))
 }
 
 /// Converts an Angular expression with interpolation support.

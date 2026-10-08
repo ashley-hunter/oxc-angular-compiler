@@ -775,6 +775,7 @@ impl<'a> IrExpression<'a> {
                     ResolvedTemplateLiteralExpr {
                         elements,
                         expressions,
+                        tagged: e.tagged,
                         source_span: e.source_span,
                     },
                     &allocator,
@@ -1059,7 +1060,13 @@ pub struct ResolvedTemplateLiteralExpr<'a> {
     /// Template literal text elements (the static parts between expressions).
     pub elements: Vec<'a, IrTemplateLiteralElement<'a>>,
     /// Resolved expressions (the dynamic parts inside ${...}).
+    ///
+    /// For a tagged template the tag comes first, ahead of the `${...}` parts, so that
+    /// every phase resolves and rewrites it along with them.
     pub expressions: Vec<'a, IrExpression<'a>>,
+    /// Whether this is a tagged template (`` tag`...` ``), with the tag stored as the
+    /// first entry of `expressions`.
+    pub tagged: bool,
     /// Source span.
     pub source_span: Option<Span>,
 }
@@ -1487,6 +1494,10 @@ pub enum IrUnaryOperator {
     Plus,
     /// Unary minus (-)
     Minus,
+    /// Spread (`...expr`), which only appears as a call argument. It is modelled as a
+    /// unary operator so that every phase resolves and rewrites its operand like any
+    /// other expression.
+    Spread,
 }
 
 /// Logical NOT expression (!expr).

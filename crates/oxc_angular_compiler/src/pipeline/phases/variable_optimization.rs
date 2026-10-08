@@ -3758,7 +3758,12 @@ where
                 expressions.push(transform_expression(e, &allocator, transform));
             }
             IrExpression::ResolvedTemplateLiteral(OxcBox::new_in(
-                ResolvedTemplateLiteralExpr { elements, expressions, source_span: rtl.source_span },
+                ResolvedTemplateLiteralExpr {
+                    elements,
+                    expressions,
+                    tagged: rtl.tagged,
+                    source_span: rtl.source_span,
+                },
                 &allocator,
             ))
         }

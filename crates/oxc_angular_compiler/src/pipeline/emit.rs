@@ -1236,6 +1236,15 @@ fn convert_pure_function_body<'a>(
             let operator = match unary.operator {
                 crate::ir::expression::IrUnaryOperator::Plus => UnaryOperator::Plus,
                 crate::ir::expression::IrUnaryOperator::Minus => UnaryOperator::Minus,
+                crate::ir::expression::IrUnaryOperator::Spread => {
+                    return OutputExpression::SpreadElement(Box::new_in(
+                        crate::output::ast::SpreadElementExpr {
+                            expr: Box::new_in(inner, &allocator),
+                            source_span: None,
+                        },
+                        &allocator,
+                    ));
+                }
             };
             OutputExpression::UnaryOperator(Box::new_in(
                 UnaryOperatorExpr {
@@ -1287,6 +1296,15 @@ fn convert_pure_function_body<'a>(
 
             for expr in rtl.expressions.iter() {
                 expressions.push(convert_pure_function_body(allocator, expr, params));
+            }
+
+            if rtl.tagged {
+                return crate::pipeline::conversion::tagged_template_literal(
+                    allocator,
+                    elements,
+                    expressions,
+                    rtl.source_span,
+                );
             }
 
             OutputExpression::TemplateLiteral(Box::new_in(
