@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 
 import {
   transformAngularFile,
+  transformAngularFileSync,
   extractComponentUrls,
   compileTemplate,
   extractAngularComponentByAst,
@@ -609,5 +610,72 @@ describe('object spread in template bindings', () => {
     // Both spread variables should appear in the output
     expect(result.code).toContain('ctx.a')
     expect(result.code).toContain('ctx.b')
+  })
+})
+
+describe('incomplete control-flow blocks', () => {
+  const INCOMPLETE_IF =
+    'Incomplete block "if". If you meant to write the @ character, you should use the "&#64;" HTML entity instead.'
+
+  it('reports an @if whose parameters never close, with its position in the file', () => {
+    const source = `import { Component } from '@angular/core';
+
+@Component({
+  selector: 'x-cut',
+  template: \`
+    <text>before</text>
+    @if (on() {
+      <text>inside</text>
+    }
+    <text>after</text>
+  \`,
+})
+export class Cut {
+  on() { return true; }
+}`
+
+    const result = transformAngularFileSync(source, '/x/cut.ts', {})
+
+    expect(result.errors).toHaveLength(1)
+    const [error] = result.errors
+    expect(error.message).toBe(INCOMPLETE_IF)
+    expect(error.helpMessage).toBe('/x/cut.ts:7:5')
+    expect(error.labels).toHaveLength(1)
+    expect(source.slice(error.labels[0].start, error.labels[0].end)).toMatch(/^@if \(on\(\) \{/)
+    expect(error.codeframe).toContain('@if (on() {')
+  })
+
+  it('reports the position within a templateUrl file', () => {
+    const source = `import { Component } from '@angular/core';
+@Component({ selector: 'x-cut', templateUrl: './cut.html' })
+export class Cut {}`
+
+    const result = transformAngularFileSync(
+      source,
+      '/x/cut.ts',
+      {},
+      { templates: { './cut.html': '<text>before</text>\n  @if (on() {\n' }, styles: {} },
+    )
+
+    expect(result.errors).toHaveLength(1)
+    const [error] = result.errors
+    expect(error.message).toBe(INCOMPLETE_IF)
+    expect(error.helpMessage).toBe('./cut.html:2:3')
+    expect(error.labels).toHaveLength(0)
+  })
+
+  it('still compiles a literal @ and well-formed blocks', () => {
+    const source = `import { Component } from '@angular/core';
+@Component({
+  selector: 'x-ok',
+  template: '<p>user@example.com</p>@if (on()) { <i>a</i> }',
+})
+export class Ok { on() { return true; } }`
+
+    const result = transformAngularFileSync(source, '/x/ok.ts', {})
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.code).toContain('user@example.com')
+    expect(result.code).toContain('ɵɵconditional')
   })
 })

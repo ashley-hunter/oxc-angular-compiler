@@ -537,7 +537,11 @@ impl<'a> HtmlParser<'a> {
                 }
             }
             HtmlTokenType::BlockOpenStart => {
-                self.consume_block_open();
+                let block = self.read_block_open();
+                self.push_block_container(block);
+            }
+            HtmlTokenType::IncompleteBlockOpen => {
+                self.consume_incomplete_block();
             }
             HtmlTokenType::BlockClose => {
                 self.consume_block_close();
@@ -1579,10 +1583,9 @@ impl<'a> HtmlParser<'a> {
     }
 
     /// Consumes a block open (@if, @for, etc.) and pushes it onto the container stack.
-    fn consume_block_open(&mut self) {
-        let Some(token) = self.advance() else {
-            return; // No token to consume
-        };
+    fn read_block_open(&mut self) -> HtmlBlock<'a> {
+        // Callers dispatch on a peeked token, so there is always one to consume.
+        let token = self.advance().expect("block open token");
         let name = token.value().to_string();
         let start = token.start;
         let name_end = token.end;
@@ -1640,7 +1643,7 @@ impl<'a> HtmlParser<'a> {
         let name_span = self.make_span(start, name_end);
         let start_span = self.make_span(start, end);
 
-        let block = HtmlBlock {
+        HtmlBlock {
             block_type,
             name: Ident::from_in(name, &self.allocator),
             parameters,
@@ -1649,10 +1652,24 @@ impl<'a> HtmlParser<'a> {
             name_span,
             start_span,
             end_span: None,
-        };
+        }
+    }
 
-        // Push block onto container stack - children will be added as we parse
-        self.push_block_container(block);
+    /// Consumes a block whose header was never completed: its parameters are unclosed
+    /// or it has no `{`. The block is kept, empty, and reported.
+    ///
+    /// Ported from Angular's `_consumeIncompleteBlock`.
+    fn consume_incomplete_block(&mut self) {
+        let block = self.read_block_open();
+        let message = format!(
+            "Incomplete block \"{}\". If you meant to write the @ character, \
+             you should use the \"&#64;\" HTML entity instead.",
+            block.name
+        );
+        let start = ParseLocation::new(Arc::clone(&self.source_file), block.span.start, 0, 0);
+        let end = ParseLocation::new(Arc::clone(&self.source_file), block.span.end, 0, 0);
+        self.errors.push(ParseError::new(ParseSourceSpan::new(start, end), message));
+        self.add_to_parent(HtmlNode::Block(Box::new_in(block, &self.allocator)));
     }
 
     /// Parses a directive token sequence: DirectiveName → DirectiveOpen? → attrs → DirectiveClose?
