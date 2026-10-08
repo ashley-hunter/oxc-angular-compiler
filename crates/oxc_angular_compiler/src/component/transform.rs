@@ -3902,9 +3902,18 @@ pub fn transform_angular_file(
                         compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
                         class.body.span.end,
                     ));
+                    // Constants pooled by the host bindings are declared before the class.
+                    let mut decls_before_class = String::new();
+                    for stmt in &definitions.statements {
+                        if !decls_before_class.is_empty() {
+                            decls_before_class.push('\n');
+                        }
+                        decls_before_class.push_str(&emitter.emit_statement(stmt));
+                    }
+
                     class_definitions.insert(
                         class_name,
-                        (property_assignments, String::new(), decls_after_class),
+                        (property_assignments, decls_before_class, decls_after_class),
                     );
                 } else if let Some(mut pipe_metadata) = extract_pipe_metadata_in(
                     allocator,
