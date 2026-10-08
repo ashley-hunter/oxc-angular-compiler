@@ -46,5 +46,6 @@ pub use dependencies::{
 pub use initializer::{HmrDefinition, compile_hmr_initializer, compile_hmr_update_callback};
 pub use styles::generate_style_update_module;
 pub use update_module::{
-    HmrUpdateModuleOptions, generate_hmr_update_module, generate_hmr_update_module_from_js,
+    HmrTemplateFields, HmrUpdateModuleOptions, generate_hmr_update_module,
+    generate_hmr_update_module_from_js,
 };

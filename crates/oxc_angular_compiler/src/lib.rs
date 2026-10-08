@@ -78,9 +78,9 @@ pub use component::CrossFileAnalyzer;
 // Re-export HMR types
 pub use hmr::{
     HmrDefinition, HmrDependencies, HmrLocalDependency, HmrMetadata, HmrNamespaceDependency,
-    HmrUpdateModuleOptions, compile_hmr_initializer, compile_hmr_update_callback,
-    extract_hmr_dependencies, generate_hmr_update_module, generate_hmr_update_module_from_js,
-    generate_style_update_module,
+    HmrTemplateFields, HmrUpdateModuleOptions, compile_hmr_initializer,
+    compile_hmr_update_callback, extract_hmr_dependencies, generate_hmr_update_module,
+    generate_hmr_update_module_from_js, generate_style_update_module,
 };
 
 // Re-export styles

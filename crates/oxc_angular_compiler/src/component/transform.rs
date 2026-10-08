@@ -418,6 +418,16 @@ pub struct HmrTemplateCompileOutput {
     /// constant references. Without this, the template may reference indices that don't
     /// exist in the old component definition's consts array.
     pub consts_js: Option<String>,
+
+    /// The number of element, text and container slots the template creates.
+    pub decls: u32,
+
+    /// The number of binding slots the template uses.
+    pub vars: u32,
+
+    /// The `ngContentSelectors` array as JavaScript code, when the template projects
+    /// content. It refers to a constant declared in `declarations_js`.
+    pub ng_content_selectors_js: Option<String>,
 }
 
 /// Compiled component information.
@@ -5604,7 +5614,18 @@ pub fn compile_template_for_hmr<'a>(
         None
     };
 
-    Ok(HmrTemplateCompileOutput { template_js, declarations_js, styles, consts_js })
+    let ng_content_selectors_js =
+        job.content_selectors.take().map(|selectors| emitter.emit_expression(&selectors));
+
+    Ok(HmrTemplateCompileOutput {
+        template_js,
+        declarations_js,
+        styles,
+        consts_js,
+        decls: job.root.decl_count.unwrap_or(0),
+        vars: job.root.vars.unwrap_or(0),
+        ng_content_selectors_js,
+    })
 }
 
 /// Generate component compilation output for HMR.

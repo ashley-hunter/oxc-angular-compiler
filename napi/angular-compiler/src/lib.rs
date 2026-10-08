@@ -20,7 +20,7 @@ use napi_derive::napi;
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
     AngularVersion as RustAngularVersion, ChangeDetectionStrategy as RustChangeDetectionStrategy,
-    HmrUpdateModuleOptions, HostMetadataInput as RustHostMetadataInput,
+    HmrTemplateFields, HmrUpdateModuleOptions, HostMetadataInput as RustHostMetadataInput,
     TransformOptions as RustTransformOptions, ViewEncapsulation as RustViewEncapsulation,
     build_ctor_params_metadata_in as core_build_ctor_params_metadata,
     build_decorator_metadata_array as core_build_decorator_metadata_array,
@@ -659,14 +659,19 @@ pub fn compile_for_hmr_sync(
                     None
                 };
 
-            // Generate HMR module with declarations, encapsulated styles, and consts
+            // Generate the HMR module from everything the new template decided
             let hmr_module = generate_hmr_update_module(&HmrUpdateModuleOptions {
                 component_id: &component_id,
                 class_name: &component_name,
-                template_js: Some(&template_js),
+                template: Some(HmrTemplateFields {
+                    template_js: &template_js,
+                    decls: output.decls,
+                    vars: output.vars,
+                    consts_js: output.consts_js.as_deref(),
+                    ng_content_selectors_js: output.ng_content_selectors_js.as_deref(),
+                }),
                 styles: encapsulated_styles.as_deref(),
                 declarations_js,
-                consts_js: output.consts_js.as_deref(),
             });
 
             HmrCompileResult { hmr_module, component_id, template_js, errors: vec![] }
