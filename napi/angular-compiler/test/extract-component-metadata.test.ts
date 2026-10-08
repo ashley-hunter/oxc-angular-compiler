@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { extractComponentMetadataSync } from '../index.js'
+import { extractComponentMetadataSync, transformAngularFileSync } from '../index.js'
 
 // The queries reported must be the ones the component is compiled with.
 describe('extractComponentMetadataSync queries', () => {
@@ -168,4 +168,49 @@ export class Widget {}
     )
     expect(components.map((c) => c.className)).toEqual(['A', 'B'])
   })
+})
+
+// The styles reported must be the ones the component is compiled with.
+describe('extractComponentMetadataSync styles', () => {
+  const source = (styles: string) => `
+import { Component } from '@angular/core';
+import { OTHER } from './other';
+
+const S = '.a{}';
+const LIST = ['.l{}'];
+
+@Component({ selector: 'app-x', template: '', styles: ${styles} })
+export class X {}
+`
+
+  it.each([
+    ['[S]', ['.a{}']],
+    ['S', ['.a{}']],
+    ["['.b{}' + '.c{}']", ['.b{}.c{}']],
+    ['[...LIST]', ['.l{}']],
+    ['LIST', ['.l{}']],
+    ['[]', []],
+  ])('evaluates `styles: %s` as the transform does', (styles, expected) => {
+    const [component] = extractComponentMetadataSync(source(styles), 'x.component.ts')
+    expect(component.styles).toEqual(expected)
+
+    const result = transformAngularFileSync(source(styles), 'x.component.ts')
+    expect(result.errors).toEqual([])
+    for (const style of expected) {
+      expect(result.code).toContain(style.replaceAll('{}', '[_ngcontent-%COMP%]{}'))
+    }
+  })
+
+  it.each(['[OTHER]', '[S, OTHER]', '[S, 1]'])(
+    'reports `styles: %s` instead of dropping an entry',
+    (styles) => {
+      const code = source(styles)
+      const [error] = transformAngularFileSync(code, 'x.component.ts').errors
+      expect(error.message).toMatch(
+        /^(@Component\.styles depends on 'OTHER'|Failed to resolve styles at position 1 to a string)/,
+      )
+      expect(error.labels.map((label) => code.slice(label.start, label.end))).toEqual([styles])
+      expect(extractComponentMetadataSync(code, 'x.component.ts')[0].styles).toEqual([])
+    },
+  )
 })

@@ -106,13 +106,12 @@ pub fn extract_component_metadata<'a>(
                         crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "styles" => {
-                    if let Some(styles) = extract_string_array(allocator, &prop.value, consts) {
-                        metadata.styles = styles;
-                    } else if let Some(style) =
-                        crate::directive::extract_string_value(allocator, &prop.value, consts)
-                    {
-                        // Single style string (legacy support)
-                        metadata.styles.push(style);
+                    // Anything that isn't styles is an error `decorator_io_errors` reports.
+                    if let Ok(styles) = crate::directive::evaluate_styles(&prop.value, consts) {
+                        metadata.styles = Vec::from_iter_in(
+                            styles.iter().map(|style| Ident::from(allocator.alloc_str(style))),
+                            &allocator,
+                        );
                     }
                 }
                 "styleUrls" | "styleUrl" => {

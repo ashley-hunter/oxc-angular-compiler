@@ -792,8 +792,8 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                 // `fileReplacements` pointed `actualId` at a different file.
                 //
                 // On a disk source the compiler never saw, every `styles`
-                // shape the extractor cannot fold — an array constant, an
-                // imported one, a `.concat(...)` — resolves to nothing. Read
+                // shape the extractor cannot evaluate (an imported constant,
+                // a call to an imported function) resolves to nothing. Read
                 // as definitive that emits `styles: []` and wipes CSS the
                 // running component genuinely has, from a template edit that
                 // never touched the styles at all.

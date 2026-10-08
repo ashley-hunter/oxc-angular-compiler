@@ -1436,6 +1436,14 @@ pub fn decorator_io_errors<'a>(
     let selector =
         || directive_selector_error(config, decorator_name, &class_name, &evaluator, consts);
 
+    // The component handler reads `styles` once the directive metadata is extracted.
+    let styles = || {
+        let expr = config
+            .filter(|_| decorator_name == "Component")
+            .and_then(|config| config_property(config, "styles", consts))?;
+        evaluate_styles(expr, consts).err().map(|message| (message, expr.span(), None))
+    };
+
     io.as_ref()
         .and_then(|io| io.input_error.clone())
         .map(at)
@@ -1445,6 +1453,7 @@ pub fn decorator_io_errors<'a>(
         .or_else(member_queries)
         .or_else(queries)
         .or_else(selector)
+        .or_else(styles)
         .map(|(message, span, related)| {
             let diagnostic = OxcDiagnostic::error(message).with_label(span);
             match related {
@@ -1488,6 +1497,37 @@ fn directive_selector_error<'a>(
         ));
     }
     None
+}
+
+/// ngtsc's `parseDirectiveStyles`: the `styles` of a `@Component`, evaluated
+/// statically. A string is one style, and every entry of an array must be a
+/// string (`isStringArrayOrDie`). Anything else is ngtsc's error for it, or,
+/// for a value from another module, the one of [`value_error`].
+pub(crate) fn evaluate_styles<'a>(
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'a>,
+) -> Result<std::vec::Vec<String>, String> {
+    const SUBJECT: &str = "@Component.styles";
+    match Evaluator::new(consts).evaluate(expr) {
+        Value::String(style) => Ok(vec![style]),
+        Value::Array(entries) => entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, entry)| match entry {
+                Value::String(style) => Ok(style),
+                entry => Err(value_error(
+                    SUBJECT,
+                    || format!("Failed to resolve styles at position {position} to a string"),
+                    &entry,
+                )),
+            })
+            .collect(),
+        value => Err(value_error(
+            SUBJECT,
+            || format!("Failed to resolve {SUBJECT} to a string or an array of strings"),
+            &value,
+        )),
+    }
 }
 
 /// The name upstream sees for a `@angular/core` decorator (`dec.import?.name

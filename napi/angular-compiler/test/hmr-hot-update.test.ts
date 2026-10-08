@@ -2949,16 +2949,13 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     expect(body).not.toContain('styles:')
   })
 
-  it('serves `styles: []` for a class whose `styles` names an array constant', async () => {
+  it('serves the styles of a class whose `styles` names an array constant', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
 
     const constPath = join(appDir, 'ps457-const.component.ts')
-    // `collect_string_consts` folds STRING-valued consts only, never an array
-    // one, so `styles: PS457_STYLES` resolves to nothing. Measured against the
-    // real compile: this class's `\u0275cmp` carries no `styles` key at all and
-    // never held `.PS457_CONST_MARKER`. So `styles: []` is the exact answer —
-    // it clears nothing, because the running component never had these styles.
+    // `styles` is evaluated statically, so `styles: PS457_STYLES` compiles with
+    // the constant's styles, and the update carries the same ones.
     const source = `
       import { Component } from '@angular/core';
       const PS457_STYLES = ['.PS457_CONST_MARKER { color: red; }'];
@@ -2984,10 +2981,9 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
-    expect(body).not.toContain('PS457_CONST_MARKER')
-    expect(body).toContain('styles: []')
+    expect(body).toContain('.PS457_CONST_MARKER[_ngcontent-%COMP%]')
   })
-  it('serves `styles: []` for an array-constant `styles` beside an empty sibling stylesheet', async () => {
+  it('serves an array-constant `styles` beside an empty sibling stylesheet', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
 
@@ -2998,10 +2994,9 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     writeFileSync(fbEmptyCssPath, '')
 
     // Two classes. `FbEmptyOwnerComponent` declares `styles: PS457_FB_STYLES`,
-    // an array constant the compiler does not fold, so it compiles with no
-    // styles (measured) and `styles: []` is exact. What this pins is that the
-    // SIBLING has no say: its stylesheet is neither consulted for this class's
-    // answer nor able to turn it into something else.
+    // an array constant, and compiles with its styles. What this pins is that
+    // the SIBLING has no say: its stylesheet is neither consulted for this
+    // class's answer nor able to turn it into something else.
     const source = `
       import { Component } from '@angular/core';
       const PS457_FB_STYLES = ['.PS457_FB_MARKER { color: red; }'];
@@ -3033,11 +3028,11 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
-    expect(body).not.toContain('PS457_FB_MARKER')
-    expect(body).toContain('styles: []')
+    expect(body).toContain('.PS457_FB_MARKER[_ngcontent-%COMP%]')
+    expect(body).not.toContain('styles: []')
   })
 
-  it('serves `styles: []` for an array-constant `styles` beside a whitespace sibling stylesheet', async () => {
+  it('serves an array-constant `styles` beside a whitespace sibling stylesheet', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
 
@@ -3078,8 +3073,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
-    expect(body).not.toContain('PS457_FB_WS_MARKER')
-    expect(body).toContain('styles: []')
+    expect(body).toContain('.PS457_FB_WS_MARKER[_ngcontent-%COMP%]')
+    expect(body).not.toContain('styles: []')
   })
 
   // A read that FAILED on one stylesheet but succeeded on another is not the
@@ -3445,14 +3440,14 @@ describe('@ng/component endpoint resolves the styles per class', () => {
   // upstream `load` / `transform: { order: 'pre' }` rewrote the module, or
   // this plugin's own `fileReplacements` pointed `actualId` at another file.
   //
-  // For every form the extractor cannot fold, the disk parse yields NO
+  // For every form the extractor cannot evaluate, the disk parse yields NO
   // styles — which, taken as definitive, emits `styles: []` and wipes CSS
   // the component really does have. So an empty answer may only clear when
   // the stripped disk source matches the stripped source the component
   // compiled from; otherwise it is unknown and `styles` is omitted.
   // ----------------------------------------------------------------
 
-  it('keeps the styles of a class whose disk `styles` names an array constant the transform never saw', async () => {
+  it('serves the styles of a class whose disk `styles` names an array constant the transform never saw', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
 
@@ -3460,8 +3455,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     const arrPath = join(appDir, 'ps458-arr.component.ts')
     writeFileSync(arrHtmlPath, '<p>one</p>')
 
-    // What is ON DISK: `collect_string_consts` folds string consts only, so
-    // re-parsing this shape resolves no styles at all.
+    // What is ON DISK: an array constant, which evaluates to the same styles
+    // the rewritten code compiled with.
     const diskSource = `
       import { Component } from '@angular/core';
       const PS458_ARR = ['.PS458_ARR_MARKER { color: red; }'];
@@ -3502,9 +3497,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
-    expect(body, 'an unreadable `styles` must stay unknown, not clear the live CSS').not.toContain(
-      'styles:',
-    )
+    expect(body).toContain('.PS458_ARR_MARKER[_ngcontent-%COMP%]')
+    expect(body).not.toContain('styles: []')
   })
 
   it('keeps the styles of a class whose disk `styles` names an imported constant', async () => {
@@ -3519,8 +3513,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
       `export const PS458_IMP = ['.PS458_IMP_MARKER { color: red; }'];\n`,
     )
 
-    // A cross-file reference is unreadable to the extractor for the same
-    // reason a same-file array constant is.
+    // A cross-file reference is unreadable to the extractor, which sees one
+    // file: the answer is unknown and must not clear the live CSS.
     const diskSource = `
       import { Component } from '@angular/core';
       import { PS458_IMP } from './ps458-imp-styles';
@@ -3559,7 +3553,7 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     expect(body).not.toContain('styles:')
   })
 
-  it('keeps the styles of a class whose disk `styles` is a `.concat(...)` call', async () => {
+  it('serves the styles of a class whose disk `styles` is a `.concat(...)` call', async () => {
     const plugin = getAngularPlugin()
     const mockServer = await setupPluginWithRealConfig(plugin)
 
@@ -3567,9 +3561,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     const catPath = join(appDir, 'ps458-cat.component.ts')
     writeFileSync(catHtmlPath, '<p>one</p>')
 
-    // A call expression is unreadable to the extractor AND unreadable to the
-    // strip (its value has no `[` / quote opener), so the stripped disk form
-    // keeps the call verbatim while the stripped transform form is `styles: []`.
+    // A call the strip cannot read (its value has no `[` / quote opener), but
+    // one that evaluates statically, to the styles the rewritten code has.
     const diskSource = `
       import { Component } from '@angular/core';
       const PS458_CAT_BASE = ['.PS458_CAT_MARKER { color: red; }'];
@@ -3605,7 +3598,8 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
-    expect(body).not.toContain('styles:')
+    expect(body).toContain('.PS458_CAT_MARKER[_ngcontent-%COMP%]')
+    expect(body).toContain('.PS458_CAT_EXTRA[_ngcontent-%COMP%]')
   })
 
   // The counterweight: when the endpoint IS looking at the source the
