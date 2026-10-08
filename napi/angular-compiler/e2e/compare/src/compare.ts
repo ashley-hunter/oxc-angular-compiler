@@ -2269,44 +2269,12 @@ interface ClassMetadataInfo {
   ctorParams: string | null
   /** Property decorators (fourth argument, null if none) */
   propDecorators: string | null
-}
-
-/**
- * Find matching closing bracket, handling nested structures and strings.
- *
- * @param code - The source code
- * @param startIdx - Index where to start looking (should be at or before the opening bracket)
- * @param open - Opening bracket character ('[', '{', or '(')
- * @param close - Closing bracket character (']', '}', or ')')
- * @returns Index of the matching closing bracket, or -1 if not found
- */
-function findMatchingBracket(code: string, startIdx: number, open: string, close: string): number {
-  let depth = 0
-  let inString: string | null = null
-
-  for (let i = startIdx; i < code.length; i++) {
-    const char = code[i]
-
-    if (inString) {
-      if (char === inString && code[i - 1] !== '\\') {
-        inString = null
-      }
-      continue
-    }
-
-    if (char === '"' || char === "'" || char === '`') {
-      inString = char
-      continue
-    }
-
-    if (char === open) depth++
-    else if (char === close) {
-      depth--
-      if (depth === 0) return i
-    }
-  }
-
-  return -1
+  /** `ɵsetClassMetadataAsync` call: resolver thunk (second argument). */
+  resolver?: string | null
+  /** `ɵsetClassMetadataAsync` call: wrapper with params alpha-renamed, normalized AST. */
+  wrapperNormalized?: string | null
+  /** Whether this entry came from `ɵsetClassMetadataAsync` (deferred imports). */
+  isAsync?: boolean
 }
 
 /**
@@ -2320,74 +2288,425 @@ function findMatchingBracket(code: string, startIdx: number, open: string, close
  * @param code - The compiled JavaScript code
  * @returns Array of extracted class metadata info
  */
-function extractClassMetadataCalls(code: string): ClassMetadataInfo[] {
-  const results: ClassMetadataInfo[] = []
 
-  // Pattern matches: i0.ɵɵsetClassMetadata(ClassName,
-  // Need to handle nested brackets and multiline content
-  const startPattern = /i\d+\.ɵɵsetClassMetadata\(\s*(\w+)\s*,\s*/g
-  let match
+/**
+ * `null` and `undefined` are NOT interchangeable in these slots: the runtime
+ * `setClassMetadata` guards each field with `!== null`, so `undefined` (or a
+ * missing argument, which is `undefined` at the call site) assigns the field
+ * while `null` skips it. Keep the two spellings distinct so the comparator
+ * catches a regression between them. Returns the literal argument text, or
+ * `'null'` / `'undefined'` for the absent-value forms.
+ */
+function metadataArgOrAbsent(arg: string | undefined): string {
+  if (arg === undefined) return 'undefined'
+  const trimmed = arg.trim()
+  if (trimmed === 'null') return 'null'
+  // `undefined`, `void 0` and `void(0)` are the inert spellings a compiler
+  // emits; any other `void expr` runs its operand and must stay distinct.
+  if (trimmed === 'undefined' || trimmed === 'void 0' || trimmed === 'void(0)') return 'undefined'
+  return trimmed
+}
 
-  while ((match = startPattern.exec(code)) !== null) {
-    const className = match[1]
-    const startIdx = match.index + match[0].length
-
-    // Extract the decorators array (first parameter after className)
-    const decoratorsEnd = findMatchingBracket(code, startIdx, '[', ']')
-    if (decoratorsEnd === -1) continue
-    const decorators = code.slice(startIdx, decoratorsEnd + 1)
-
-    // Skip comma and whitespace to get to ctorParams
-    let idx = decoratorsEnd + 1
-    while (idx < code.length && (code[idx] === ',' || code[idx] === ' ' || code[idx] === '\n'))
-      idx++
-
-    let ctorParams: string | null = null
-    if (code[idx] === '[') {
-      const ctorEnd = findMatchingBracket(code, idx, '[', ']')
-      if (ctorEnd !== -1) {
-        ctorParams = code.slice(idx, ctorEnd + 1)
-        idx = ctorEnd + 1
+/**
+ * Namespace bindings (`import * as X` / `const X = require(...)`) for
+ * '@angular/core' in the emitted code — the callee of a metadata call must be
+ * one of these so a user-defined `debug.ɵsetClassMetadata` isn't picked up.
+ */
+function angularCoreNamespaces(program: unknown): Set<string> {
+  const namespaces = new Set<string>()
+  walkAst(program, (node) => {
+    if (node.type === 'ImportDeclaration') {
+      const source = node.source as NormAstNode | undefined
+      if (source?.value !== '@angular/core') return
+      for (const spec of (node.specifiers ?? []) as NormAstNode[]) {
+        if (spec.type === 'ImportNamespaceSpecifier') {
+          namespaces.add((spec.local as NormAstNode).name as string)
+        }
       }
-    } else if (code.slice(idx, idx + 4) === 'null') {
-      ctorParams = null
-      idx += 4
-    } else if (code.slice(idx, idx + 4) === 'void') {
-      // Handle "void 0" which is equivalent to undefined/null
-      ctorParams = null
-      idx += 6 // Skip "void 0"
-    }
-
-    // Skip comma and whitespace to get to propDecorators
-    while (idx < code.length && (code[idx] === ',' || code[idx] === ' ' || code[idx] === '\n'))
-      idx++
-
-    let propDecorators: string | null = null
-    if (code[idx] === '{') {
-      const propEnd = findMatchingBracket(code, idx, '{', '}')
-      if (propEnd !== -1) {
-        propDecorators = code.slice(idx, propEnd + 1)
+    } else if (node.type === 'VariableDeclaration') {
+      // `const i0 = require('@angular/core')`
+      for (const decl of (node.declarations ?? []) as NormAstNode[]) {
+        const init = decl.init as NormAstNode | undefined
+        const callee = init?.callee as NormAstNode | undefined
+        if (
+          init?.type === 'CallExpression' &&
+          callee?.type === 'Identifier' &&
+          callee.name === 'require' &&
+          (init.arguments as NormAstNode[])?.[0]?.value === '@angular/core'
+        ) {
+          const id = decl.id as NormAstNode
+          if (id?.type === 'Identifier') namespaces.add(id.name as string)
+        }
       }
-    } else if (code.slice(idx, idx + 4) === 'null') {
-      propDecorators = null
-    } else if (code.slice(idx, idx + 4) === 'void') {
-      // Handle "void 0" which is equivalent to undefined/null
-      propDecorators = null
     }
+  })
+  return namespaces
+}
 
-    results.push({ className, decorators, ctorParams, propDecorators })
+/**
+ * Alpha-rename an arrow/function's parameters to `p0`, `p1`, ... so equivalent
+ * wrappers compare equal while a swapped parameter usage order still differs.
+ *
+ * Only identifier *references* are renamed. Identifier nodes in positions that
+ * are not variable references — non-computed member properties (`registry.X`),
+ * non-computed object keys (`{X: ...}`, including the key of a shorthand
+ * `{X}`), class member keys, labels, and `import.meta` — keep their names so
+ * observable names stay in the normalized form.
+ */
+function normalizeWrapperAst(wrapper: NormAstNode): string {
+  const cloned = JSON.parse(JSON.stringify(wrapper)) as NormAstNode
+  const paramNames: string[] = []
+  for (const param of (cloned.params ?? []) as NormAstNode[]) {
+    if (param.type === 'Identifier') paramNames.push(param.name as string)
   }
+  const nonReference = new Set<NormAstNode>()
+  const protect = (node: unknown) => {
+    const ident = node as NormAstNode | undefined
+    if (ident?.type === 'Identifier') nonReference.add(ident)
+  }
+  walkAst(cloned, (node) => {
+    if (
+      (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') &&
+      node.computed !== true
+    ) {
+      protect(node.property)
+    } else if (
+      (node.type === 'Property' ||
+        node.type === 'PropertyDefinition' ||
+        node.type === 'MethodDefinition' ||
+        node.type === 'AccessorProperty') &&
+      node.computed !== true
+    ) {
+      protect(node.key)
+    } else if (node.type === 'LabeledStatement') {
+      protect(node.label)
+    } else if (node.type === 'BreakStatement' || node.type === 'ContinueStatement') {
+      protect(node.label)
+    } else if (node.type === 'MetaProperty') {
+      protect(node.meta)
+      protect(node.property)
+    }
+  })
+  // Rename references bound to the wrapper's parameters before the parameter
+  // declarations: scope tracking must see the ORIGINAL names, and renaming
+  // declarations first would let a canonical name (`#p1`) collide with an
+  // original parameter and corrupt the shadow set. The canonical spellings
+  // `#p0`, `#p1`, ... can never be real identifiers, so a free `p1` in the
+  // body cannot collide with a renamed parameter either.
+  const canonical = (index: number) => `#p${index}`
+  const active = new Map(paramNames.map((name, index) => [name, canonical(index)]))
+  if (cloned.body) renameBoundIdentifiers(cloned.body, active, nonReference)
+  for (const [index, param] of ((cloned.params ?? []) as NormAstNode[]).entries()) {
+    if (param.type === 'Identifier') param.name = canonical(index)
+  }
+  return normalizeAst(cloned)
+}
+
+/**
+ * Collect names bound by a binding pattern — parameter lists, destructuring
+ * targets, variable declarator ids and catch params. Expression parts
+ * (default values, computed keys) are not bindings and are skipped.
+ */
+function boundNames(pattern: NormAstNode | null | undefined, out: Set<string>): void {
+  if (!pattern || typeof pattern !== 'object') return
+  switch (pattern.type) {
+    case 'Identifier':
+      out.add(pattern.name as string)
+      break
+    case 'ObjectPattern':
+      for (const prop of (pattern.properties ?? []) as NormAstNode[]) {
+        if (prop.type === 'Property') boundNames(prop.value as NormAstNode, out)
+        else if (prop.type === 'RestElement') boundNames(prop.argument as NormAstNode, out)
+      }
+      break
+    case 'ArrayPattern':
+      for (const el of (pattern.elements ?? []) as (NormAstNode | null)[]) boundNames(el, out)
+      break
+    case 'AssignmentPattern':
+      boundNames(pattern.left as NormAstNode, out)
+      break
+    case 'RestElement':
+      boundNames(pattern.argument as NormAstNode, out)
+      break
+    case 'TSParameterProperty':
+      boundNames(pattern.parameter as NormAstNode, out)
+      break
+  }
+}
+
+/**
+ * Names bound directly inside a block/program/statement list by `let`,
+ * `const`, `class` and `function` declarations. Only direct members are
+ * scanned — nested blocks manage their own scope.
+ */
+function blockDeclNames(stmts: NormAstNode[] | undefined, out: Set<string>): void {
+  for (const stmt of stmts ?? []) {
+    if (stmt.type === 'VariableDeclaration' && stmt.kind !== 'var') {
+      for (const decl of (stmt.declarations ?? []) as NormAstNode[]) {
+        boundNames(decl.id as NormAstNode, out)
+      }
+    } else if (stmt.type === 'FunctionDeclaration' || stmt.type === 'ClassDeclaration') {
+      const id = stmt.id as NormAstNode | undefined
+      if (id?.type === 'Identifier') out.add(id.name as string)
+    }
+  }
+}
+
+/**
+ * `var`-bound names anywhere inside a function body — they hoist to the
+ * function scope. Nested functions, classes, and class static blocks are not
+ * descended into: a `var` in a static block scopes to the block itself, and
+ * class members can't contain `var` statements.
+ */
+function varDeclNames(node: unknown, out: Set<string>): void {
+  if (node === null || typeof node !== 'object') return
+  if (Array.isArray(node)) {
+    for (const item of node) varDeclNames(item, out)
+    return
+  }
+  const obj = node as NormAstNode
+  if (
+    obj.type === 'FunctionDeclaration' ||
+    obj.type === 'FunctionExpression' ||
+    obj.type === 'ArrowFunctionExpression' ||
+    obj.type === 'StaticBlock' ||
+    obj.type === 'ClassDeclaration' ||
+    obj.type === 'ClassExpression'
+  ) {
+    return
+  }
+  if (obj.type === 'VariableDeclaration' && obj.kind === 'var') {
+    for (const decl of (obj.declarations ?? []) as NormAstNode[]) {
+      boundNames(decl.id as NormAstNode, out)
+    }
+    return
+  }
+  for (const value of Object.values(obj)) {
+    if (value !== null && typeof value === 'object') varDeclNames(value, out)
+  }
+}
+
+/**
+ * Rename identifiers bound to names in `active` (param name → `p<i>`),
+ * respecting lexical scope: parameters, `let`/`const`/`class`/`function`
+ * declarations, hoisted `var`s, catch params and class names that re-declare
+ * an active name shadow it for their subtree, and identifiers in
+ * `nonReference` positions are never renamed.
+ */
+function renameBoundIdentifiers(
+  node: unknown,
+  active: ReadonlyMap<string, string>,
+  nonReference: ReadonlySet<NormAstNode>,
+): void {
+  if (node === null || typeof node !== 'object') return
+  if (Array.isArray(node)) {
+    for (const item of node) renameBoundIdentifiers(item, active, nonReference)
+    return
+  }
+  const obj = node as NormAstNode
+  if (obj.type === 'Identifier') {
+    if (!nonReference.has(obj)) {
+      const mapped = active.get(obj.name as string)
+      if (mapped) obj.name = mapped
+    }
+    return
+  }
+
+  // Narrow the active renames for this node's subtree when it introduces
+  // shadowing bindings.
+  let inner: Map<string, string> = new Map(active)
+  const type = obj.type
+  if (
+    type === 'FunctionDeclaration' ||
+    type === 'FunctionExpression' ||
+    type === 'ArrowFunctionExpression'
+  ) {
+    // Parameter initializers evaluate in the parameter scope — only the
+    // function's own params/id shadow there. Body bindings (vars and the
+    // body's top-level let/const/class/function decls) apply to the body
+    // only; otherwise a `let A` in the body would hide the outer mapping
+    // for a default `(x = A)`.
+    const paramInner = new Map(active)
+    for (const param of (obj.params ?? []) as NormAstNode[]) {
+      const names = new Set<string>()
+      boundNames(param, names)
+      for (const name of names) paramInner.delete(name)
+    }
+    const id = obj.id as NormAstNode | undefined
+    if (id?.type === 'Identifier') paramInner.delete(id.name as string)
+
+    renameBoundIdentifiers(obj.params, paramInner, nonReference)
+
+    const bodyShadowed = new Set<string>()
+    varDeclNames(obj.body, bodyShadowed)
+    const body = obj.body as NormAstNode | undefined
+    if (body?.type === 'BlockStatement') {
+      blockDeclNames(body.body as NormAstNode[], bodyShadowed)
+    }
+    const bodyInner = new Map(paramInner)
+    for (const name of bodyShadowed) bodyInner.delete(name)
+    renameBoundIdentifiers(obj.body, bodyInner, nonReference)
+    return
+  } else if (type === 'SwitchStatement') {
+    // The discriminant is evaluated in the enclosing scope, before the
+    // case-block bindings exist — only the cases see the shadowed names.
+    const shadowed = new Set<string>()
+    for (const c of (obj.cases ?? []) as NormAstNode[]) {
+      blockDeclNames(c.consequent as NormAstNode[], shadowed)
+    }
+    renameBoundIdentifiers(obj.discriminant, active, nonReference)
+    if (shadowed.size > 0) {
+      inner = new Map(active)
+      for (const name of shadowed) inner.delete(name)
+    }
+    renameBoundIdentifiers(obj.cases, inner, nonReference)
+    return
+  } else if (type === 'StaticBlock') {
+    // A static block is its own `var` scope — collect both its hoisted vars
+    // and its top-level lexical declarations.
+    const shadowed = new Set<string>()
+    varDeclNames(obj.body, shadowed)
+    blockDeclNames(obj.body as NormAstNode[], shadowed)
+    if (shadowed.size > 0) {
+      inner = new Map(active)
+      for (const name of shadowed) inner.delete(name)
+    }
+  } else if (type === 'Program' || type === 'BlockStatement') {
+    const shadowed = new Set<string>()
+    blockDeclNames(obj.body as NormAstNode[], shadowed)
+    if (shadowed.size > 0) {
+      inner = new Map(active)
+      for (const name of shadowed) inner.delete(name)
+    }
+  } else if (type === 'CatchClause') {
+    const param = obj.param as NormAstNode | undefined
+    if (param) {
+      const shadowed = new Set<string>()
+      boundNames(param, shadowed)
+      inner = new Map(active)
+      for (const name of shadowed) inner.delete(name)
+    }
+  } else if (type === 'ClassExpression' || type === 'ClassDeclaration') {
+    const id = obj.id as NormAstNode | undefined
+    if (id?.type === 'Identifier' && active.has(id.name as string)) {
+      inner = new Map(active)
+      inner.delete(id.name as string)
+    }
+  } else if (type === 'ForStatement' || type === 'ForInStatement' || type === 'ForOfStatement') {
+    const decl = (type === 'ForStatement' ? obj.init : obj.left) as NormAstNode | undefined
+    if (decl?.type === 'VariableDeclaration' && decl.kind !== 'var') {
+      const shadowed = new Set<string>()
+      for (const d of (decl.declarations ?? []) as NormAstNode[]) {
+        boundNames(d.id as NormAstNode, shadowed)
+      }
+      inner = new Map(active)
+      for (const name of shadowed) inner.delete(name)
+    }
+  }
+
+  for (const value of Object.values(obj)) {
+    if (value !== null && typeof value === 'object') {
+      renameBoundIdentifiers(value, inner, nonReference)
+    }
+  }
+}
+
+/**
+ * Extract ɵsetClassMetadata/ɵsetClassMetadataAsync calls from the parsed AST.
+ * Working on the tree avoids every text-scanning edge case: regex literals,
+ * comments, nested calls and `$`-or-unicode identifiers are all handled by
+ * the parser.
+ */
+export function extractClassMetadataCalls(program: unknown, code: string): ClassMetadataInfo[] {
+  const results: ClassMetadataInfo[] = []
+  const coreNamespaces = angularCoreNamespaces(program)
+  // `ɵsetClassMetadata` calls nested inside an async wrapper are already
+  // covered by `wrapperNormalized` — extracting them again would compare the
+  // raw parameter spellings and produce spurious diffs (`A` vs `B`).
+  const callsInsideAsyncWrappers = new Set<NormAstNode>()
+
+  const slice = (node: NormAstNode | undefined): string | undefined =>
+    node && typeof node.start === 'number' && typeof node.end === 'number'
+      ? code.slice(node.start, node.end)
+      : undefined
+
+  walkAst(program, (node) => {
+    if (node.type !== 'CallExpression') return
+    const callee = node.callee as NormAstNode | undefined
+    if (!callee || callee.type !== 'MemberExpression') return
+    const object = callee.object as NormAstNode | undefined
+    const property = callee.property as NormAstNode | undefined
+    if (object?.type !== 'Identifier' || property?.type !== 'Identifier') return
+    if (!coreNamespaces.has(object.name as string)) return
+
+    const isAsync = property.name === 'ɵsetClassMetadataAsync'
+    if (!isAsync && property.name !== 'ɵsetClassMetadata') return
+
+    const args = node.arguments as NormAstNode[] | undefined
+    const classArg = args?.[0]
+    if (!args || !classArg) return
+
+    if (callsInsideAsyncWrappers.has(node)) return
+
+    const className =
+      classArg.type === 'Identifier' ? (classArg.name as string) : (slice(classArg) ?? '')
+
+    if (isAsync) {
+      // `ɵsetClassMetadataAsync(Class, resolver, wrapper)` — the wrapper's
+      // nested calls are normalized with the parameter bindings, so mark every
+      // nested metadata call in the wrapper argument as covered.
+      const wrapper = args[2]
+      if (wrapper) {
+        walkAst(wrapper, (nested) => {
+          if (nested !== wrapper && nested.type === 'CallExpression') {
+            callsInsideAsyncWrappers.add(nested)
+          }
+        })
+      }
+      results.push({
+        className,
+        decorators: 'null',
+        ctorParams: null,
+        propDecorators: null,
+        resolver: metadataArgOrAbsent(slice(args[1])),
+        isAsync: true,
+        wrapperNormalized:
+          wrapper &&
+          (wrapper.type === 'ArrowFunctionExpression' || wrapper.type === 'FunctionExpression')
+            ? normalizeWrapperAst(wrapper)
+            : (slice(wrapper) ?? null),
+      })
+      return
+    }
+
+    results.push({
+      className,
+      decorators: metadataArgOrAbsent(slice(args[1])),
+      ctorParams: metadataArgOrAbsent(slice(args[2])),
+      propDecorators: metadataArgOrAbsent(slice(args[3])),
+    })
+  })
 
   return results
 }
 
 /**
- * Normalize a metadata string for comparison.
- * Removes whitespace variations while preserving semantic content.
+ * Normalize a metadata argument for comparison.
+ *
+ * The argument is an expression fragment (`[...]`, `{...}`, `null`, ...), so
+ * parse it and compare normalized ASTs: quote style, indentation, trailing
+ * commas and key ordering noise don't matter semantically for these
+ * structures. Falls back to whitespace-collapsed text when the fragment
+ * can't be parsed.
  */
 function normalizeMetadataString(s: string | null): string {
   if (!s) return 'null'
-  return s.replace(/\s+/g, ' ').trim()
+  const parsed = parseSync('metadata.js', `(${s}\n)`, { sourceType: 'module' })
+  const stmt = parsed.program.body[0]
+  if (parsed.errors.length > 0 || !stmt || stmt.type !== 'ExpressionStatement') {
+    return s.replace(/\s+/g, ' ').trim()
+  }
+  return normalizeAst(stmt.expression)
 }
 
 /**
@@ -2397,75 +2716,168 @@ function normalizeMetadataString(s: string | null): string {
  * @param tsMetadata - Class metadata extracted from TS output
  * @returns Array of differences found
  */
-function compareClassMetadata(
+export function compareClassMetadata(
   oxcMetadata: ClassMetadataInfo[],
   tsMetadata: ClassMetadataInfo[],
 ): ClassMetadataDiff[] {
   const diffs: ClassMetadataDiff[] = []
-  const tsMap = new Map(tsMetadata.map((m) => [m.className, m]))
-  const oxcMap = new Map(oxcMetadata.map((m) => [m.className, m]))
+  // Sync and async calls for the same class are separate entries — a class
+  // reported under both names on one side and only sync on the other is a
+  // real difference (deferredImports metadata wrapper). Each key maps to a
+  // LIST of calls: a source file can legitimately contain its own
+  // `ng.ɵsetClassMetadata(...)` call through the same Angular namespace
+  // binding, and keeping only the last call would let an identical user call
+  // mask a divergent generated one.
+  const keyOf = (m: ClassMetadataInfo) => (m.isAsync ? `${m.className}#async` : m.className)
+  const groupByKey = (list: ClassMetadataInfo[]) => {
+    const map = new Map<string, ClassMetadataInfo[]>()
+    for (const m of list) {
+      const key = keyOf(m)
+      const group = map.get(key)
+      if (group) {
+        group.push(m)
+      } else {
+        map.set(key, [m])
+      }
+    }
+    // Calls stay in execution order: repeated setClassMetadata calls overwrite
+    // fields, so the same calls in a different order produce different runtime
+    // metadata and must not compare equal.
+    return map
+  }
+  const tsMap = groupByKey(tsMetadata)
+  const oxcMap = groupByKey(oxcMetadata)
 
   // Check for missing/different metadata (in TS but not matching in Oxc)
-  for (const [className, tsInfo] of tsMap) {
-    const oxcInfo = oxcMap.get(className)
-    if (!oxcInfo) {
+  for (const [key, tsGroup] of tsMap) {
+    const className = tsGroup[0].className
+    const callName = tsGroup[0].isAsync ? 'setClassMetadataAsync' : 'setClassMetadata'
+    const oxcGroup = oxcMap.get(key)
+    if (!oxcGroup) {
       diffs.push({
         type: 'missing',
         className,
-        field: 'setClassMetadata',
-        expected: `decorators: ${tsInfo.decorators.slice(0, 100)}...`,
+        field: callName,
+        expected: `decorators: ${tsGroup[0].decorators.slice(0, 100)}...`,
       })
-    } else {
-      // Compare decorators (normalized)
-      const normalizedTsDecorators = normalizeMetadataString(tsInfo.decorators)
-      const normalizedOxcDecorators = normalizeMetadataString(oxcInfo.decorators)
-      if (normalizedTsDecorators !== normalizedOxcDecorators) {
-        diffs.push({
-          type: 'different',
-          className,
-          field: 'setClassMetadata.decorators',
-          expected: tsInfo.decorators.slice(0, 100),
-          actual: oxcInfo.decorators.slice(0, 100),
-        })
-      }
+      continue
+    }
+    if (oxcGroup.length !== tsGroup.length) {
+      diffs.push({
+        type: 'different',
+        className,
+        field: callName,
+        expected: `${tsGroup.length} call(s)`,
+        actual: `${oxcGroup.length} call(s)`,
+      })
+    }
+    for (let i = 0; i < Math.min(tsGroup.length, oxcGroup.length); i++) {
+      const tsInfo = tsGroup[i]
+      const oxcInfo = oxcGroup[i]
+      if (tsInfo.isAsync) {
+        // Async entries: compare the deferred-imports resolver thunk AND the
+        // wrapper (alpha-renamed) — a swapped `(B, A)` wrapper is behaviorally
+        // wrong even though its nested sync call looks identical. The nested
+        // sync call itself is extracted as its own entry.
+        if (
+          normalizeMetadataString(tsInfo.resolver ?? null) !==
+          normalizeMetadataString(oxcInfo.resolver ?? null)
+        ) {
+          diffs.push({
+            type: 'different',
+            className,
+            field: 'setClassMetadataAsync.resolver',
+            expected: String(tsInfo.resolver).slice(0, 100),
+            actual: String(oxcInfo.resolver).slice(0, 100),
+          })
+        }
+        if ((tsInfo.wrapperNormalized ?? null) !== (oxcInfo.wrapperNormalized ?? null)) {
+          diffs.push({
+            type: 'different',
+            className,
+            field: 'setClassMetadataAsync.wrapper',
+            expected: '(normalized wrapper)',
+            actual: '(normalized wrapper)',
+          })
+        }
+      } else {
+        // Compare decorators (normalized)
+        const normalizedTsDecorators = normalizeMetadataString(tsInfo.decorators)
+        const normalizedOxcDecorators = normalizeMetadataString(oxcInfo.decorators)
+        if (normalizedTsDecorators !== normalizedOxcDecorators) {
+          diffs.push({
+            type: 'different',
+            className,
+            field: 'setClassMetadata.decorators',
+            expected: tsInfo.decorators.slice(0, 100),
+            actual: oxcInfo.decorators.slice(0, 100),
+          })
+        }
 
-      // Compare ctorParams
-      if (
-        normalizeMetadataString(tsInfo.ctorParams) !== normalizeMetadataString(oxcInfo.ctorParams)
-      ) {
-        diffs.push({
-          type: 'different',
-          className,
-          field: 'setClassMetadata.ctorParams',
-          expected: String(tsInfo.ctorParams).slice(0, 100),
-          actual: String(oxcInfo.ctorParams).slice(0, 100),
-        })
-      }
+        // Compare ctorParams
+        if (
+          normalizeMetadataString(tsInfo.ctorParams) !== normalizeMetadataString(oxcInfo.ctorParams)
+        ) {
+          diffs.push({
+            type: 'different',
+            className,
+            field: 'setClassMetadata.ctorParams',
+            expected: String(tsInfo.ctorParams).slice(0, 100),
+            actual: String(oxcInfo.ctorParams).slice(0, 100),
+          })
+        }
 
-      // Compare propDecorators
-      if (
-        normalizeMetadataString(tsInfo.propDecorators) !==
-        normalizeMetadataString(oxcInfo.propDecorators)
-      ) {
-        diffs.push({
-          type: 'different',
-          className,
-          field: 'setClassMetadata.propDecorators',
-          expected: String(tsInfo.propDecorators).slice(0, 100),
-          actual: String(oxcInfo.propDecorators).slice(0, 100),
-        })
+        // Compare propDecorators
+        if (
+          normalizeMetadataString(tsInfo.propDecorators) !==
+          normalizeMetadataString(oxcInfo.propDecorators)
+        ) {
+          diffs.push({
+            type: 'different',
+            className,
+            field: 'setClassMetadata.propDecorators',
+            expected: String(tsInfo.propDecorators).slice(0, 100),
+            actual: String(oxcInfo.propDecorators).slice(0, 100),
+          })
+        }
       }
     }
   }
 
   // Check for extra metadata (in Oxc but not in TS)
-  for (const className of oxcMap.keys()) {
-    if (!tsMap.has(className)) {
+  for (const [key, oxcGroup] of oxcMap) {
+    if (!tsMap.has(key)) {
       diffs.push({
         type: 'extra',
-        className,
-        field: 'setClassMetadata',
+        className: oxcGroup[0].className,
+        field: oxcGroup[0].isAsync ? 'setClassMetadataAsync' : 'setClassMetadata',
         actual: 'found in Oxc output but not in TS',
+      })
+    }
+  }
+
+  // Call order is observable across classes too: decorator arguments may run
+  // evaluated expressions, so emitting the same calls in a different sequence
+  // can change runtime behavior. When both outputs contain the same multiset
+  // of calls (keyed by class/kind) but in a different order, report it at the
+  // first divergent position. Same-multiset-only keeps the check meaningful:
+  // differing lengths are already covered by missing/extra diffs above.
+  const tsKeys = tsMetadata.map(keyOf)
+  const oxcKeys = oxcMetadata.map(keyOf)
+  const tsSorted = [...tsKeys].sort()
+  const oxcSorted = [...oxcKeys].sort()
+  if (tsSorted.length === oxcSorted.length && tsSorted.every((k, i) => k === oxcSorted[i])) {
+    const divergent = tsKeys.findIndex((k, i) => k !== oxcKeys[i])
+    if (divergent >= 0) {
+      const callName = tsKeys[divergent].endsWith('#async')
+        ? 'setClassMetadataAsync'
+        : 'setClassMetadata'
+      diffs.push({
+        type: 'different',
+        className: tsKeys[divergent].replace(/#async$/, ''),
+        field: `${callName}.order`,
+        expected: `call #${divergent + 1}: ${tsKeys[divergent].replace(/#async$/, '')}`,
+        actual: `call #${divergent + 1}: ${oxcKeys[divergent].replace(/#async$/, '')}`,
       })
     }
   }
@@ -3172,8 +3584,8 @@ export async function compareFullFileSemantically(
     const staticFieldDiffs = compareStaticFields(oxcFields, tsFields, constMapping)
 
     // Extract and compare class metadata (setClassMetadata calls)
-    const oxcClassMetadata = extractClassMetadataCalls(normalizedOxcCode)
-    const tsClassMetadata = extractClassMetadataCalls(normalizedTsCode)
+    const oxcClassMetadata = extractClassMetadataCalls(oxcResult.program, normalizedOxcCode)
+    const tsClassMetadata = extractClassMetadataCalls(tsResult.program, normalizedTsCode)
     const classMetadataDiffs = compareClassMetadata(oxcClassMetadata, tsClassMetadata)
 
     // Extract and compare functions (template functions, etc.)
