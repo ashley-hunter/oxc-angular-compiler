@@ -18,8 +18,9 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    StringConsts, extract_host_bindings_in, extract_host_listeners_in, extract_input_metadata_in,
-    extract_output_metadata_in, merge_by_class_property, parse_decorator_io,
+    HostKey, StringConsts, extract_host_bindings_in, extract_host_listeners_in,
+    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
+    parse_decorator_io,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -480,66 +481,28 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
     }
 }
 
-/// Extract host metadata from a host object expression.
+/// Extract host metadata from a host expression.
 ///
 /// Reference: packages/compiler/src/render3/view/compiler.ts:560-604
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
-    expr: &Expression<'a>,
+    expr: &'a Expression<'a>,
     consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
-    let Expression::ObjectExpression(obj) = expr else {
-        return None;
-    };
+    // An unusable host is reported by `decorator_io_errors`.
+    let entries =
+        crate::directive::evaluate_host_metadata(allocator, expr, "Component", consts).ok()?;
 
-    let mut host = HostMetadata {
-        properties: Vec::new_in(&allocator),
-        attributes: Vec::new_in(&allocator),
-        listeners: Vec::new_in(&allocator),
-        class_attr: None,
-        style_attr: None,
-    };
-
-    for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop
-            && is_metadata_property(prop)
-        {
-            let Some(key_name) = get_property_key_name(&prop.key, consts) else {
-                continue;
-            };
-            let Some(value) =
-                crate::directive::extract_string_value(allocator, &prop.value, consts)
-            else {
-                continue;
-            };
-
-            let key_str = key_name.as_str();
-
-            if key_str.starts_with('[') && key_str.ends_with(']') {
-                // Property binding: [class.active]
-                host.properties.push((key_name, value));
-            } else if key_str.starts_with('(') && key_str.ends_with(')') {
-                // Event listener: (click)
-                host.listeners.push((key_name, value));
-            } else {
-                // Check for special attributes (class and style)
-                // Reference: compiler.ts:567-588
-                match key_str {
-                    "class" => {
-                        host.class_attr = Some(value);
-                    }
-                    "style" => {
-                        host.style_attr = Some(value);
-                    }
-                    _ => {
-                        // Regular static attribute
-                        host.attributes.push((key_name, value));
-                    }
-                }
-            }
+    let mut host = HostMetadata::new(allocator);
+    for (key, value) in entries {
+        match HostKey::of(key.as_str()) {
+            HostKey::Property => host.properties.push((key, value)),
+            HostKey::Listener => host.listeners.push((key, value)),
+            HostKey::Class => host.class_attr = Some(value),
+            HostKey::Style => host.style_attr = Some(value),
+            HostKey::Attribute => host.attributes.push((key, value)),
         }
     }
-
     Some(host)
 }
 

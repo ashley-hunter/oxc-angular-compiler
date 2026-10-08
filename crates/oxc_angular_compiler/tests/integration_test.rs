@@ -12139,10 +12139,10 @@ export class D {}
     );
 }
 
-/// An unresolved identifier in a computed host key must be silently dropped —
-/// matching existing behavior for any unrecognized host metadata.
+/// An unresolved identifier in a computed host key makes the host impossible to
+/// evaluate. ngtsc reports it; the entry is not silently dropped.
 #[test]
-fn host_attribute_unknown_identifier_dropped() {
+fn host_attribute_unknown_identifier_is_reported() {
     let allocator = Allocator::default();
     let source = r#"
 import { Directive } from '@angular/core';
@@ -12154,13 +12154,10 @@ import { Directive } from '@angular/core';
 export class D {}
 "#;
     let result = transform_angular_file(&allocator, "d.ts", source, None, None);
-    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
-
-    let normalized = result.code.replace([' ', '\n', '\t'], "");
-    assert!(
-        !normalized.contains("hostAttrs:"),
-        "Unresolved identifier must not produce hostAttrs entry.\nCode:\n{}",
-        result.code
+    let messages: Vec<&str> = result.diagnostics.iter().map(|d| &*d.message).collect();
+    assert_eq!(
+        messages,
+        ["Decorator host metadata must be an object Value could not be determined statically."]
     );
 }
 

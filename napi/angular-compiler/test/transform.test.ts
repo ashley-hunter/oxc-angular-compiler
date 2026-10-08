@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 
 import {
   transformAngularFile,
+  transformAngularFileSync,
   extractComponentUrls,
   compileTemplate,
   extractAngularComponentByAst,
@@ -609,5 +610,61 @@ describe('object spread in template bindings', () => {
     // Both spread variables should appear in the output
     expect(result.code).toContain('ctx.a')
     expect(result.code).toContain('ctx.b')
+  })
+})
+
+describe('host metadata that is not a plain literal', () => {
+  const listener =
+    /ɵɵlistener\("press",\s*function X_press_HostBindingHandler\(\)\s*\{\s*return ctx\.go\(\);/
+
+  it('compiles a spread inside the host object', () => {
+    const result = transformAngularFileSync(
+      `import { Component } from '@angular/core';
+const SHARED = { '(press)': 'go()' };
+@Component({
+  selector: 'x',
+  template: '',
+  host: { ...SHARED, accessibilityRole: 'button' },
+})
+export class X { go() {} }`,
+      '/x/a.ts',
+      {},
+    )
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.code).toMatch(/hostAttrs:\s*\["accessibilityRole",\s*"button"\]/)
+    expect(result.code).toMatch(listener)
+  })
+
+  it('compiles a host that is a constant', () => {
+    const result = transformAngularFileSync(
+      `import { Component } from '@angular/core';
+const HOST = { '(press)': 'go()' };
+@Component({ selector: 'x', template: '', host: HOST })
+export class X { go() {} }`,
+      '/x/a.ts',
+      {},
+    )
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.code).toMatch(listener)
+  })
+
+  it('reports a host it cannot use, at the host expression', () => {
+    const source = `import { Directive } from '@angular/core';
+const SHARED = { tabindex: 0 };
+@Directive({ selector: '[x]', host: { ...SHARED, role: 'button' } })
+export class X {}`
+
+    const result = transformAngularFileSync(source, '/x/a.ts', {})
+
+    expect(result.errors).toHaveLength(1)
+    const [error] = result.errors
+    expect(error.message).toBe(
+      "Decorator host metadata must be a string -> string object, but found unparseable value Value is of type 'number'.",
+    )
+    expect(source.slice(error.labels[0].start, error.labels[0].end)).toBe(
+      "{ ...SHARED, role: 'button' }",
+    )
   })
 })

@@ -1,0 +1,420 @@
+//! `host` in `@Component` / `@Directive` metadata is evaluated statically, as ngtsc's
+//! `evaluateHostExpressionBindings` does: a spread of an object, or a host that is itself
+//! a constant, compiles to the same bindings as the entries written out in a literal.
+//! A host that cannot be used is an error on the host expression, never a silent drop.
+//!
+//! Every expectation is what `@angular/compiler-cli` 22.2.1 produces for the same source:
+//! for the equivalence cases its definitions are identical for both forms, and the error
+//! messages are its diagnostics (with the chained line joined by a space, as elsewhere).
+
+use oxc_allocator::Allocator;
+use oxc_angular_compiler::{TransformOptions, transform_angular_file};
+use oxc_diagnostics::OxcDiagnostic;
+
+const MEMBERS: &str = "go() {} other() {} t = ''; on = true; w = '';";
+
+fn source(decorator: &str, preamble: &str, host: &str) -> String {
+    let rest =
+        if decorator == "Component" { "selector: 'x', template: ''," } else { "selector: '[x]'," };
+    format!(
+        "import {{ {decorator} }} from '@angular/core';\n{preamble}\n\
+         @{decorator}({{ {rest} host: {host} }})\nexport class X {{ {MEMBERS} }}\n"
+    )
+}
+
+fn compile(source: &str) -> (String, Vec<OxcDiagnostic>) {
+    let allocator = Allocator::default();
+    let result = transform_angular_file(
+        &allocator,
+        "/x/a.ts",
+        source,
+        Some(&TransformOptions::default()),
+        None,
+    );
+    (result.code, result.diagnostics)
+}
+
+/// The whitespace-free host part of the compiled definition: `hostAttrs`, `hostVars`
+/// and `hostBindings`, or nothing when the class has no host metadata.
+fn host_definition(decorator: &str, preamble: &str, host: &str) -> String {
+    let (code, diagnostics) = compile(&source(decorator, preamble, host));
+    assert!(diagnostics.is_empty(), "unexpected diagnostics for `{host}`: {diagnostics:?}");
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let start = compact.find("({type:X,").expect("definition");
+    // The definition ends where the class metadata call, which repeats `host`, starts.
+    let definition = &compact[start..];
+    let definition = &definition[..definition.find("(()=>").unwrap_or(definition.len())];
+    let Some(from) = definition.find(",host") else { return String::new() };
+    let to = definition[from..].find("decls:").map_or(definition.len(), |i| from + i);
+    definition[from..to].to_string()
+}
+
+/// `host` compiles to what `literal` compiles to.
+#[track_caller]
+fn assert_same_as_literal(decorator: &str, preamble: &str, host: &str, literal: &str) {
+    let expected = host_definition(decorator, "", literal);
+    assert_eq!(
+        host_definition(decorator, preamble, host),
+        expected,
+        "`host: {host}` should compile like `host: {literal}`"
+    );
+}
+
+/// Compiling `host` reports exactly `message`, on the host expression.
+#[track_caller]
+fn assert_error(preamble: &str, host: &str, message: &str) {
+    for decorator in ["Component", "Directive"] {
+        let source = source(decorator, preamble, host);
+        let (_, diagnostics) = compile(&source);
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one diagnostic for `{host}`, got {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.message, message, "for `host: {host}`");
+        let labels: Vec<&str> = diagnostic
+            .labels
+            .iter()
+            .map(|l| &source[l.offset() as usize..(l.offset() + l.len()) as usize])
+            .collect();
+        assert_eq!(labels, [host], "label for `host: {host}`");
+    }
+}
+
+const NOT_AN_OBJECT: &str = "Decorator host metadata must be an object";
+const UNPARSEABLE_VALUE: &str =
+    "Decorator host metadata must be a string -> string object, but found unparseable value";
+
+// The two reported inputs.
+
+#[test]
+fn spread_inside_the_host_object() {
+    let (code, diagnostics) = compile(
+        "import { Component } from '@angular/core';
+const SHARED = { '(press)': 'go()' };
+@Component({
+  selector: 'x',
+  template: '',
+  host: { ...SHARED, accessibilityRole: 'button' },
+})
+export class X { go() {} }
+",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(r#"hostAttrs:["accessibilityRole","button"]"#), "{compact}");
+    assert!(
+        compact.contains(
+            r#"i0.ɵɵlistener("press",functionX_press_HostBindingHandler(){returnctx.go();});"#
+        ),
+        "{compact}"
+    );
+}
+
+#[test]
+fn host_that_is_a_constant() {
+    let (code, diagnostics) = compile(
+        "import { Component } from '@angular/core';
+const HOST = { '(press)': 'go()' };
+@Component({ selector: 'x', template: '', host: HOST })
+export class X { go() {} }
+",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(
+            r#"i0.ɵɵlistener("press",functionX_press_HostBindingHandler(){returnctx.go();});"#
+        ),
+        "{compact}"
+    );
+}
+
+// Spreads.
+
+#[test]
+fn spread_before_and_after_other_entries() {
+    let shared = "const SHARED = { '(press)': 'go()' };";
+    let literal = "{ '(press)': 'go()', accessibilityRole: 'button' }";
+    for decorator in ["Component", "Directive"] {
+        assert_same_as_literal(
+            decorator,
+            shared,
+            "{ ...SHARED, accessibilityRole: 'button' }",
+            literal,
+        );
+        assert_same_as_literal(
+            decorator,
+            shared,
+            "{ accessibilityRole: 'button', ...SHARED }",
+            "{ accessibilityRole: 'button', '(press)': 'go()' }",
+        );
+    }
+}
+
+/// The later entry wins, and keeps the position of the first one with that key.
+#[test]
+fn later_entry_overrides_an_earlier_one() {
+    assert_same_as_literal(
+        "Component",
+        "const SHARED = { role: 'a', '(press)': 'go()' };",
+        "{ ...SHARED, role: 'b', '(press)': 'other()' }",
+        "{ role: 'b', '(press)': 'other()' }",
+    );
+    assert_same_as_literal(
+        "Component",
+        "const SHARED = { role: 'a' };",
+        "{ role: 'b', ...SHARED }",
+        "{ role: 'a' }",
+    );
+    assert_same_as_literal(
+        "Component",
+        "const SHARED = { role: 'x', id: 'i' };",
+        "{ ...SHARED, title: 't', role: 'y' }",
+        "{ role: 'y', id: 'i', title: 't' }",
+    );
+}
+
+#[test]
+fn two_spreads_and_a_spread_of_a_spread() {
+    assert_same_as_literal(
+        "Component",
+        "const A = { '(press)': 'go()' }; const B = { '[title]': 't', role: 'x' };",
+        "{ ...A, ...B }",
+        "{ '(press)': 'go()', '[title]': 't', role: 'x' }",
+    );
+    assert_same_as_literal(
+        "Component",
+        "const A = { '(press)': 'go()' }; const B = { ...A, role: 'x' };",
+        "{ ...B, id: 'y' }",
+        "{ '(press)': 'go()', role: 'x', id: 'y' }",
+    );
+}
+
+// A host that is a constant.
+
+#[test]
+fn constant_host_with_and_without_as_const() {
+    for decorator in ["Component", "Directive"] {
+        assert_same_as_literal(
+            decorator,
+            "const HOST = { '(press)': 'go()', role: 'x' };",
+            "HOST",
+            "{ '(press)': 'go()', role: 'x' }",
+        );
+        assert_same_as_literal(
+            decorator,
+            "const HOST = { '(press)': 'go()', role: 'x' } as const;",
+            "HOST",
+            "{ '(press)': 'go()', role: 'x' }",
+        );
+    }
+}
+
+/// ngtsc evaluates these too; none of them is an error.
+#[test]
+fn other_statically_resolvable_hosts() {
+    let literal = "{ '(press)': 'go()' }";
+    for (preamble, host) in [
+        ("let HOST = { '(press)': 'go()' };", "HOST"),
+        ("var HOST = { '(press)': 'go()' };", "HOST"),
+        ("const HOST: Record<string, string> = { '(press)': 'go()' };", "HOST"),
+        ("const HOST = { '(press)': 'go()' };", "HOST as any"),
+        ("const HOST = { '(press)': 'go()' };", "(HOST)"),
+        ("const HOST = { '(press)': 'go()' };", "HOST!"),
+        ("const C = { h: { '(press)': 'go()' } };", "C.h"),
+        ("class C { static HOST = { '(press)': 'go()' }; }", "C.HOST"),
+        ("function make() { return { '(press)': 'go()' }; }", "make()"),
+        ("function make() { return { '(press)': 'go()' }; }", "{ ...make() }"),
+        ("let SHARED = { '(press)': 'go()' };", "{ ...SHARED }"),
+        ("const DEV = true; const A = { '(press)': 'go()' };", "{ ...(DEV ? A : {}) }"),
+    ] {
+        assert_same_as_literal("Component", preamble, host, literal);
+    }
+}
+
+// Values.
+
+#[test]
+fn entry_values_that_are_string_constants() {
+    assert_same_as_literal(
+        "Component",
+        "const HANDLER = 'go()'; const ROLE = 'button';",
+        "{ '(press)': HANDLER, role: ROLE }",
+        "{ '(press)': 'go()', role: 'button' }",
+    );
+    assert_same_as_literal(
+        "Component",
+        "const KEY = '(press)';",
+        "{ [KEY]: 'go()' }",
+        "{ '(press)': 'go()' }",
+    );
+    assert_same_as_literal(
+        "Component",
+        "const N = 'x'; enum E { A = 'a' } const DEV = true; const role = 'r';",
+        "{ id: `a-${N}`, title: E.A, lang: DEV ? 'a' : 'b', role }",
+        "{ id: 'a-x', title: 'a', lang: 'a', role: 'r' }",
+    );
+}
+
+// Every kind of key, through a spread and through a constant.
+
+#[test]
+fn every_kind_of_key() {
+    let literal = "{ '(click)': 'go()', '[title]': 't', '[class.x]': 'on', \
+                   '[style.width]': 'w', '[attr.aria-label]': 't', role: 'button', \
+                   class: 'a b', style: 'color: red' }";
+    let preamble = format!("const ALL = {literal};");
+    for decorator in ["Component", "Directive"] {
+        let expected = host_definition(decorator, "", literal);
+        for needle in [
+            r#"hostAttrs:["role","button",1,"a","b",2,"color","red"]"#,
+            "hostVars:6",
+            r#"i0.ɵɵlistener("click""#,
+            r#"i0.ɵɵdomProperty("title",ctx.t)"#,
+            r#"i0.ɵɵattribute("aria-label",ctx.t)"#,
+            r#"i0.ɵɵstyleProp("width",ctx.w)"#,
+            r#"i0.ɵɵclassProp("x",ctx.on)"#,
+        ] {
+            assert!(expected.contains(needle), "missing `{needle}` in:\n{expected}");
+        }
+        assert_same_as_literal(decorator, &preamble, "{ ...ALL }", literal);
+        assert_same_as_literal(decorator, &preamble, "ALL", literal);
+    }
+}
+
+/// A plain literal host compiles exactly as it did before hosts were evaluated.
+#[test]
+fn literal_host_is_unchanged() {
+    assert_eq!(
+        host_definition("Component", "", "{ '(press)': 'go()', accessibilityRole: 'button' }"),
+        r#",hostAttrs:["accessibilityRole","button"],hostBindings:functionX_HostBindings(rf,ctx){if((rf&1)){i0.ɵɵlistener("press",functionX_press_HostBindingHandler(){returnctx.go();});}},"#
+    );
+    assert_eq!(host_definition("Component", "", "{}"), "");
+    assert_eq!(host_definition("Component", "const HOST = {};", "HOST"), "");
+    assert_same_as_literal(
+        "Component",
+        "",
+        "{ role: 'a', id: 'i', role: 'b' }",
+        "{ role: 'b', id: 'i' }",
+    );
+}
+
+// Errors: what ngtsc reports, on the host expression.
+
+#[test]
+fn host_that_is_not_an_object() {
+    for (preamble, host, suffix) in [
+        ("", "['a']", "Value is of type '[string]'."),
+        ("", "'a'", "Value is of type 'string'."),
+        ("", "null", "Value is of type 'null'."),
+        ("", "undefined", "Value is of type 'undefined'."),
+        ("declare function make(): any;", "make()", "Value could not be determined statically."),
+        (
+            "const HOST = Object.freeze({ '(press)': 'go()' });",
+            "HOST",
+            "Value could not be determined statically.",
+        ),
+        (
+            "const HOST = { '(press)': 'go()' } satisfies Record<string, string>;",
+            "HOST",
+            "Value could not be determined statically.",
+        ),
+    ] {
+        assert_error(preamble, host, &format!("{NOT_AN_OBJECT} {suffix}"));
+    }
+}
+
+/// A spread or member ngtsc cannot evaluate makes the whole object unresolvable.
+#[test]
+fn host_object_that_cannot_be_evaluated() {
+    for (preamble, host) in [
+        ("declare function make(): any;", "{ ...make(), role: 'x' }"),
+        ("", "{ ...NOPE, role: 'x' }"),
+        ("const S = 'abc';", "{ ...S }"),
+        ("const S = ['a'];", "{ ...S }"),
+        ("const K = 1;", "{ [K]: 'a' }"),
+        ("", "{ role() { return 'a' } }"),
+        ("", "{ get role() { return 'a' } }"),
+    ] {
+        assert_error(
+            preamble,
+            host,
+            &format!("{NOT_AN_OBJECT} Value could not be determined statically."),
+        );
+    }
+}
+
+#[test]
+fn host_value_that_is_not_a_string() {
+    for (preamble, host, suffix) in [
+        ("", "{ tabindex: 0 }", "Value is of type 'number'."),
+        ("", "{ '[tabindex]': 0 }", "Value is of type 'number'."),
+        ("", "{ '(click)': 0 }", "Value is of type 'number'."),
+        ("", "{ class: 1 }", "Value is of type 'number'."),
+        ("const S = { hidden: true };", "{ ...S }", "Value is of type 'boolean'."),
+        ("", "{ role: { a: 1 } }", "Value is of type '{ a: number }'."),
+        ("", "{ role: null }", "Value is of type 'null'."),
+        ("const U = undefined;", "{ role: U }", "Value is of type 'undefined'."),
+        ("declare const s: string;", "{ role: s }", "Value is a reference to 's'."),
+        ("declare const s: string;", "{ '[title]': s }", "Value is a reference to 's'."),
+        // The first unusable value is the one reported.
+        ("", "{ a: 1, b: true }", "Value is of type 'number'."),
+    ] {
+        assert_error(preamble, host, &format!("{UNPARSEABLE_VALUE} {suffix}"));
+    }
+}
+
+/// A value ngtsc cannot evaluate at all is an error for everything but a plain attribute.
+#[test]
+fn dynamic_value_of_a_binding() {
+    let make = "declare function make(): string;";
+    assert_error(make, "{ '[title]': make() }", "Property binding must be string");
+    assert_error(make, "{ '(click)': make() }", "Event binding must be string");
+    assert_error(make, "{ class: make() }", "Class binding must be string");
+    assert_error(make, "{ style: make() }", "Style binding must be string");
+}
+
+/// ngtsc emits a plain attribute's dynamic value as an expression in `hostAttrs`
+/// (`["role", make()]`). That is not supported here, and is reported instead of dropped.
+#[test]
+fn dynamic_value_of_a_plain_attribute() {
+    let message = |key: &str| {
+        format!(
+            "Decorator host metadata must be a string -> string object, but the value of \
+             '{key}' could not be determined statically. OXC does not support dynamic \
+             host attribute values."
+        )
+    };
+    assert_error("declare function make(): string;", "{ role: make() }", &message("role"));
+    assert_error("", "{ role: NOPE }", &message("role"));
+    assert_error(
+        "declare function make(): string; const S = { title: make() };",
+        "{ ...S, id: 'a' }",
+        &message("title"),
+    );
+}
+
+/// ngtsc reads another file to evaluate an import. One file at a time, that is an error
+/// that says so.
+#[test]
+fn host_that_depends_on_an_import() {
+    let imported = |subject: &str| {
+        format!(
+            "{subject} depends on 'SHARED', which is imported from another module. \
+             OXC compiles one file at a time and cannot evaluate values from other files."
+        )
+    };
+    let preamble = "import { SHARED } from './other';";
+    for (decorator, subject) in [("Component", "@Component.host"), ("Directive", "@Directive.host")]
+    {
+        for host in
+            ["SHARED", "{ ...SHARED, role: 'x' }", "{ role: SHARED }", "{ '(click)': SHARED }"]
+        {
+            let source = source(decorator, preamble, host);
+            let (_, diagnostics) = compile(&source);
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one diagnostic for `{host}`, got {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.message, imported(subject), "for `host: {host}`");
+        }
+    }
+}

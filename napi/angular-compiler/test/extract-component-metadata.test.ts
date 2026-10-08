@@ -169,3 +169,54 @@ export class Widget {}
     expect(components.map((c) => c.className)).toEqual(['A', 'B'])
   })
 })
+
+// `host` is evaluated the way the compiler evaluates it, so a spread or a
+// constant reports the same host as the entries written out.
+describe('extractComponentMetadataSync host', () => {
+  const ENTRIES = `'(click)': 'go()', '[title]': 't', '[class.x]': 'on', '[style.width]': 'w', '[attr.aria-label]': 't', role: 'button', class: 'a b', style: 'color: red'`
+
+  function hostOf(preamble: string, host: string) {
+    const [component] = extractComponentMetadataSync(
+      `import { Component } from '@angular/core';
+${preamble}
+@Component({ selector: 'app-x', template: '', host: ${host} })
+export class X { go() {} t = ''; on = true; w = ''; }
+`,
+      'x.component.ts',
+    )
+    return component.host
+  }
+
+  const literal = hostOf('', `{ ${ENTRIES} }`)
+
+  it('reports every kind of entry for a literal host', () => {
+    expect(literal).toEqual({
+      properties: [
+        ['[title]', 't'],
+        ['[class.x]', 'on'],
+        ['[style.width]', 'w'],
+        ['[attr.aria-label]', 't'],
+      ],
+      attributes: [['role', 'button']],
+      listeners: [['(click)', 'go()']],
+      classAttr: 'a b',
+      styleAttr: 'color: red',
+    })
+  })
+
+  it('reports the same host for a spread', () => {
+    expect(hostOf(`const ALL = { ${ENTRIES} };`, '{ ...ALL }')).toEqual(literal)
+    expect(
+      hostOf(
+        `const A = { '(click)': 'go()', '[title]': 't', '[class.x]': 'on', '[style.width]': 'w' };
+const B = { ...A, '[attr.aria-label]': 't', role: 'link' };`,
+        `{ ...B, role: 'button', class: 'a b', style: 'color: red' }`,
+      ),
+    ).toEqual(literal)
+  })
+
+  it('reports the same host for a constant', () => {
+    expect(hostOf(`const HOST = { ${ENTRIES} };`, 'HOST')).toEqual(literal)
+    expect(hostOf(`const HOST = { ${ENTRIES} } as const;`, 'HOST')).toEqual(literal)
+  })
+})

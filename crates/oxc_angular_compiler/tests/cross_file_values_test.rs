@@ -237,3 +237,58 @@ export class A {}
         error_messages(&result)
     );
 }
+
+/// `host` goes through the same evaluator, so an imported object or string resolves
+/// in a spread, as the whole host and as an entry's value.
+#[test]
+fn imported_host_metadata_evaluates() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        dir.path(),
+        "app/meta.ts",
+        "export const SHARED = { '(press)': 'go()' };\nexport const NAME = 'button';",
+    );
+    let listener =
+        r#"i0.ɵɵlistener("press",functionA_press_HostBindingHandler(){returnctx.go();})"#;
+    for (host, attrs) in
+        [("{ ...SHARED, role: NAME }", Some(r#"hostAttrs:["role","button"]"#)), ("SHARED", None)]
+    {
+        let source = format!(
+            "import {{ Directive }} from '@angular/core';
+import {{ SHARED, NAME }} from './meta';
+@Directive({{ selector: '[a]', host: {host} }})
+export class A {{ go() {{}} }}
+"
+        );
+        let result = transform(&dir, &source, &resolve_options());
+        assert!(!result.has_errors(), "{}", error_messages(&result));
+        let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(listener), "`host: {host}`:\n{compact}");
+        if let Some(attrs) = attrs {
+            assert!(compact.contains(attrs), "`host: {host}`:\n{compact}");
+        }
+    }
+}
+
+/// Without the option the import is not read, and the host is reported, not dropped.
+#[test]
+fn imported_host_metadata_without_the_option_is_reported() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/meta.ts", "export const SHARED = { '(press)': 'go()' };");
+    let result = transform(
+        &dir,
+        r#"import { Directive } from '@angular/core';
+import { SHARED } from './meta';
+@Directive({ selector: '[a]', host: { ...SHARED } })
+export class A { go() {} }
+"#,
+        &TransformOptions::default(),
+    );
+    assert!(
+        error_messages(&result).contains(
+            "@Directive.host depends on 'SHARED', which is imported from another module."
+        ),
+        "{}",
+        error_messages(&result)
+    );
+}
