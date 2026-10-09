@@ -1146,7 +1146,12 @@ pub fn convert_ir_expression<'a>(
             for elem in rtl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // elem.text is cooked; the emitter prints raw_text verbatim,
+                    // so it must be re-escaped like upstream's
+                    // escapeForTemplateLiteral(escapeSlashes(text)).
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }
@@ -1189,7 +1194,11 @@ pub fn convert_ir_expression<'a>(
             for elem in ttl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // See ResolvedTemplateLiteral above: cooked text must be
+                    // re-escaped for emission as raw text.
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }

@@ -315,50 +315,6 @@ pub fn compile_template<'a>(
     TemplateCompilationResult { template_fn, declarations }
 }
 
-/// Emit pool constants that were added after `compile_template`.
-///
-/// This is used to emit constants that are added during definition generation
-/// (e.g., attrs array from selectors), which happens after `compile_template`
-/// drains the pool to `declarations`.
-///
-/// # Arguments
-///
-/// * `allocator` - Memory allocator
-/// * `job` - The compilation job with the constant pool
-/// * `start_index` - Index of the first constant to emit (constants before this are skipped)
-///
-/// # Returns
-///
-/// A vector of output statements for the new constants.
-pub fn emit_additional_pool_constants<'a>(
-    allocator: &'a Allocator,
-    job: &mut ComponentCompilationJob<'a>,
-    start_index: usize,
-) -> OxcVec<'a, OutputStatement<'a>> {
-    use crate::output::ast::DeclareVarStmt;
-
-    let mut declarations = OxcVec::new_in(&allocator);
-
-    // Only emit constants starting from start_index
-    let constants = job.pool.constants_mut();
-    for constant in constants.iter_mut().skip(start_index) {
-        let value = emit_pooled_constant_value(allocator, &mut constant.kind);
-
-        declarations.push(OutputStatement::DeclareVar(Box::new_in(
-            DeclareVarStmt {
-                name: constant.name.clone(),
-                value: Some(value),
-                modifiers: StmtModifier::FINAL,
-                leading_comment: None,
-                source_span: None,
-            },
-            &allocator,
-        )));
-    }
-
-    declarations
-}
-
 /// Converts a pure function body expression to an output expression.
 ///
 /// This function handles `PureFunctionParameterExpr` by converting them to
@@ -1289,7 +1245,12 @@ fn convert_pure_function_body<'a>(
             for elem in rtl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // elem.text is cooked; the emitter prints raw_text verbatim,
+                    // so it must be re-escaped like upstream's
+                    // escapeForTemplateLiteral(escapeSlashes(text)).
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }
@@ -1346,7 +1307,11 @@ fn convert_pure_function_body<'a>(
             for elem in ttl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // See ResolvedTemplateLiteral above: cooked text must be
+                    // re-escaped for emission as raw text.
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }

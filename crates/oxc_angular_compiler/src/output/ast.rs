@@ -574,6 +574,29 @@ pub struct TaggedTemplateLiteralExpr<'a> {
     pub source_span: Option<Span>,
 }
 
+impl TemplateLiteralExpr<'_> {
+    /// Checks if two template literals are structurally equivalent.
+    ///
+    /// Mirrors `TemplateLiteralExpr.isEquivalent` in `output_ast.ts`: elements
+    /// compare by `text` (upstream also compares `rawText` at the element
+    /// level, so both are checked here) and expressions by structural
+    /// equivalence.
+    pub fn is_equivalent(&self, other: &Self) -> bool {
+        self.elements.len() == other.elements.len()
+            && self
+                .elements
+                .iter()
+                .zip(other.elements.iter())
+                .all(|(x, y)| x.text == y.text && x.raw_text == y.raw_text)
+            && self.expressions.len() == other.expressions.len()
+            && self
+                .expressions
+                .iter()
+                .zip(other.expressions.iter())
+                .all(|(x, y)| x.is_equivalent(y))
+    }
+}
+
 /// Read variable expression.
 #[derive(Debug)]
 pub struct ReadVarExpr<'a> {
@@ -1109,6 +1132,42 @@ impl<'a> OutputExpression<'a> {
             (OutputExpression::RawSource(a), OutputExpression::RawSource(b)) => {
                 a.source == b.source
             }
+            // Template literals
+            (OutputExpression::TemplateLiteral(a), OutputExpression::TemplateLiteral(b)) => {
+                a.is_equivalent(b)
+            }
+            (
+                OutputExpression::TaggedTemplateLiteral(a),
+                OutputExpression::TaggedTemplateLiteral(b),
+            ) => a.tag.is_equivalent(&b.tag) && a.template.is_equivalent(&b.template),
+            // Constructor invocations
+            (OutputExpression::Instantiate(a), OutputExpression::Instantiate(b)) => {
+                a.class_expr.is_equivalent(&b.class_expr)
+                    && a.args.len() == b.args.len()
+                    && a.args.iter().zip(b.args.iter()).all(|(x, y)| x.is_equivalent(y))
+            }
+            // Dynamic imports: upstream compares url/urlComment by identity for
+            // expression URLs; structural comparison is strictly more precise here.
+            (OutputExpression::DynamicImport(a), OutputExpression::DynamicImport(b)) => {
+                a.url_comment == b.url_comment
+                    && match (&a.url, &b.url) {
+                        (DynamicImportUrl::String(x), DynamicImportUrl::String(y)) => x == y,
+                        (DynamicImportUrl::Expression(x), DynamicImportUrl::Expression(y)) => {
+                            x.is_equivalent(y)
+                        }
+                        _ => false,
+                    }
+            }
+            // Wrapped nodes compare by identity upstream; node_id is the port's
+            // stable identity for a wrapped external node.
+            (OutputExpression::WrappedNode(a), OutputExpression::WrappedNode(b)) => {
+                a.node_id == b.node_id
+            }
+            (OutputExpression::WrappedIrNode(a), OutputExpression::WrappedIrNode(b)) => {
+                std::ptr::eq(a.node.as_ref(), b.node.as_ref())
+            }
+            // Upstream LocalizedString.isEquivalent always returns false.
+            (OutputExpression::LocalizedString(_), OutputExpression::LocalizedString(_)) => false,
             _ => false,
         }
     }

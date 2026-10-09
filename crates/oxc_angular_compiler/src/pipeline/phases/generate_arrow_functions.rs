@@ -123,6 +123,13 @@ pub fn generate_arrow_functions_for_host(job: &mut HostBindingCompilationJob<'_>
 
     // Collect arrow functions into the root unit's functions set.
     // Only hoisted arrows are collected, matching the template path.
+    collect_arrow_functions_for_host(job);
+}
+
+/// Rebuilds the root unit's `functions` list from the hoisted arrow functions
+/// currently in its operations, mirroring [`collect_arrow_functions`] for
+/// template jobs.
+pub fn collect_arrow_functions_for_host(job: &mut HostBindingCompilationJob<'_>) {
     job.root.functions.clear();
     for ptr in collect_hoisted_arrow_functions(&mut job.root.create, &mut job.root.update) {
         job.root.functions.push(ptr);

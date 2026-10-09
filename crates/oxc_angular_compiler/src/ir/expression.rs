@@ -2464,8 +2464,12 @@ pub fn transform_expressions_in_create_op<'a, F>(
         | CreateOp::I18nAttributes(_)
         | CreateOp::SourceLocation(_)
         | CreateOp::ConditionalBranch(_)
-        | CreateOp::ControlCreate(_)
-        | CreateOp::Statement(_) => {}
+        | CreateOp::ControlCreate(_) => {}
+        CreateOp::Statement(op) => {
+            // Statement ops may contain WrappedIrNode which wraps IR expressions,
+            // same as UpdateOp::Statement.
+            transform_expressions_in_output_statement(&mut op.statement, transform, flags);
+        }
     }
 }
 
@@ -2545,11 +2549,165 @@ pub fn visit_expressions_in_update_op<'a, F>(
         UpdateOp::DeferWhen(op) => {
             visit_expressions_in_expression(&op.condition, visitor, flags);
         }
+        UpdateOp::Statement(op) => {
+            // Statement ops may contain WrappedIrNode which wraps IR expressions;
+            // transform_expressions_in_update_op covers them, and upstream's
+            // visitExpressionsInOp shares that same implementation. Mirror the
+            // transform here so read-only consumers see the same expressions.
+            visit_expressions_in_output_statement(&op.statement, visitor, flags);
+        }
         // Operations without expressions
-        UpdateOp::ListEnd(_)
-        | UpdateOp::Advance(_)
-        | UpdateOp::I18nApply(_)
-        | UpdateOp::Statement(_) => {}
+        UpdateOp::ListEnd(_) | UpdateOp::Advance(_) | UpdateOp::I18nApply(_) => {}
+    }
+}
+
+/// Visit all expressions inside an OutputStatement (read-only).
+/// This handles WrappedIrNode expressions that contain IR expressions.
+fn visit_expressions_in_output_statement<'a, F>(
+    stmt: &crate::output::ast::OutputStatement<'a>,
+    visitor: &F,
+    flags: VisitorContextFlag,
+) where
+    F: Fn(&IrExpression<'a>, VisitorContextFlag),
+{
+    use crate::output::ast::OutputStatement;
+
+    match stmt {
+        OutputStatement::Expression(expr_stmt) => {
+            visit_expressions_in_output_expression(&expr_stmt.expr, visitor, flags);
+        }
+        OutputStatement::Return(ret_stmt) => {
+            visit_expressions_in_output_expression(&ret_stmt.value, visitor, flags);
+        }
+        OutputStatement::DeclareVar(decl) => {
+            if let Some(ref value) = decl.value {
+                visit_expressions_in_output_expression(value, visitor, flags);
+            }
+        }
+        OutputStatement::If(if_stmt) => {
+            visit_expressions_in_output_expression(&if_stmt.condition, visitor, flags);
+            for stmt in if_stmt.true_case.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+            for stmt in if_stmt.false_case.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+        }
+        OutputStatement::DeclareFunction(_) => {
+            // Function declarations don't contain IrExpressions to visit
+        }
+    }
+}
+
+/// Visit all expressions inside an OutputExpression (read-only).
+/// This handles WrappedIrNode which contains IR expressions.
+fn visit_expressions_in_output_expression<'a, F>(
+    expr: &crate::output::ast::OutputExpression<'a>,
+    visitor: &F,
+    flags: VisitorContextFlag,
+) where
+    F: Fn(&IrExpression<'a>, VisitorContextFlag),
+{
+    use crate::output::ast::OutputExpression;
+
+    match expr {
+        OutputExpression::WrappedIrNode(wrapped) => {
+            visit_expressions_in_expression(&wrapped.node, visitor, flags);
+        }
+        OutputExpression::Conditional(cond) => {
+            visit_expressions_in_output_expression(&cond.condition, visitor, flags);
+            visit_expressions_in_output_expression(&cond.true_case, visitor, flags);
+            if let Some(false_case) = &cond.false_case {
+                visit_expressions_in_output_expression(false_case, visitor, flags);
+            }
+        }
+        OutputExpression::BinaryOperator(bin) => {
+            visit_expressions_in_output_expression(&bin.lhs, visitor, flags);
+            visit_expressions_in_output_expression(&bin.rhs, visitor, flags);
+        }
+        OutputExpression::UnaryOperator(un) => {
+            visit_expressions_in_output_expression(&un.expr, visitor, flags);
+        }
+        OutputExpression::Not(not) => {
+            visit_expressions_in_output_expression(&not.condition, visitor, flags);
+        }
+        OutputExpression::ReadProp(member) => {
+            visit_expressions_in_output_expression(&member.receiver, visitor, flags);
+        }
+        OutputExpression::ReadKey(idx) => {
+            visit_expressions_in_output_expression(&idx.receiver, visitor, flags);
+            visit_expressions_in_output_expression(&idx.index, visitor, flags);
+        }
+        OutputExpression::TaggedTemplateLiteral(tagged) => {
+            visit_expressions_in_output_expression(&tagged.tag, visitor, flags);
+            for expr in tagged.template.expressions.iter() {
+                visit_expressions_in_output_expression(expr, visitor, flags);
+            }
+        }
+        OutputExpression::ArrowFunction(arrow) => match &arrow.body {
+            crate::output::ast::ArrowFunctionBody::Expression(expr) => {
+                visit_expressions_in_output_expression(expr, visitor, flags);
+            }
+            crate::output::ast::ArrowFunctionBody::Statements(stmts) => {
+                for stmt in stmts.iter() {
+                    visit_expressions_in_output_statement(stmt, visitor, flags);
+                }
+            }
+        },
+        OutputExpression::LiteralArray(arr) => {
+            for elem in arr.entries.iter() {
+                visit_expressions_in_output_expression(elem, visitor, flags);
+            }
+        }
+        OutputExpression::LiteralMap(obj) => {
+            for entry in obj.entries.iter() {
+                visit_expressions_in_output_expression(&entry.value, visitor, flags);
+            }
+        }
+        OutputExpression::InvokeFunction(inv) => {
+            visit_expressions_in_output_expression(&inv.fn_expr, visitor, flags);
+            for arg in inv.args.iter() {
+                visit_expressions_in_output_expression(arg, visitor, flags);
+            }
+        }
+        OutputExpression::Function(func) => {
+            for stmt in func.statements.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+        }
+        OutputExpression::Instantiate(inst) => {
+            visit_expressions_in_output_expression(&inst.class_expr, visitor, flags);
+            for arg in inst.args.iter() {
+                visit_expressions_in_output_expression(arg, visitor, flags);
+            }
+        }
+        OutputExpression::Parenthesized(paren) => {
+            visit_expressions_in_output_expression(&paren.expr, visitor, flags);
+        }
+        OutputExpression::Comma(comma) => {
+            for part in comma.parts.iter() {
+                visit_expressions_in_output_expression(part, visitor, flags);
+            }
+        }
+        OutputExpression::Typeof(typeof_expr) => {
+            visit_expressions_in_output_expression(&typeof_expr.expr, visitor, flags);
+        }
+        OutputExpression::Void(void_expr) => {
+            visit_expressions_in_output_expression(&void_expr.expr, visitor, flags);
+        }
+        OutputExpression::SpreadElement(spread) => {
+            visit_expressions_in_output_expression(&spread.expr, visitor, flags);
+        }
+        // Leaf expressions without sub-expressions
+        OutputExpression::Literal(_)
+        | OutputExpression::TemplateLiteral(_)
+        | OutputExpression::RegularExpressionLiteral(_)
+        | OutputExpression::ReadVar(_)
+        | OutputExpression::External(_)
+        | OutputExpression::LocalizedString(_)
+        | OutputExpression::WrappedNode(_)
+        | OutputExpression::DynamicImport(_)
+        | OutputExpression::RawSource(_) => {}
     }
 }
 
@@ -2653,8 +2811,11 @@ pub fn visit_expressions_in_create_op<'a, F>(
         | CreateOp::I18nAttributes(_)
         | CreateOp::SourceLocation(_)
         | CreateOp::ConditionalBranch(_)
-        | CreateOp::ControlCreate(_)
-        | CreateOp::Statement(_) => {}
+        | CreateOp::ControlCreate(_) => {}
+        CreateOp::Statement(op) => {
+            // Same as UpdateOp::Statement: statements may wrap IR expressions.
+            visit_expressions_in_output_statement(&op.statement, visitor, flags);
+        }
     }
 }
 
