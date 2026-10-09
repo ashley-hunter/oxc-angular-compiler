@@ -1162,6 +1162,63 @@ pub fn convert_ir_expression<'a>(
             ))
         }
 
+        // Tagged template literal: convert tag and template expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            let tag =
+                convert_ir_expression(allocator, core_namespace, &ttl.tag, expressions, root_xref);
+            let mut elements = OxcVec::new_in(&allocator);
+            let mut output_expressions = OxcVec::new_in(&allocator);
+            for elem in ttl.elements.iter() {
+                elements.push(crate::output::ast::TemplateLiteralElement {
+                    text: elem.text.clone(),
+                    raw_text: elem.text.clone(),
+                    source_span: elem.source_span,
+                });
+            }
+            for expr in ttl.expressions.iter() {
+                output_expressions.push(convert_ir_expression(
+                    &allocator,
+                    core_namespace,
+                    expr,
+                    expressions,
+                    root_xref,
+                ));
+            }
+            OutputExpression::TaggedTemplateLiteral(Box::new_in(
+                crate::output::ast::TaggedTemplateLiteralExpr {
+                    tag: Box::new_in(tag, &allocator),
+                    template: Box::new_in(
+                        crate::output::ast::TemplateLiteralExpr {
+                            elements,
+                            expressions: output_expressions,
+                            source_span: ttl.source_span,
+                        },
+                        &allocator,
+                    ),
+                    source_span: ttl.source_span,
+                },
+                &allocator,
+            ))
+        }
+
+        // Spread element: convert the inner expression
+        IrExpression::SpreadElement(spread) => {
+            let inner = convert_ir_expression(
+                allocator,
+                core_namespace,
+                &spread.expr,
+                expressions,
+                root_xref,
+            );
+            OutputExpression::SpreadElement(Box::new_in(
+                SpreadElementExpr {
+                    expr: Box::new_in(inner, &allocator),
+                    source_span: spread.source_span,
+                },
+                &allocator,
+            ))
+        }
+
         IrExpression::Parenthesized(paren) => {
             let inner = convert_ir_expression(
                 allocator,

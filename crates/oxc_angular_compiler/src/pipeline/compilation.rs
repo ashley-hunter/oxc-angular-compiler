@@ -806,6 +806,11 @@ pub struct HostBindingCompilationUnit<'a> {
     pub vars: Option<u32>,
     /// Generated function name.
     pub fn_name: Option<Ident<'a>>,
+    /// Arrow functions found in this unit.
+    ///
+    /// Populated by the generateArrowFunctions phase. Only non-listener,
+    /// top-level arrows are collected, matching upstream `unit.functions`.
+    pub functions: Vec<'a, *mut crate::ir::expression::ArrowFunctionExpr<'a>>,
 }
 
 impl<'a> HostBindingCompilationUnit<'a> {
@@ -820,6 +825,7 @@ impl<'a> HostBindingCompilationUnit<'a> {
             attributes: None,
             vars: None,
             fn_name: None,
+            functions: Vec::new_in(&allocator),
         }
     }
 }

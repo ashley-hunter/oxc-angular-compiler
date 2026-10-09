@@ -229,6 +229,15 @@ fn collect_fences(expr: &IrExpression<'_>) -> Fence {
                 fences |= collect_fences(e);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            fences |= collect_fences(&ttl.tag);
+            for e in ttl.expressions.iter() {
+                fences |= collect_fences(e);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            fences |= collect_fences(&spread.expr);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             fences |= collect_fences(&arrow_fn.body);
@@ -2691,6 +2700,15 @@ fn collect_variable_xrefs(expr: &IrExpression<'_>, xrefs: &mut Vec<XrefId>) {
                 collect_variable_xrefs(e, xrefs);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            collect_variable_xrefs(&ttl.tag, xrefs);
+            for e in ttl.expressions.iter() {
+                collect_variable_xrefs(e, xrefs);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            collect_variable_xrefs(&spread.expr, xrefs);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             collect_variable_xrefs(&arrow_fn.body, xrefs);
@@ -3746,6 +3764,43 @@ where
             }
             IrExpression::ResolvedTemplateLiteral(OxcBox::new_in(
                 ResolvedTemplateLiteralExpr { elements, expressions, source_span: rtl.source_span },
+                &allocator,
+            ))
+        }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            use crate::ir::expression::{IrTaggedTemplateLiteralExpr, IrTemplateLiteralElement};
+            let tag = transform_expression(&ttl.tag, &allocator, transform);
+            let mut elements = OxcVec::with_capacity_in(ttl.elements.len(), &allocator);
+            for elem in ttl.elements.iter() {
+                elements.push(IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: elem.source_span,
+                });
+            }
+            let mut expressions = OxcVec::with_capacity_in(ttl.expressions.len(), &allocator);
+            for e in ttl.expressions.iter() {
+                expressions.push(transform_expression(e, &allocator, transform));
+            }
+            IrExpression::TaggedTemplateLiteral(OxcBox::new_in(
+                IrTaggedTemplateLiteralExpr {
+                    tag: OxcBox::new_in(tag, &allocator),
+                    elements,
+                    expressions,
+                    source_span: ttl.source_span,
+                },
+                &allocator,
+            ))
+        }
+        IrExpression::SpreadElement(spread) => {
+            use crate::ir::expression::IrSpreadElementExpr;
+            IrExpression::SpreadElement(OxcBox::new_in(
+                IrSpreadElementExpr {
+                    expr: OxcBox::new_in(
+                        transform_expression(&spread.expr, &allocator, transform),
+                        &allocator,
+                    ),
+                    source_span: spread.source_span,
+                },
                 &allocator,
             ))
         }

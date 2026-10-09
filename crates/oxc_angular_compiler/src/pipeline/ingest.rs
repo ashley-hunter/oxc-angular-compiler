@@ -655,6 +655,55 @@ fn convert_ast_to_ir<'a>(
             Box::new_in(expr, &allocator)
         }
 
+        // Convert TaggedTemplateLiteral - recursively convert the tag and template
+        // expressions to preserve pipes and arrow functions (ingest.ts convertAst).
+        AngularExpression::TaggedTemplateLiteral(ttl) => {
+            let ttl = ttl.unbox();
+            let tag = convert_ast_to_ir(job, ttl.tag);
+            let mut elements = Vec::with_capacity_in(ttl.template.elements.len(), &allocator);
+            for elem in ttl.template.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(ttl.template.expressions.len(), &allocator);
+            for expr in ttl.template.expressions {
+                let converted = convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::IrTaggedTemplateLiteralExpr {
+                        tag,
+                        elements,
+                        expressions,
+                        source_span: Some(ttl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement - recursively convert the inner expression so arrows
+        // and pipes inside spread positions (e.g. call arguments) are preserved
+        // (ingest.ts convertAst produces o.SpreadElementExpr).
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let expr = convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::SpreadElement(Box::new_in(
+                    crate::ir::expression::IrSpreadElementExpr {
+                        expr,
+                        source_span: Some(spread.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
         // For all other expressions, store in ExpressionStore and return reference.
         other => store_and_ref_expr(job, other),
     }
@@ -3896,6 +3945,168 @@ fn host_convert_ast_to_ir<'a>(
                     crate::ir::expression::VoidExpr {
                         expr,
                         source_span: Some(void_expr.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert LiteralArray - recursively convert elements to preserve pipes.
+        // Spread elements (e.g. [...base, item]) are preserved via the spreads parallel vec.
+        AngularExpression::LiteralArray(arr) => {
+            let arr = arr.unbox();
+            let mut elements = Vec::with_capacity_in(arr.expressions.len(), &allocator);
+            let mut spreads = Vec::with_capacity_in(arr.expressions.len(), &allocator);
+            for elem in arr.expressions {
+                let is_spread = matches!(elem, AngularExpression::SpreadElement(_));
+                let inner = if let AngularExpression::SpreadElement(s) = elem {
+                    host_convert_ast_to_ir(job, s.unbox().expression)
+                } else {
+                    host_convert_ast_to_ir(job, elem)
+                };
+                elements.push(inner.unbox());
+                spreads.push(is_spread);
+            }
+            Box::new_in(
+                IrExpression::LiteralArray(Box::new_in(
+                    crate::ir::expression::IrLiteralArrayExpr {
+                        elements,
+                        spreads,
+                        source_span: Some(arr.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert LiteralMap (object literal) - recursively convert values to preserve pipes.
+        // Spread entries (e.g. { ...base, key: val }) are preserved: spread keys get a dummy
+        // empty Ident with spreads[i] = true so later phases can emit them correctly.
+        AngularExpression::LiteralMap(map) => {
+            use crate::ast::expression::LiteralMapKey;
+            let map = map.unbox();
+            let mut keys = Vec::with_capacity_in(map.keys.len(), &allocator);
+            let mut values = Vec::with_capacity_in(map.values.len(), &allocator);
+            let mut quoted = Vec::with_capacity_in(map.keys.len(), &allocator);
+            let mut spreads = Vec::with_capacity_in(map.keys.len(), &allocator);
+
+            for (key, value) in map.keys.into_iter().zip(map.values.into_iter()) {
+                match key {
+                    LiteralMapKey::Property(prop) => {
+                        keys.push(prop.key);
+                        quoted.push(prop.quoted);
+                        spreads.push(false);
+                    }
+                    LiteralMapKey::Spread(_) => {
+                        keys.push(Ident::from(""));
+                        quoted.push(false);
+                        spreads.push(true);
+                    }
+                }
+                let value_expr = host_convert_ast_to_ir(job, value);
+                values.push(value_expr.unbox());
+            }
+
+            Box::new_in(
+                IrExpression::LiteralMap(Box::new_in(
+                    crate::ir::expression::IrLiteralMapExpr {
+                        keys,
+                        values,
+                        quoted,
+                        spreads,
+                        source_span: Some(map.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TemplateLiteral - recursively convert inner expressions to preserve pipes
+        // and arrow functions, matching the component-side converter.
+        AngularExpression::TemplateLiteral(tl) => {
+            let tl = tl.unbox();
+            let mut elements = Vec::with_capacity_in(tl.elements.len(), &allocator);
+            for elem in tl.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(tl.expressions.len(), &allocator);
+            for expr in tl.expressions {
+                let converted = host_convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::ResolvedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::ResolvedTemplateLiteralExpr {
+                        elements,
+                        expressions,
+                        source_span: Some(tl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Empty expression - convert directly to IrExpression::Empty, matching the
+        // component-side converter.
+        AngularExpression::Empty(empty) => {
+            let empty = empty.unbox();
+            Box::new_in(
+                IrExpression::Empty(Box::new_in(
+                    EmptyExpr { source_span: Some(empty.source_span.to_span()) },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TaggedTemplateLiteral - recursively convert the tag and template
+        // expressions to preserve pipes and arrow functions (ingest.ts convertAst).
+        AngularExpression::TaggedTemplateLiteral(ttl) => {
+            let ttl = ttl.unbox();
+            let tag = host_convert_ast_to_ir(job, ttl.tag);
+            let mut elements = Vec::with_capacity_in(ttl.template.elements.len(), &allocator);
+            for elem in ttl.template.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(ttl.template.expressions.len(), &allocator);
+            for expr in ttl.template.expressions {
+                let converted = host_convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::IrTaggedTemplateLiteralExpr {
+                        tag,
+                        elements,
+                        expressions,
+                        source_span: Some(ttl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement - recursively convert the inner expression so arrows
+        // and pipes inside spread positions (e.g. call arguments) are preserved.
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let expr = host_convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::SpreadElement(Box::new_in(
+                    crate::ir::expression::IrSpreadElementExpr {
+                        expr,
+                        source_span: Some(spread.source_span.to_span()),
                     },
                     &allocator,
                 )),

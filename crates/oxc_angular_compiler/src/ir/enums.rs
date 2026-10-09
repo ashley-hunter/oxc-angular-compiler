@@ -260,6 +260,10 @@ pub enum ExpressionKind {
     Void,
     /// Template literal with resolved expressions (used after name resolution).
     ResolvedTemplateLiteral,
+    /// Tagged template literal with resolved tag and template expressions.
+    TaggedTemplateLiteral,
+    /// Spread element (...expr) inside a call or other expression list.
+    SpreadElement,
     /// Arrow function expression.
     ArrowFunction,
     /// Parenthesized expression.
