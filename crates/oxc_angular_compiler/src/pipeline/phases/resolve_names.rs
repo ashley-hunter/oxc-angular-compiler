@@ -17,10 +17,11 @@ use rustc_hash::FxHashMap;
 use crate::ast::expression::AngularExpression;
 use crate::ir::enums::SemanticVariableKind;
 use crate::ir::expression::{
-    ContextExpr, IrExpression, ReadVariableExpr, ResolvedCallExpr, ResolvedKeyedReadExpr,
-    ResolvedPropertyReadExpr, ResolvedSafePropertyReadExpr, RestoreViewTarget, VisitorContextFlag,
-    transform_expressions_in_create_op, transform_expressions_in_update_op,
-    visit_expressions_in_create_op, visit_expressions_in_update_op,
+    ContextExpr, IrExpression, LexicalReadExpr, ReadVariableExpr, ResolvedCallExpr,
+    ResolvedKeyedReadExpr, ResolvedPropertyReadExpr, ResolvedSafePropertyReadExpr,
+    RestoreViewTarget, VisitorContextFlag, transform_expressions_in_create_op,
+    transform_expressions_in_update_op, visit_expressions_in_create_op,
+    visit_expressions_in_update_op,
 };
 use crate::ir::ops::{CreateOp, UpdateOp, XrefId};
 use crate::pipeline::compilation::{ComponentCompilationJob, HostBindingCompilationJob};
@@ -1827,13 +1828,27 @@ fn verify_no_lexical_reads_remain(job: &mut ComponentCompilationJob<'_>) {
     // Collect errors in a RefCell to allow mutation from within the Fn closure
     let errors: RefCell<Vec<OxcDiagnostic>> = RefCell::new(Vec::new());
 
+    // `$event` inside listener handlers (IN_CHILD_OPERATION) legitimately stays
+    // a LexicalRead until reify turns it into the handler parameter. Upstream's
+    // resolveDollarEvent rewrites it to a ReadVarExpr before this check, so its
+    // verifier never sees it; this port leaves the LexicalRead in place instead,
+    // so it is exempt here.
+    let is_exempt_event_param = |lexical: &LexicalReadExpr<'_>,
+                                 flags: VisitorContextFlag|
+     -> bool {
+        flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) && lexical.name.as_str() == "$event"
+    };
+
     for view in job.all_views() {
         // Check create ops
         for op in view.create.iter() {
             visit_expressions_in_create_op(
                 op,
-                &|expr, _flags| {
+                &|expr, flags| {
                     if let IrExpression::LexicalRead(lexical) = expr {
+                        if is_exempt_event_param(lexical, flags) {
+                            return;
+                        }
                         errors.borrow_mut().push(
                             OxcDiagnostic::error(format!(
                                 "AssertionError: no lexical reads should remain, but found read of {}",
@@ -1851,8 +1866,11 @@ fn verify_no_lexical_reads_remain(job: &mut ComponentCompilationJob<'_>) {
         for op in view.update.iter() {
             visit_expressions_in_update_op(
                 op,
-                &|expr, _flags| {
+                &|expr, flags| {
                     if let IrExpression::LexicalRead(lexical) = expr {
+                        if is_exempt_event_param(lexical, flags) {
+                            return;
+                        }
                         errors.borrow_mut().push(
                             OxcDiagnostic::error(format!(
                                 "AssertionError: no lexical reads should remain, but found read of {}",
