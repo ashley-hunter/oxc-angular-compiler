@@ -143,7 +143,10 @@ async function expectSwapMatchesFreshCompile(
 describe('compileForHmrSync update module', () => {
   it('writes the slot counts and projection selectors of the new template', async () => {
     const type = await component('<view></view>', { members: `a = 'A';` })
-    const { hmrModule } = await swap(type, '<view><text>{{ a }}</text></view><ng-content select="[x]"/>')
+    const { hmrModule } = await swap(
+      type,
+      '<view><text>{{ a }}</text></view><ng-content select="[x]"/>',
+    )
 
     expect(templateFields(type)).toMatchObject({
       decls: 4,
