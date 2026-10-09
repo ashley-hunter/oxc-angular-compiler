@@ -434,6 +434,18 @@ fn get_slot_dependency_from_ir_expr(expr: &IrExpression<'_>) -> Option<XrefId> {
             }
             None
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            if let Some(target) = get_slot_dependency_from_ir_expr(&ttl.tag) {
+                return Some(target);
+            }
+            for expr in ttl.expressions.iter() {
+                if let Some(target) = get_slot_dependency_from_ir_expr(expr) {
+                    return Some(target);
+                }
+            }
+            None
+        }
+        IrExpression::SpreadElement(spread) => get_slot_dependency_from_ir_expr(&spread.expr),
         // Expressions that don't contain slot dependencies
         IrExpression::LexicalRead(_)
         | IrExpression::Context(_)

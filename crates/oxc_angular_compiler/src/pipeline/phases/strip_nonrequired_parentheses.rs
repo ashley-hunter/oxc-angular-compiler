@@ -397,6 +397,15 @@ fn check_ir_expression_for_required_parens(
                 check_ir_expression_for_required_parens(e, required);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            check_ir_expression_for_required_parens(&ttl.tag, required);
+            for e in ttl.expressions.iter() {
+                check_ir_expression_for_required_parens(e, required);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            check_ir_expression_for_required_parens(&spread.expr, required);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             check_ir_expression_for_required_parens(&arrow_fn.body, required);

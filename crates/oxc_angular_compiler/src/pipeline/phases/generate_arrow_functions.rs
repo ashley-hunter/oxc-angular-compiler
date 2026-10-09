@@ -173,28 +173,65 @@ pub fn generate_arrow_functions_for_host(job: &mut HostBindingCompilationJob<'_>
             VisitorContextFlag::NONE,
         );
     }
+
+    // Collect arrow functions into the root unit's functions set
+    let ptrs = collect_arrow_function_ptrs(&job.root.create, &job.root.update);
+    for ptr in ptrs {
+        // SAFETY: see collect_arrow_functions_from_view.
+        unsafe { (*ptr).var_offset = Some(u32::MAX) };
+        job.root.functions.push(ptr);
+    }
 }
 
 /// Collect arrow functions from a view's operations into its functions set.
+///
+/// Only top-level arrows are collected: arrows inside child operations (listener
+/// handlers, nested arrow bodies) are skipped, matching upstream where
+/// `unit.functions` only holds `ir.ArrowFunctionExpr`s created by
+/// `addArrowFunctions` for non-listener, non-nested positions.
 fn collect_arrow_functions_from_view(
     view: &mut crate::pipeline::compilation::ViewCompilationUnit<'_>,
 ) {
     // Clear existing functions
     view.functions.clear();
 
+    let ptrs = collect_arrow_function_ptrs(&view.create, &view.update);
+    for ptr in ptrs {
+        // SAFETY: The pointer targets an ArrowFunctionExpr allocated in this
+        // job's allocator, which outlives the pipeline.
+        unsafe { (*ptr).var_offset = Some(u32::MAX) };
+        view.functions.push(ptr);
+    }
+}
+
+/// Collect arrow function pointers from create and update op lists.
+///
+/// Only top-level arrows are collected: arrows inside child operations (listener
+/// handlers, nested arrow bodies) are skipped, matching upstream where
+/// `unit.functions` only holds `ir.ArrowFunctionExpr`s created by
+/// `addArrowFunctions` for non-listener, non-nested positions. Collected arrows
+/// are marked with a sentinel var_offset (u32::MAX) so var_counting can tell
+/// them apart from arrows preserved in place.
+fn collect_arrow_function_ptrs<'a>(
+    create: &crate::ir::list::CreateOpList<'a>,
+    update: &crate::ir::list::UpdateOpList<'a>,
+) -> std::vec::Vec<*mut ArrowFunctionExpr<'a>> {
     // We use RefCell to allow mutable access from within the visitor closure
     use std::cell::RefCell;
-    let collected: RefCell<std::vec::Vec<*mut ArrowFunctionExpr<'_>>> =
+    let collected: RefCell<std::vec::Vec<*mut ArrowFunctionExpr<'a>>> =
         RefCell::new(std::vec::Vec::new());
 
     // Collect from create ops
-    for op in view.create.iter() {
+    for op in create.iter() {
         crate::ir::expression::visit_expressions_in_create_op(
             op,
-            &|expr, _flags| {
+            &|expr, flags| {
+                if flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                    return;
+                }
                 if let IrExpression::ArrowFunction(arrow_fn) = expr {
-                    let ptr = arrow_fn.as_ref() as *const ArrowFunctionExpr<'_>
-                        as *mut ArrowFunctionExpr<'_>;
+                    let ptr = arrow_fn.as_ref() as *const ArrowFunctionExpr<'a>
+                        as *mut ArrowFunctionExpr<'a>;
                     collected.borrow_mut().push(ptr);
                 }
             },
@@ -203,13 +240,16 @@ fn collect_arrow_functions_from_view(
     }
 
     // Collect from update ops
-    for op in view.update.iter() {
+    for op in update.iter() {
         crate::ir::expression::visit_expressions_in_update_op(
             op,
-            &|expr, _flags| {
+            &|expr, flags| {
+                if flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                    return;
+                }
                 if let IrExpression::ArrowFunction(arrow_fn) = expr {
-                    let ptr = arrow_fn.as_ref() as *const ArrowFunctionExpr<'_>
-                        as *mut ArrowFunctionExpr<'_>;
+                    let ptr = arrow_fn.as_ref() as *const ArrowFunctionExpr<'a>
+                        as *mut ArrowFunctionExpr<'a>;
                     collected.borrow_mut().push(ptr);
                 }
             },
@@ -217,9 +257,5 @@ fn collect_arrow_functions_from_view(
         );
     }
 
-    // Move collected pointers into the allocator Vec
-    let ptrs = collected.into_inner();
-    for ptr in ptrs {
-        view.functions.push(ptr);
-    }
+    collected.into_inner()
 }

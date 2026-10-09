@@ -37,7 +37,7 @@ use crate::ir::expression::{
     BinaryExpr, ConditionalCaseExpr, EmptyExpr, IrBinaryOperator, IrExpression, LexicalReadExpr,
     PipeBindingExpr, ResolvedCallExpr, ResolvedKeyedReadExpr, ResolvedPropertyReadExpr,
     SafeInvokeFunctionExpr, SafeKeyedReadExpr, SafePropertyReadExpr, SlotHandle,
-    TwoWayBindingSetExpr,
+    TwoWayBindingSetExpr, VisitorContextFlag, transform_expressions_in_expression,
 };
 use crate::ir::ops::{
     BindingOp, ConditionalBranchCreateOp, ConditionalOp, ConditionalUpdateOp, CreateOp,
@@ -47,9 +47,10 @@ use crate::ir::ops::{
     RepeaterCreateOp, RepeaterOp, RepeaterVarNames, SlotId, StatementOp, StoreLetOp, TemplateOp,
     TextOp, TwoWayListenerOp, UpdateOp, UpdateOpBase, XrefId,
 };
-use crate::output::ast::OutputExpression;
+use crate::output::ast::{OutputExpression, ReadVarExpr};
 use crate::pipeline::compilation::{AliasVariable, ContextVariable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 
 /// Options for ingesting a component template.
 ///
@@ -630,9 +631,116 @@ fn convert_ast_to_ir<'a>(
             )
         }
 
+        // Convert ArrowFunction - recursively convert the body so the names it reads are
+        // resolved, then keep reads of the arrow's own parameters as plain variables.
+        AngularExpression::ArrowFunction(arrow) => {
+            let arrow = arrow.unbox();
+            let source_span = Some(arrow.source_span.to_span());
+            let mut params = Vec::with_capacity_in(arrow.parameters.len(), &allocator);
+            for param in &arrow.parameters {
+                params.push(crate::output::ast::FnParam { name: param.name });
+            }
+            let body = convert_ast_to_ir(job, arrow.body);
+            let mut expr = IrExpression::ArrowFunction(Box::new_in(
+                crate::ir::expression::ArrowFunctionExpr {
+                    params,
+                    body,
+                    ops: Vec::new_in(&allocator),
+                    var_offset: None,
+                    source_span,
+                },
+                &allocator,
+            ));
+            update_parameter_references(&mut expr, allocator);
+            Box::new_in(expr, &allocator)
+        }
+
+        // Convert TaggedTemplateLiteral - recursively convert the tag and template
+        // expressions to preserve pipes and arrow functions (ingest.ts convertAst).
+        AngularExpression::TaggedTemplateLiteral(ttl) => {
+            let ttl = ttl.unbox();
+            let tag = convert_ast_to_ir(job, ttl.tag);
+            let mut elements = Vec::with_capacity_in(ttl.template.elements.len(), &allocator);
+            for elem in ttl.template.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(ttl.template.expressions.len(), &allocator);
+            for expr in ttl.template.expressions {
+                let converted = convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::IrTaggedTemplateLiteralExpr {
+                        tag,
+                        elements,
+                        expressions,
+                        source_span: Some(ttl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement - recursively convert the inner expression so arrows
+        // and pipes inside spread positions (e.g. call arguments) are preserved
+        // (ingest.ts convertAst produces o.SpreadElementExpr).
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let expr = convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::SpreadElement(Box::new_in(
+                    crate::ir::expression::IrSpreadElementExpr {
+                        expr,
+                        source_span: Some(spread.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
         // For all other expressions, store in ExpressionStore and return reference.
         other => store_and_ref_expr(job, other),
     }
+}
+
+/// Replaces reads of an arrow function's parameters with plain variable reads, so the
+/// name resolution phases leave them alone instead of resolving them against template
+/// variables or the component context.
+///
+/// Like Angular, the parameter set only grows: parameters of a nested arrow are added
+/// when that arrow is visited (after its body), and are not removed afterwards.
+///
+/// Ported from Angular's `updateParameterReferences` in `ingest.ts`.
+fn update_parameter_references<'a>(root: &mut IrExpression<'a>, allocator: &'a Allocator) {
+    let parameter_names: RefCell<FxHashSet<Ident<'a>>> = RefCell::new(FxHashSet::default());
+    if let IrExpression::ArrowFunction(arrow) = &*root {
+        parameter_names.borrow_mut().extend(arrow.params.iter().map(|p| p.name));
+    }
+    transform_expressions_in_expression(
+        root,
+        &|expr, _flags| match expr {
+            IrExpression::ArrowFunction(arrow) => {
+                parameter_names.borrow_mut().extend(arrow.params.iter().map(|p| p.name));
+            }
+            IrExpression::LexicalRead(read) if parameter_names.borrow().contains(&read.name) => {
+                *expr = IrExpression::OutputExpr(Box::new_in(
+                    OutputExpression::ReadVar(Box::new_in(
+                        ReadVarExpr { name: read.name, source_span: read.source_span },
+                        &allocator,
+                    )),
+                    &allocator,
+                ));
+            }
+            _ => {}
+        },
+        VisitorContextFlag::NONE,
+    );
 }
 
 /// Converts an AST binary operator to an IR binary operator.
@@ -3842,6 +3950,192 @@ fn host_convert_ast_to_ir<'a>(
                 )),
                 &allocator,
             )
+        }
+
+        // Convert LiteralArray - recursively convert elements to preserve pipes.
+        // Spread elements (e.g. [...base, item]) are preserved via the spreads parallel vec.
+        AngularExpression::LiteralArray(arr) => {
+            let arr = arr.unbox();
+            let mut elements = Vec::with_capacity_in(arr.expressions.len(), &allocator);
+            let mut spreads = Vec::with_capacity_in(arr.expressions.len(), &allocator);
+            for elem in arr.expressions {
+                let is_spread = matches!(elem, AngularExpression::SpreadElement(_));
+                let inner = if let AngularExpression::SpreadElement(s) = elem {
+                    host_convert_ast_to_ir(job, s.unbox().expression)
+                } else {
+                    host_convert_ast_to_ir(job, elem)
+                };
+                elements.push(inner.unbox());
+                spreads.push(is_spread);
+            }
+            Box::new_in(
+                IrExpression::LiteralArray(Box::new_in(
+                    crate::ir::expression::IrLiteralArrayExpr {
+                        elements,
+                        spreads,
+                        source_span: Some(arr.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert LiteralMap (object literal) - recursively convert values to preserve pipes.
+        // Spread entries (e.g. { ...base, key: val }) are preserved: spread keys get a dummy
+        // empty Ident with spreads[i] = true so later phases can emit them correctly.
+        AngularExpression::LiteralMap(map) => {
+            use crate::ast::expression::LiteralMapKey;
+            let map = map.unbox();
+            let mut keys = Vec::with_capacity_in(map.keys.len(), &allocator);
+            let mut values = Vec::with_capacity_in(map.values.len(), &allocator);
+            let mut quoted = Vec::with_capacity_in(map.keys.len(), &allocator);
+            let mut spreads = Vec::with_capacity_in(map.keys.len(), &allocator);
+
+            for (key, value) in map.keys.into_iter().zip(map.values.into_iter()) {
+                match key {
+                    LiteralMapKey::Property(prop) => {
+                        keys.push(prop.key);
+                        quoted.push(prop.quoted);
+                        spreads.push(false);
+                    }
+                    LiteralMapKey::Spread(_) => {
+                        keys.push(Ident::from(""));
+                        quoted.push(false);
+                        spreads.push(true);
+                    }
+                }
+                let value_expr = host_convert_ast_to_ir(job, value);
+                values.push(value_expr.unbox());
+            }
+
+            Box::new_in(
+                IrExpression::LiteralMap(Box::new_in(
+                    crate::ir::expression::IrLiteralMapExpr {
+                        keys,
+                        values,
+                        quoted,
+                        spreads,
+                        source_span: Some(map.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TemplateLiteral - recursively convert inner expressions to preserve pipes
+        // and arrow functions, matching the component-side converter.
+        AngularExpression::TemplateLiteral(tl) => {
+            let tl = tl.unbox();
+            let mut elements = Vec::with_capacity_in(tl.elements.len(), &allocator);
+            for elem in tl.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(tl.expressions.len(), &allocator);
+            for expr in tl.expressions {
+                let converted = host_convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::ResolvedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::ResolvedTemplateLiteralExpr {
+                        elements,
+                        expressions,
+                        source_span: Some(tl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Empty expression - convert directly to IrExpression::Empty, matching the
+        // component-side converter.
+        AngularExpression::Empty(empty) => {
+            let empty = empty.unbox();
+            Box::new_in(
+                IrExpression::Empty(Box::new_in(
+                    EmptyExpr { source_span: Some(empty.source_span.to_span()) },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert TaggedTemplateLiteral - recursively convert the tag and template
+        // expressions to preserve pipes and arrow functions (ingest.ts convertAst).
+        AngularExpression::TaggedTemplateLiteral(ttl) => {
+            let ttl = ttl.unbox();
+            let tag = host_convert_ast_to_ir(job, ttl.tag);
+            let mut elements = Vec::with_capacity_in(ttl.template.elements.len(), &allocator);
+            for elem in ttl.template.elements.iter() {
+                elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: Some(elem.source_span.to_span()),
+                });
+            }
+            let mut expressions = Vec::with_capacity_in(ttl.template.expressions.len(), &allocator);
+            for expr in ttl.template.expressions {
+                let converted = host_convert_ast_to_ir(job, expr);
+                expressions.push(converted.unbox());
+            }
+            Box::new_in(
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::IrTaggedTemplateLiteralExpr {
+                        tag,
+                        elements,
+                        expressions,
+                        source_span: Some(ttl.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert SpreadElement - recursively convert the inner expression so arrows
+        // and pipes inside spread positions (e.g. call arguments) are preserved.
+        AngularExpression::SpreadElement(spread) => {
+            let spread = spread.unbox();
+            let expr = host_convert_ast_to_ir(job, spread.expression);
+            Box::new_in(
+                IrExpression::SpreadElement(Box::new_in(
+                    crate::ir::expression::IrSpreadElementExpr {
+                        expr,
+                        source_span: Some(spread.source_span.to_span()),
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            )
+        }
+
+        // Convert ArrowFunction - recursively convert the body so the names it reads are
+        // resolved, then keep reads of the arrow's own parameters as plain variables.
+        AngularExpression::ArrowFunction(arrow) => {
+            let arrow = arrow.unbox();
+            let source_span = Some(arrow.source_span.to_span());
+            let mut params = Vec::with_capacity_in(arrow.parameters.len(), &allocator);
+            for param in &arrow.parameters {
+                params.push(crate::output::ast::FnParam { name: param.name });
+            }
+            let body = host_convert_ast_to_ir(job, arrow.body);
+            let mut expr = IrExpression::ArrowFunction(Box::new_in(
+                crate::ir::expression::ArrowFunctionExpr {
+                    params,
+                    body,
+                    ops: Vec::new_in(&allocator),
+                    var_offset: None,
+                    source_span,
+                },
+                &allocator,
+            ));
+            update_parameter_references(&mut expr, allocator);
+            Box::new_in(expr, &allocator)
         }
 
         // For all other expressions, store in ExpressionStore and return reference

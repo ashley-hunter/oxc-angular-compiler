@@ -573,6 +573,15 @@ fn assign_temp_names<'a>(
                 assign_temp_names(e, tracker, &allocator);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            assign_temp_names(&mut ttl.tag, tracker, &allocator);
+            for e in ttl.expressions.iter_mut() {
+                assign_temp_names(e, tracker, &allocator);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            assign_temp_names(&mut spread.expr, tracker, &allocator);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             assign_temp_names(&mut arrow_fn.body, tracker, &allocator);

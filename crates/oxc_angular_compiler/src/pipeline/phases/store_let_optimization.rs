@@ -682,6 +682,30 @@ fn transform_nested_expressions<'a>(
                 );
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            transform_store_let_in_expr_value(
+                &allocator,
+                &mut ttl.tag,
+                let_used_externally,
+                declare_lets_to_remove,
+            );
+            for e in ttl.expressions.iter_mut() {
+                transform_store_let_in_expr_value(
+                    &allocator,
+                    e,
+                    let_used_externally,
+                    declare_lets_to_remove,
+                );
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            transform_store_let_in_expr_value(
+                &allocator,
+                &mut spread.expr,
+                let_used_externally,
+                declare_lets_to_remove,
+            );
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             transform_store_let_in_expr_value(
@@ -1084,6 +1108,30 @@ fn transform_nested_in_expr_value<'a>(
                 );
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            transform_store_let_in_expr_value(
+                &allocator,
+                &mut ttl.tag,
+                let_used_externally,
+                declare_lets_to_remove,
+            );
+            for e in ttl.expressions.iter_mut() {
+                transform_store_let_in_expr_value(
+                    &allocator,
+                    e,
+                    let_used_externally,
+                    declare_lets_to_remove,
+                );
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            transform_store_let_in_expr_value(
+                &allocator,
+                &mut spread.expr,
+                let_used_externally,
+                declare_lets_to_remove,
+            );
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             transform_store_let_in_expr_value(
@@ -1152,6 +1200,10 @@ fn has_pipe(expr: &IrExpression<'_>) -> bool {
         IrExpression::Typeof(t) => has_pipe(&t.expr),
         IrExpression::Void(v) => has_pipe(&v.expr),
         IrExpression::ResolvedTemplateLiteral(rtl) => rtl.expressions.iter().any(has_pipe),
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            has_pipe(&ttl.tag) || ttl.expressions.iter().any(has_pipe)
+        }
+        IrExpression::SpreadElement(spread) => has_pipe(&spread.expr),
         // Leaf expressions don't contain pipes
         IrExpression::LexicalRead(_)
         | IrExpression::Reference(_)
@@ -1397,6 +1449,15 @@ fn collect_context_let_refs_in_expr(expr: &IrExpression<'_>, refs: &mut HashSet<
             for e in rtl.expressions.iter() {
                 collect_context_let_refs_in_expr(e, refs);
             }
+        }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            collect_context_let_refs_in_expr(&ttl.tag, refs);
+            for e in ttl.expressions.iter() {
+                collect_context_let_refs_in_expr(e, refs);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            collect_context_let_refs_in_expr(&spread.expr, refs);
         }
 
         IrExpression::ArrowFunction(arrow_fn) => {

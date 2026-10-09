@@ -7,9 +7,10 @@ use crate::ast::expression::AngularExpression;
 use crate::ir::expression::{IrExpression, TwoWayBindingSetExpr};
 use crate::ir::ops::XrefId;
 use crate::output::ast::{
-    BinaryOperator, BinaryOperatorExpr, ConditionalExpr, InvokeFunctionExpr, LiteralArrayExpr,
-    LiteralExpr, LiteralMapEntry, LiteralMapExpr, LiteralValue, OutputExpression,
-    ParenthesizedExpr, ReadKeyExpr, ReadPropExpr, ReadVarExpr, SpreadElementExpr,
+    ArrowFunctionBody, ArrowFunctionExpr, BinaryOperator, BinaryOperatorExpr, ConditionalExpr,
+    FnParam, InvokeFunctionExpr, LiteralArrayExpr, LiteralExpr, LiteralMapEntry, LiteralMapExpr,
+    LiteralValue, OutputExpression, ParenthesizedExpr, ReadKeyExpr, ReadPropExpr, ReadVarExpr,
+    SpreadElementExpr,
 };
 use crate::pipeline::expression_store::ExpressionStore;
 use crate::r3::{Identifiers, get_pipe_bind_instruction, get_pure_function_instruction};
@@ -1161,6 +1162,63 @@ pub fn convert_ir_expression<'a>(
             ))
         }
 
+        // Tagged template literal: convert tag and template expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            let tag =
+                convert_ir_expression(allocator, core_namespace, &ttl.tag, expressions, root_xref);
+            let mut elements = OxcVec::new_in(&allocator);
+            let mut output_expressions = OxcVec::new_in(&allocator);
+            for elem in ttl.elements.iter() {
+                elements.push(crate::output::ast::TemplateLiteralElement {
+                    text: elem.text.clone(),
+                    raw_text: elem.text.clone(),
+                    source_span: elem.source_span,
+                });
+            }
+            for expr in ttl.expressions.iter() {
+                output_expressions.push(convert_ir_expression(
+                    &allocator,
+                    core_namespace,
+                    expr,
+                    expressions,
+                    root_xref,
+                ));
+            }
+            OutputExpression::TaggedTemplateLiteral(Box::new_in(
+                crate::output::ast::TaggedTemplateLiteralExpr {
+                    tag: Box::new_in(tag, &allocator),
+                    template: Box::new_in(
+                        crate::output::ast::TemplateLiteralExpr {
+                            elements,
+                            expressions: output_expressions,
+                            source_span: ttl.source_span,
+                        },
+                        &allocator,
+                    ),
+                    source_span: ttl.source_span,
+                },
+                &allocator,
+            ))
+        }
+
+        // Spread element: convert the inner expression
+        IrExpression::SpreadElement(spread) => {
+            let inner = convert_ir_expression(
+                allocator,
+                core_namespace,
+                &spread.expr,
+                expressions,
+                root_xref,
+            );
+            OutputExpression::SpreadElement(Box::new_in(
+                SpreadElementExpr {
+                    expr: Box::new_in(inner, &allocator),
+                    source_span: spread.source_span,
+                },
+                &allocator,
+            ))
+        }
+
         IrExpression::Parenthesized(paren) => {
             let inner = convert_ir_expression(
                 allocator,
@@ -1173,6 +1231,29 @@ pub fn convert_ir_expression<'a>(
                 ParenthesizedExpr {
                     expr: Box::new_in(inner, &allocator),
                     source_span: paren.source_span,
+                },
+                &allocator,
+            ))
+        }
+
+        // Arrow function left in place: emit it with its converted body.
+        IrExpression::ArrowFunction(arrow_fn) => {
+            let mut params = OxcVec::with_capacity_in(arrow_fn.params.len(), &allocator);
+            for param in &arrow_fn.params {
+                params.push(FnParam { name: param.name });
+            }
+            let body = convert_ir_expression(
+                allocator,
+                core_namespace,
+                &arrow_fn.body,
+                expressions,
+                root_xref,
+            );
+            OutputExpression::ArrowFunction(Box::new_in(
+                ArrowFunctionExpr {
+                    params,
+                    body: ArrowFunctionBody::Expression(Box::new_in(body, &allocator)),
+                    source_span: arrow_fn.source_span,
                 },
                 &allocator,
             ))
