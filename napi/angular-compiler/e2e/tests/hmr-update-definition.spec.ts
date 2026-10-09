@@ -14,6 +14,13 @@ import { test, expect } from '../fixtures/test-fixture.js'
  * it converted `outputs` a second time, turning them round.
  */
 
+/**
+ * The dev server's watcher drops a change that follows another change to the
+ * same file within 50ms, and a hot swap can be on screen sooner than that. Wait
+ * this long before editing a file a second time.
+ */
+const WATCHER_THROTTLE_MS = 200
+
 /** The parts of a rendered component's definition these tests care about. */
 async function definition(page: Page, selector: string) {
   return await page.evaluate((selector) => {
@@ -70,6 +77,7 @@ test.describe('HMR update definition', () => {
     expect(await definition(page, 'app-lab')).toMatchObject({ decls: 6, vars: 2 })
 
     // A second swap on the same component, down to less than it started with.
+    await page.waitForTimeout(WATCHER_THROTTLE_MS)
     await fileModifier.modifyFile('lab.html', () => '<i class="lab-min">min</i>\n')
 
     await expect(page.locator('app-lab .lab-min')).toHaveText('min')
@@ -99,6 +107,7 @@ test.describe('HMR update definition', () => {
     await expect(page.locator('app-lab .lab-py')).toHaveCount(0)
     expect(await definition(page, 'app-lab')).toMatchObject({ ngContentSelectors: ['[x]'] })
 
+    await page.waitForTimeout(WATCHER_THROTTLE_MS)
     await fileModifier.modifyFile(
       'lab.html',
       () => '<ng-content select="[y]" /><p class="lab-one">one</p><ng-content />\n',
@@ -110,6 +119,7 @@ test.describe('HMR update definition', () => {
     await expect(page.locator('app-lab')).toHaveText('PYonePXREST')
     expect(await definition(page, 'app-lab')).toMatchObject({ ngContentSelectors: ['[y]', '*'] })
 
+    await page.waitForTimeout(WATCHER_THROTTLE_MS)
     await fileModifier.modifyFile('lab.html', () => '<p class="lab-one">one</p>\n')
 
     await expect(page.locator('app-lab')).toHaveText('one')
@@ -136,6 +146,7 @@ test.describe('HMR update definition', () => {
     expect(await definition(page, 'app-lab')).toMatchObject({ consts: 4 })
 
     // No attributes at all: the old consts must not linger.
+    await page.waitForTimeout(WATCHER_THROTTLE_MS)
     await fileModifier.modifyFile('lab.html', () => '<p>plain</p>\n')
 
     await expect(page.locator('app-lab p')).toHaveText('plain')
@@ -181,6 +192,7 @@ test.describe('HMR update definition', () => {
     await expect(page.locator('.io-checked')).toHaveText('true')
 
     // A second swap.
+    await page.waitForTimeout(WATCHER_THROTTLE_MS)
     await fileModifier.modifyFile(
       'io.html',
       () => '<button class="io-emit" (click)="emit()">again {{ label() }}</button>\n',
