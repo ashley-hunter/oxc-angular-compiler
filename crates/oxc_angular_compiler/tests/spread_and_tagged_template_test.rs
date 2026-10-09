@@ -107,8 +107,9 @@ fn tagged_template_reads_arrow_function_parameters() {
 }
 
 /// The elements hold cooked text, so text that would end the literal or start an
-/// interpolation is escaped again when the tagged template is printed.
+/// interpolation is escaped again when the tagged template is printed, matching
+/// ngtsc's `escapeForTemplateLiteral` spelling (`${` becomes `$\{`).
 #[test]
 fn tagged_template_text_is_escaped() {
-    assert_emits(r"{{ tag`a\`b\${c}d\\e` }}", r"ctx.tag`a\`b\${c}d\\e`");
+    assert_emits(r"{{ tag`a\`b\${c}d\\e` }}", r"ctx.tag`a\`b$\{c}d\\e`");
 }

@@ -195,14 +195,18 @@ pub fn convert_unary_operator(op: AstUnaryOperator) -> OutputUnaryOperator {
 /// Since the Angular expression parser gives us cooked text, we need to
 /// re-escape it for contexts that need raw text (template literal emission).
 ///
+/// Mirrors Angular's `escapeForTemplateLiteral(escapeSlashes(text))` in
+/// `output/output_ast.ts`: backslashes are doubled first, then backticks and
+/// `${` are escaped so a tag sees the same `strings.raw` it would under ngtsc.
+/// Line breaks stay literal, as upstream leaves them.
+///
 /// This function escapes:
+/// - Backslashes (doubled, so the cooked value keeps the original escape)
 /// - Backticks (`) to prevent closing the template literal
-/// - `${` to prevent interpolation syntax
-/// - Backslashes to preserve escape sequences
-/// - Carriage returns and line feeds to their escape sequences
+/// - `${` as `$\{` to prevent interpolation syntax
 pub(crate) fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
     // Fast path: if no escaping needed, return as-is
-    if !cooked.contains(['`', '$', '\\', '\r', '\n']) {
+    if !cooked.contains(['`', '$', '\\']) {
         return Ident::from(allocator.alloc_str(cooked));
     }
 
@@ -213,12 +217,10 @@ pub(crate) fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> 
         match c {
             '`' => raw.push_str("\\`"),
             '\\' => raw.push_str("\\\\"),
-            '\r' => raw.push_str("\\r"),
-            '\n' => raw.push_str("\\n"),
             '$' => {
                 // Only escape if followed by { to form ${
                 if chars.peek() == Some(&'{') {
-                    raw.push_str("\\$");
+                    raw.push_str("$\\");
                 } else {
                     raw.push('$');
                 }
@@ -910,16 +912,16 @@ mod tests {
             "path\\\\to\\\\file"
         );
 
-        // Escape newlines and carriage returns
+        // Newlines and carriage returns stay literal, matching upstream
         assert_eq!(
             super::cooked_to_raw_text(&allocator, "line1\nline2\rline3").as_str(),
-            "line1\\nline2\\rline3"
+            "line1\nline2\rline3"
         );
 
-        // Escape ${
+        // Escape ${ as $\{, matching upstream's escapeForTemplateLiteral
         assert_eq!(
             super::cooked_to_raw_text(&allocator, "value is ${x}").as_str(),
-            "value is \\${x}"
+            "value is $\\{x}"
         );
 
         // Do not escape $ without {
