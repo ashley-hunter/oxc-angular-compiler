@@ -191,6 +191,12 @@ pub enum IrExpression<'a> {
     /// Used when a template literal like `\`bwi ${menuItem.icon}\`` has expressions
     /// that need to be resolved to variables in scope.
     ResolvedTemplateLiteral(Box<'a, ResolvedTemplateLiteralExpr<'a>>),
+    /// Tagged template literal (tag`...`) with IR tag and template expressions.
+    /// Used to preserve pipes and arrow functions inside tagged templates during ingest.
+    TaggedTemplateLiteral(Box<'a, IrTaggedTemplateLiteralExpr<'a>>),
+    /// Spread element (...expr) with an IR inner expression.
+    /// Used to preserve pipes and arrow functions inside spread positions during ingest.
+    SpreadElement(Box<'a, IrSpreadElementExpr<'a>>),
     /// Arrow function expression.
     /// Created by the generateArrowFunctions phase to wrap user-defined arrow functions.
     ArrowFunction(Box<'a, ArrowFunctionExpr<'a>>),
@@ -267,6 +273,10 @@ impl<'a> IrExpression<'a> {
             IrExpression::Void(_) => ExpressionKind::Void,
             // ResolvedTemplateLiteral is a template literal with resolved expressions
             IrExpression::ResolvedTemplateLiteral(_) => ExpressionKind::ResolvedTemplateLiteral,
+            // TaggedTemplateLiteral is a tagged template literal with IR sub-expressions
+            IrExpression::TaggedTemplateLiteral(_) => ExpressionKind::TaggedTemplateLiteral,
+            // SpreadElement is a spread element with an IR inner expression
+            IrExpression::SpreadElement(_) => ExpressionKind::SpreadElement,
             // ArrowFunction is an arrow function expression
             IrExpression::ArrowFunction(_) => ExpressionKind::ArrowFunction,
             IrExpression::Parenthesized(_) => ExpressionKind::Parenthesized,
@@ -781,6 +791,35 @@ impl<'a> IrExpression<'a> {
                     &allocator,
                 ))
             }
+            IrExpression::TaggedTemplateLiteral(e) => {
+                let mut elements = Vec::with_capacity_in(e.elements.len(), &allocator);
+                for elem in e.elements.iter() {
+                    elements.push(IrTemplateLiteralElement {
+                        text: elem.text.clone(),
+                        source_span: elem.source_span,
+                    });
+                }
+                let mut expressions = Vec::with_capacity_in(e.expressions.len(), &allocator);
+                for expr in e.expressions.iter() {
+                    expressions.push(expr.clone_in(allocator));
+                }
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    IrTaggedTemplateLiteralExpr {
+                        tag: Box::new_in(e.tag.clone_in(allocator), &allocator),
+                        elements,
+                        expressions,
+                        source_span: e.source_span,
+                    },
+                    &allocator,
+                ))
+            }
+            IrExpression::SpreadElement(e) => IrExpression::SpreadElement(Box::new_in(
+                IrSpreadElementExpr {
+                    expr: Box::new_in(e.expr.clone_in(allocator), &allocator),
+                    source_span: e.source_span,
+                },
+                &allocator,
+            )),
             IrExpression::ArrowFunction(e) => {
                 let mut params = Vec::with_capacity_in(e.params.len(), &allocator);
                 for param in e.params.iter() {
@@ -1076,6 +1115,34 @@ pub struct ResolvedTemplateLiteralExpr<'a> {
 pub struct IrTemplateLiteralElement<'a> {
     /// The text content.
     pub text: Ident<'a>,
+    /// Source span.
+    pub source_span: Option<Span>,
+}
+
+/// Tagged template literal (tag`...`) with IR sub-expressions.
+///
+/// Used during ingest to preserve pipes and arrow functions inside the tag and
+/// the template's interpolated expressions.
+#[derive(Debug)]
+pub struct IrTaggedTemplateLiteralExpr<'a> {
+    /// The tag function expression.
+    pub tag: Box<'a, IrExpression<'a>>,
+    /// Template literal text elements (the static parts between expressions).
+    pub elements: Vec<'a, IrTemplateLiteralElement<'a>>,
+    /// The dynamic parts inside ${...}.
+    pub expressions: Vec<'a, IrExpression<'a>>,
+    /// Source span.
+    pub source_span: Option<Span>,
+}
+
+/// Spread element (...expr) with an IR inner expression.
+///
+/// Used during ingest to preserve pipes and arrow functions inside spread
+/// positions (e.g. call arguments).
+#[derive(Debug)]
+pub struct IrSpreadElementExpr<'a> {
+    /// The expression being spread.
+    pub expr: Box<'a, IrExpression<'a>>,
     /// Source span.
     pub source_span: Option<Span>,
 }
@@ -1785,11 +1852,29 @@ pub fn transform_expressions_in_expression<'a, F>(
                 transform_expressions_in_expression(expr, transform, flags);
             }
         }
+        IrExpression::TaggedTemplateLiteral(e) => {
+            transform_expressions_in_expression(&mut e.tag, transform, flags);
+            for expr in e.expressions.iter_mut() {
+                transform_expressions_in_expression(expr, transform, flags);
+            }
+        }
+        IrExpression::SpreadElement(e) => {
+            transform_expressions_in_expression(&mut e.expr, transform, flags);
+        }
         IrExpression::ArrowFunction(e) => {
-            // Transform body with InChildOperation and InArrowFunctionOperation flags set
-            let child_flags = flags
-                .union(VisitorContextFlag::IN_CHILD_OPERATION)
-                .union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            // Mirror ir.ArrowFunctionExpr.transformInternalExpressions: ops are
+            // transformed as child operations inside an arrow function. The
+            // InArrowFunctionOperation flag only applies to top-level (collected)
+            // arrows; arrows preserved in place inside child operations (listener
+            // handlers, nested arrows) get only InChildOperation, matching the
+            // o.ArrowFunctionExpr branch of transformExpressionsInExpression.
+            let mut child_flags = flags.union(VisitorContextFlag::IN_CHILD_OPERATION);
+            if !flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                child_flags = child_flags.union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            }
+            for op in e.ops.iter_mut() {
+                transform_expressions_in_update_op(op, transform, child_flags);
+            }
             transform_expressions_in_expression(&mut e.body, transform, child_flags);
         }
         IrExpression::Parenthesized(e) => {
@@ -1972,11 +2057,25 @@ pub fn visit_expressions_in_expression<'a, F>(
                 visit_expressions_in_expression(expr, visitor, flags);
             }
         }
+        IrExpression::TaggedTemplateLiteral(e) => {
+            visit_expressions_in_expression(&e.tag, visitor, flags);
+            for expr in e.expressions.iter() {
+                visit_expressions_in_expression(expr, visitor, flags);
+            }
+        }
+        IrExpression::SpreadElement(e) => {
+            visit_expressions_in_expression(&e.expr, visitor, flags);
+        }
         IrExpression::ArrowFunction(e) => {
-            // Visit body with InChildOperation and InArrowFunctionOperation flags set
-            let child_flags = flags
-                .union(VisitorContextFlag::IN_CHILD_OPERATION)
-                .union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            // See transform_expressions_in_expression for the flag rationale:
+            // InArrowFunctionOperation applies only to top-level (collected) arrows.
+            let mut child_flags = flags.union(VisitorContextFlag::IN_CHILD_OPERATION);
+            if !flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                child_flags = child_flags.union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            }
+            for op in e.ops.iter() {
+                visit_expressions_in_update_op(op, visitor, child_flags);
+            }
             visit_expressions_in_expression(&e.body, visitor, child_flags);
         }
         IrExpression::Parenthesized(e) => {
@@ -3073,6 +3172,15 @@ pub fn vars_used_by_ir_expression(expr: &IrExpression<'_>) -> u32 {
         IrExpression::ResolvedTemplateLiteral(rtl) => {
             rtl.expressions.iter().map(vars_used_by_ir_expression).sum()
         }
+
+        // TaggedTemplateLiteral: vars used by tag and template expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            vars_used_by_ir_expression(&ttl.tag)
+                + ttl.expressions.iter().map(vars_used_by_ir_expression).sum::<u32>()
+        }
+
+        // SpreadElement: vars used by the inner expression
+        IrExpression::SpreadElement(spread) => vars_used_by_ir_expression(&spread.expr),
 
         // All other expressions don't directly consume variable slots
         IrExpression::LexicalRead(_)

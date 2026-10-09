@@ -249,6 +249,11 @@ fn interpolation_arrow_reads_its_parameters() {
         "constarrowFn0=(ctx,view)=>(o)=>(o||ctx.fallback());",
         "i0.ɵɵtextInterpolate(ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));",
     );
+    assert_hoists(
+        "{{ run(() => !open()) }}",
+        "constarrowFn0=(ctx,view)=>()=>!ctx.open();",
+        "i0.ɵɵtextInterpolate(ctx.run(i0.ɵɵarrowFunction(1,arrowFn0,ctx)));",
+    );
 }
 
 /// Equivalent arrows share one factory but each gets its own var slot.

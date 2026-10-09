@@ -22,6 +22,9 @@ export interface Gen<T> { v: T }
 export const val = {a: 1};
 export const kc = 'kc';
 export function gen<T>(x: T) { return x; }
+const re = /[/*]/;
+function f() { return /[/*]/; }
+const tpl = `${re}`;
 @Directive({selector: '[t]'})
 export class T {
   @Input({transform: (v: %TYPE%) => 1}) t: any;
@@ -71,51 +74,100 @@ fn matches_ngtsc() {
     check(MATCH);
 }
 
-/// Comments ngtsc keeps that oxc drops: `/** */` comments after a type or
-/// on their own line (TypeScript's printer keeps only those two kinds of
-/// comment around nodes), and comments spanning lines. Each row is the type,
-/// what ngtsc writes and what oxc writes; they differ only by the comment.
-const COMMENTS_NOT_KEPT: &[(&str, &str, &str)] = &[
-    ("{\n  /** doc */\n  a: 1\n}", "{ \n    /** doc */\n    a: 1; }", "{ a: 1; }"),
-    ("string | /* a\n b */ number", "string | /* a\n   b */ number", "string | number"),
-    ("string /** d */ | number", "string /** d */ | number", "string | number"),
-    ("{ a: 1 /** y */ }", "{ a: 1; /** y */ }", "{ a: 1; }"),
-    ("(x: string /** y */) => void", "(x: string /** y */) => void", "(x: string) => void"),
-    ("Array<string /** y */>", "Array<string /** y */>", "Array<string>"),
-    ("string |\n /** j */ number", "string | \n    /** j */ number", "string | number"),
+/// Comments ngtsc keeps around a type: `/** */` comments after a type or on
+/// their own line (TypeScript's printer keeps only those two kinds of comment
+/// around nodes), `/* */` comments a list scan picks up, and comments
+/// spanning lines. Each row is the type and what ngtsc writes.
+const COMMENTS_KEPT: &[(&str, &str)] = &[
+    ("string /** doc */", "string /** doc */"),
+    ("string | number /** doc */", "string | number /** doc */"),
+    ("\n/** doc */\nstring", "\n    /** doc */\n    string"),
+    ("Array</* a\n   b */ string>", "Array</* a\n     b */ string>"),
+    ("{\n  /** doc */\n  a: 1\n}", "{ \n    /** doc */\n    a: 1; }"),
+    ("string | /* a\n b */ number", "string | /* a\n   b */ number"),
+    ("string /** d */ | number", "string /** d */ | number"),
+    ("{ a: 1 /** y */ }", "{ a: 1; /** y */ }"),
+    ("(x: string /** y */) => void", "(x: string /** y */) => void"),
+    ("Array<string /** y */>", "Array<string /** y */>"),
+    ("string |\n /** j */ number", "string | \n    /** j */ number"),
     // TypeScript reads past a U+2028 / U+2029 for the comments after `<` (it
-    // only stops at `\n` and `\r`), and prints this one twice.
+    // only stops at `\n` and `\r`), and prints this one twice: once for the
+    // type-arguments list, once for the union's constituents list.
+    ("Array<\u{2028}/* c */\nstring | number>", "Array</* c */ /* c */ string | number>"),
+    ("Array<\u{2029}/* c */\nstring | number>", "Array</* c */ /* c */ string | number>"),
+    // `//` and `/*` inside strings and comments are comment text, not trivia.
+    ("{ a: 'x//y'\n b: 1 }", "{ a: \"x//y\"; b: 1; }"),
+    ("string | /* a // b */\n number", "string | /* a // b */ number"),
+    ("string | /** a /** b */\nnumber", "string | /** a /** b */ number"),
+    // ngtsc synthesizes the type name of a reference (its `pos`/`end` are -1),
+    // so a comment between the name and the type arguments is dropped.
+    ("Signal /** j */ <number>", "i0.Signal<number>"),
+    // `]` after a trailing comma scans from the list's end (past the comma).
+    ("[a: string,\n /** j */]", "[a: string\n    /** j */ ]"),
+    // Mapped-type `±readonly` and `±?` are two tokens each. The keyword is
+    // a plain write after a sign — a comment after a line break is never
+    // scanned.
+    ("{ - /** j */ readonly [K in string]: 1 }", "{ - /** j */readonly [K in string]: 1; }"),
+    ("{ -\n/** j */\nreadonly [K in string]: 1 }", "{ -readonly [K in string]: 1; }"),
+    ("{ [K in string]-\n/** j */\n?: 1 }", "{ [K in string]-?: 1; }"),
+    ("{ [K in string] - /** j */ ?: 1 }", "{ [K in string]- /** j */?: 1; }"),
+    // The `...` of a binding rest and the `${` of a template literal are
+    // emitted tokens too.
+    ("({ ... /** j */ rest }: Box) => void", "({ ... /** j */rest }: Box) => void"),
+    ("`${ /** j */ string}`", "`${ /** j */string}`"),
+    // A quasi goes out as one literal write (TypeScript's `emitLiteral`), so
+    // line breaks inside its text never start a write: nothing is indented.
+    ("`a\n${string}`", "`a\n${string}`"),
+    ("`a\n${string}b\n${number}`", "`a\n${string}b\n${number}`"),
+    ("`a\n`", "`a\n`"),
+    ("`${string}x\n`", "`${string}x\n`"),
+    // A `//` on a `/*`'s continuation line is comment text.
+    ("string | /* a\n // b */\n number", "string | /* a\n   // b */ number"),
+    // The `/*` inside the file's `/[/*]/` regexes (after `=` and after the
+    // `return` keyword) doesn't pair with this `*/`.
+    ("string | /* a\n b */ number", "string | /* a\n   b */ number"),
+    // A template ending in a hole (`${re}` in the file) doesn't hide later
+    // comments.
+    ("string | /* c */ number", "string | /* c */ number"),
+    ("[`${string}`, /** x */ number]", "[`${string}`, /** x */ number]"),
+    // `isWhiteSpaceSingleLine` covers U+200B: the JSDoc stays `number`'s.
+    ("string | /** doc */\u{200B} number", "string | /** doc */ number"),
+    // An elision is zero-width right after its preceding comma: comments
+    // before the comma stay with the previous element, comments after it
+    // are the elision's intervening trivia.
+    ("([a /** j */, , b]: any[]) => void", "([a /** j */, , b]: any[]) => void"),
+    ("([a, , /* x */, , b]: any[]) => void", "([a, , /* x */ , , b]: any[]) => void"),
     (
-        "Array<\u{2028}/* c */\nstring | number>",
-        "Array</* c */ /* c */ string | number>",
-        "Array<string | number>",
+        "([a /** j */, , /* x */, , b]: any[]) => void",
+        "([a /** j */, , /* x */ , , b]: any[]) => void",
     ),
-    (
-        "Array<\u{2029}/* c */\nstring | number>",
-        "Array</* c */ /* c */ string | number>",
-        "Array<string | number>",
-    ),
+    ("([, , a]: any[]) => void", "([, , a]: any[]) => void"),
+    // `AllowTrailingComma` is on both binding formats: `[a, ,]` keeps its
+    // trailing comma, and the comments around it are the elision's and the
+    // comma's own scans.
+    ("([a, ,]: any[]) => void", "([a, ,]: any[]) => void"),
+    ("([a,]: any[]) => void", "([a,]: any[]) => void"),
+    ("({a,}: any) => void", "({ a, }: any) => void"),
+    ("([a /** j */,]: any[]) => void", "([a /** j */,]: any[]) => void"),
+    ("([a, /** j */,]: any[]) => void", "([a, /** j */ ,]: any[]) => void"),
+    ("([a, , /** j */,]: any[]) => void", "([a, , /** j */ ,]: any[]) => void"),
+    ("([a, , /** j */, b]: any[]) => void", "([a, , /** j */ , b]: any[]) => void"),
+    // Comments inside a template's `${}` holes count during the backward
+    // trivia scan — the hole is code; the opening backtick isn't an
+    // unterminated string.
+    ("`${ /** j */\n string}`", "`${ /** j */string}`"),
+    ("`${\n/** doc */\nstring}`", "`${\n    /** doc */\n    string}`"),
+    ("`x${string /** j */ }y`", "`x${string /** j */}y`"),
+    ("`${string}t${ /** k */ number}z`", "`${string}t${ /** k */number}z`"),
+    // A `typeof` name's parts are emitted separately.
+    ("typeof val.a.\n/** j */\nb", "typeof val.a.\n    /** j */\n    b"),
+    // NEL (U+0085) is whitespace in TypeScript's trivia scans.
+    ("(/* a */\u{85}/** b */ x: string) => void", "(/* a */ /** b */ x: string) => void"),
 ];
 
 #[test]
-fn comments_not_kept() {
-    // Without comments and whitespace, ngtsc's text is oxc's.
-    let bare = |text: &str| {
-        let mut out = String::new();
-        let mut rest = text;
-        while let Some(at) = rest.find("/*") {
-            out.push_str(&rest[..at]);
-            rest = &rest[at + rest[at..].find("*/").unwrap() + 2..];
-        }
-        out.push_str(rest);
-        out.split_whitespace().collect::<String>()
-    };
-    for (ty, ngtsc, oxc) in COMMENTS_NOT_KEPT {
-        assert_eq!(bare(ngtsc), bare(oxc), "{ty:?}");
-    }
-    let cases: Vec<(&str, &str)> =
-        COMMENTS_NOT_KEPT.iter().map(|(ty, _, oxc)| (*ty, *oxc)).collect();
-    check(&cases);
+fn comments_kept() {
+    check(COMMENTS_KEPT);
 }
 
 /// ngtsc adds `import * as i1 from './other'` and writes `i1.Other`; oxc

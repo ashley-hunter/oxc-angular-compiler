@@ -120,6 +120,13 @@ pub fn generate_arrow_functions_for_host(job: &mut HostBindingCompilationJob<'_>
             VisitorContextFlag::NONE,
         );
     }
+
+    // Collect arrow functions into the root unit's functions set.
+    // Only hoisted arrows are collected, matching the template path.
+    job.root.functions.clear();
+    for ptr in collect_hoisted_arrow_functions(&mut job.root.create, &mut job.root.update) {
+        job.root.functions.push(ptr);
+    }
 }
 
 /// Collect hoisted arrow functions from a view's operations into its functions set.
@@ -128,8 +135,20 @@ fn collect_arrow_functions_from_view<'a>(
 ) {
     view.functions.clear();
 
-    // The transforming visitors are used, rather than the read-only ones, because they
-    // also walk into the statements that variable optimization turns some ops into.
+    for ptr in collect_hoisted_arrow_functions(&mut view.create, &mut view.update) {
+        view.functions.push(ptr);
+    }
+}
+
+/// Return pointers to the hoisted (top-level) arrow functions in the given op lists.
+///
+/// The transforming visitors are used, rather than the read-only ones, because they
+/// also walk into the statements that variable optimization turns some ops into.
+fn collect_hoisted_arrow_functions<'a>(
+    create: &mut crate::ir::list::CreateOpList<'a>,
+    update: &mut crate::ir::list::UpdateOpList<'a>,
+) -> std::vec::Vec<*mut ArrowFunctionExpr<'a>> {
+    // We use RefCell to allow mutable access from within the visitor closure
     use std::cell::RefCell;
     let collected: RefCell<std::vec::Vec<*mut ArrowFunctionExpr<'a>>> =
         RefCell::new(std::vec::Vec::new());
@@ -141,16 +160,14 @@ fn collect_arrow_functions_from_view<'a>(
         }
     };
 
-    for op in view.create.iter_mut() {
+    for op in create.iter_mut() {
         if !is_listener_op(op) {
             transform_expressions_in_create_op(op, &collect, VisitorContextFlag::NONE);
         }
     }
-    for op in view.update.iter_mut() {
+    for op in update.iter_mut() {
         transform_expressions_in_update_op(op, &collect, VisitorContextFlag::NONE);
     }
 
-    for ptr in collected.into_inner() {
-        view.functions.push(ptr);
-    }
+    collected.into_inner()
 }

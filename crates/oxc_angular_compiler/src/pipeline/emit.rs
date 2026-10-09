@@ -1338,6 +1338,50 @@ fn convert_pure_function_body<'a>(
                 &allocator,
             ))
         }
+        // TaggedTemplateLiteral: convert tag and template expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            let tag = convert_pure_function_body(allocator, &ttl.tag, params);
+            let mut elements = OxcVec::new_in(&allocator);
+            let mut expressions = OxcVec::new_in(&allocator);
+            for elem in ttl.elements.iter() {
+                elements.push(crate::output::ast::TemplateLiteralElement {
+                    text: elem.text.clone(),
+                    raw_text: elem.text.clone(),
+                    source_span: elem.source_span,
+                });
+            }
+            for expr in ttl.expressions.iter() {
+                expressions.push(convert_pure_function_body(allocator, expr, params));
+            }
+            OutputExpression::TaggedTemplateLiteral(Box::new_in(
+                crate::output::ast::TaggedTemplateLiteralExpr {
+                    tag: Box::new_in(tag, &allocator),
+                    template: Box::new_in(
+                        crate::output::ast::TemplateLiteralExpr {
+                            elements,
+                            expressions,
+                            source_span: ttl.source_span,
+                        },
+                        &allocator,
+                    ),
+                    source_span: ttl.source_span,
+                },
+                &allocator,
+            ))
+        }
+
+        // SpreadElement: convert the inner expression
+        IrExpression::SpreadElement(spread) => {
+            let inner = convert_pure_function_body(allocator, &spread.expr, params);
+            OutputExpression::SpreadElement(Box::new_in(
+                crate::output::ast::SpreadElementExpr {
+                    expr: Box::new_in(inner, &allocator),
+                    source_span: spread.source_span,
+                },
+                &allocator,
+            ))
+        }
+
         // Parenthesized expression - convert inner and wrap
         IrExpression::Parenthesized(paren) => {
             let inner = convert_pure_function_body(allocator, &paren.expr, params);

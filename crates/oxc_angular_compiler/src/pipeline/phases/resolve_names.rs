@@ -17,10 +17,11 @@ use rustc_hash::FxHashMap;
 use crate::ast::expression::AngularExpression;
 use crate::ir::enums::SemanticVariableKind;
 use crate::ir::expression::{
-    ContextExpr, IrExpression, ReadVariableExpr, ResolvedCallExpr, ResolvedKeyedReadExpr,
-    ResolvedPropertyReadExpr, ResolvedSafePropertyReadExpr, RestoreViewTarget, VisitorContextFlag,
-    transform_expressions_in_create_op, transform_expressions_in_update_op,
-    visit_expressions_in_create_op, visit_expressions_in_update_op,
+    ContextExpr, IrExpression, LexicalReadExpr, ReadVariableExpr, ResolvedCallExpr,
+    ResolvedKeyedReadExpr, ResolvedPropertyReadExpr, ResolvedSafePropertyReadExpr,
+    RestoreViewTarget, VisitorContextFlag, transform_expressions_in_create_op,
+    transform_expressions_in_update_op, visit_expressions_in_create_op,
+    visit_expressions_in_update_op,
 };
 use crate::ir::ops::{CreateOp, UpdateOp, XrefId};
 use crate::pipeline::compilation::{ComponentCompilationJob, HostBindingCompilationJob};
@@ -915,12 +916,43 @@ fn resolve_angular_expression<'a>(
     root_xref: XrefId,
     allocator: &'a oxc_allocator::Allocator,
 ) -> Option<IrExpression<'a>> {
+    resolve_angular_expression_with_params(ast_expr, scope, root_xref, allocator, None)
+}
+
+/// Inner resolver that also tracks arrow function parameter names.
+///
+/// `param_names` is the shared parameter set of the enclosing arrow function's
+/// `updateParameterReferences` run: a `PropertyRead(ImplicitReceiver, name)`
+/// whose name is in the set becomes a plain `ReadVarExpr` instead of resolving
+/// against scope or the component context. `None` outside arrow subtrees.
+fn resolve_angular_expression_with_params<'a>(
+    ast_expr: &AngularExpression<'a>,
+    scope: &ScopeMaps<'a>,
+    root_xref: XrefId,
+    allocator: &'a oxc_allocator::Allocator,
+    param_names: Option<&std::cell::RefCell<rustc_hash::FxHashSet<Ident<'a>>>>,
+) -> Option<IrExpression<'a>> {
     match ast_expr {
         AngularExpression::PropertyRead(prop_read) => {
             // Check if this is a PropertyRead(ImplicitReceiver, name) that we can resolve
             if matches!(prop_read.receiver, AngularExpression::ImplicitReceiver(_)) {
                 let name = &prop_read.name;
                 let source_span = Some(prop_read.source_span.to_span());
+
+                // A read of an enclosing arrow function's own parameter becomes a plain
+                // variable read, matching Angular's updateParameterReferences which turns
+                // parameter LexicalReads into o.ReadVarExpr before name resolution.
+                if let Some(names) = param_names {
+                    if names.borrow().contains(name) {
+                        return Some(IrExpression::OutputExpr(Box::new_in(
+                            crate::output::ast::OutputExpression::ReadVar(Box::new_in(
+                                crate::output::ast::ReadVarExpr { name: name.clone(), source_span },
+                                &allocator,
+                            )),
+                            &allocator,
+                        )));
+                    }
+                }
 
                 // Context properties ($implicit, $index, etc.) and $event are special:
                 // - $event is the event handler parameter, never resolved to a variable
@@ -987,9 +1019,13 @@ fn resolve_angular_expression<'a>(
             } else {
                 // This is a nested property read like item.name
                 // Try to resolve the receiver first
-                if let Some(resolved_receiver) =
-                    resolve_angular_expression(&prop_read.receiver, scope, root_xref, &allocator)
-                {
+                if let Some(resolved_receiver) = resolve_angular_expression_with_params(
+                    &prop_read.receiver,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     // Receiver was resolved - create ResolvedPropertyRead
                     Some(IrExpression::ResolvedPropertyRead(Box::new_in(
                         ResolvedPropertyReadExpr {
@@ -1017,17 +1053,26 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::Call(call) => {
             // Resolve the receiver
-            let resolved_receiver =
-                resolve_angular_expression(&call.receiver, scope, root_xref, &allocator);
+            let resolved_receiver = resolve_angular_expression_with_params(
+                &call.receiver,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             // Resolve each argument
             let mut resolved_args = oxc_allocator::Vec::new_in(&allocator);
             let mut any_arg_resolved = false;
 
             for arg in call.args.iter() {
-                if let Some(resolved_arg) =
-                    resolve_angular_expression(arg, scope, root_xref, &allocator)
-                {
+                if let Some(resolved_arg) = resolve_angular_expression_with_params(
+                    arg,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     resolved_args.push(resolved_arg);
                     any_arg_resolved = true;
                 } else {
@@ -1065,10 +1110,21 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::KeyedRead(keyed) => {
             // Resolve receiver for keyed reads like item[0]
-            let resolved_receiver =
-                resolve_angular_expression(&keyed.receiver, scope, root_xref, &allocator);
+            let resolved_receiver = resolve_angular_expression_with_params(
+                &keyed.receiver,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
             // Also try to resolve the key expression
-            let resolved_key = resolve_angular_expression(&keyed.key, scope, root_xref, &allocator);
+            let resolved_key = resolve_angular_expression_with_params(
+                &keyed.key,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             if resolved_receiver.is_some() || resolved_key.is_some() {
                 // At least one part was resolved, create a ResolvedKeyedRead
@@ -1104,9 +1160,13 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::SafePropertyRead(safe) => {
             // Resolve receiver for safe property reads like item?.name
-            if let Some(resolved_receiver) =
-                resolve_angular_expression(&safe.receiver, scope, root_xref, &allocator)
-            {
+            if let Some(resolved_receiver) = resolve_angular_expression_with_params(
+                &safe.receiver,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            ) {
                 Some(IrExpression::ResolvedSafePropertyRead(Box::new_in(
                     ResolvedSafePropertyReadExpr {
                         receiver: Box::new_in(resolved_receiver, &allocator),
@@ -1123,10 +1183,20 @@ fn resolve_angular_expression<'a>(
         AngularExpression::Binary(binary) => {
             // Handle binary expressions, especially assignments in event handlers
             // like `todo.done = $event`
-            let resolved_left =
-                resolve_angular_expression(&binary.left, scope, root_xref, &allocator);
-            let resolved_right =
-                resolve_angular_expression(&binary.right, scope, root_xref, &allocator);
+            let resolved_left = resolve_angular_expression_with_params(
+                &binary.left,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
+            let resolved_right = resolve_angular_expression_with_params(
+                &binary.right,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             if resolved_left.is_some() || resolved_right.is_some() {
                 // At least one side was resolved, create a ResolvedBinary
@@ -1175,9 +1245,13 @@ fn resolve_angular_expression<'a>(
             let mut any_resolved = false;
 
             for expr in tl.expressions.iter() {
-                if let Some(resolved) =
-                    resolve_angular_expression(expr, scope, root_xref, &allocator)
-                {
+                if let Some(resolved) = resolve_angular_expression_with_params(
+                    expr,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     resolved_exprs.push(resolved);
                     any_resolved = true;
                 } else {
@@ -1215,12 +1289,27 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::Conditional(cond) => {
             // Handle conditional (ternary) expressions
-            let resolved_condition =
-                resolve_angular_expression(&cond.condition, scope, root_xref, &allocator);
-            let resolved_true =
-                resolve_angular_expression(&cond.true_exp, scope, root_xref, &allocator);
-            let resolved_false =
-                resolve_angular_expression(&cond.false_exp, scope, root_xref, &allocator);
+            let resolved_condition = resolve_angular_expression_with_params(
+                &cond.condition,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
+            let resolved_true = resolve_angular_expression_with_params(
+                &cond.true_exp,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
+            let resolved_false = resolve_angular_expression_with_params(
+                &cond.false_exp,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             if resolved_condition.is_some() || resolved_true.is_some() || resolved_false.is_some() {
                 let condition = resolved_condition.unwrap_or_else(|| {
@@ -1268,9 +1357,13 @@ fn resolve_angular_expression<'a>(
             let mut any_resolved = false;
 
             for value in map.values.iter() {
-                if let Some(resolved) =
-                    resolve_angular_expression(value, scope, root_xref, &allocator)
-                {
+                if let Some(resolved) = resolve_angular_expression_with_params(
+                    value,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     resolved_values.push(resolved);
                     any_resolved = true;
                 } else {
@@ -1331,9 +1424,13 @@ fn resolve_angular_expression<'a>(
                 } else {
                     entry
                 };
-                if let Some(resolved) =
-                    resolve_angular_expression(inner, scope, root_xref, &allocator)
-                {
+                if let Some(resolved) = resolve_angular_expression_with_params(
+                    inner,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     resolved_entries.push(resolved);
                     any_resolved = true;
                 } else {
@@ -1362,9 +1459,13 @@ fn resolve_angular_expression<'a>(
         AngularExpression::PrefixNot(prefix_not) => {
             // Handle prefix not expressions (!expr) - need to resolve variable references
             // in the operand. This is critical for expressions like `!bold` in listeners.
-            if let Some(resolved) =
-                resolve_angular_expression(&prefix_not.expression, scope, root_xref, &allocator)
-            {
+            if let Some(resolved) = resolve_angular_expression_with_params(
+                &prefix_not.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            ) {
                 Some(IrExpression::Not(Box::new_in(
                     crate::ir::expression::NotExpr {
                         expr: Box::new_in(resolved, &allocator),
@@ -1379,9 +1480,13 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::Unary(unary) => {
             // Handle unary expressions (+expr or -expr) - need to resolve variable references
-            if let Some(resolved) =
-                resolve_angular_expression(&unary.expr, scope, root_xref, &allocator)
-            {
+            if let Some(resolved) = resolve_angular_expression_with_params(
+                &unary.expr,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            ) {
                 Some(IrExpression::Unary(Box::new_in(
                     crate::ir::expression::UnaryExpr {
                         operator: match unary.operator {
@@ -1404,9 +1509,13 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::TypeofExpression(typeof_expr) => {
             // Handle typeof expressions - need to resolve variable references
-            if let Some(resolved) =
-                resolve_angular_expression(&typeof_expr.expression, scope, root_xref, &allocator)
-            {
+            if let Some(resolved) = resolve_angular_expression_with_params(
+                &typeof_expr.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            ) {
                 Some(IrExpression::Typeof(Box::new_in(
                     crate::ir::expression::TypeofExpr {
                         expr: Box::new_in(resolved, &allocator),
@@ -1421,9 +1530,13 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::VoidExpression(void_expr) => {
             // Handle void expressions - need to resolve variable references
-            if let Some(resolved) =
-                resolve_angular_expression(&void_expr.expression, scope, root_xref, &allocator)
-            {
+            if let Some(resolved) = resolve_angular_expression_with_params(
+                &void_expr.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            ) {
                 Some(IrExpression::Void(Box::new_in(
                     crate::ir::expression::VoidExpr {
                         expr: Box::new_in(resolved, &allocator),
@@ -1439,49 +1552,63 @@ fn resolve_angular_expression<'a>(
         AngularExpression::NonNullAssert(nna) => {
             // Handle non-null assertion expressions (expr!) - need to resolve variable references
             // NonNullAssert expressions are wrapped in Ast since IrExpression doesn't have this variant
-            resolve_angular_expression(&nna.expression, scope, root_xref, &allocator)
+            resolve_angular_expression_with_params(
+                &nna.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            )
         }
 
         AngularExpression::ParenthesizedExpression(paren) => {
             // Handle parenthesized expressions - need to resolve variable references
             // within the inner expression
-            resolve_angular_expression(&paren.expression, scope, root_xref, &allocator)
+            resolve_angular_expression_with_params(
+                &paren.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            )
         }
 
         AngularExpression::Chain(chain) => {
-            // Handle chain expressions (expr1; expr2; ...) - need to resolve all expressions
-            // Chain is not directly supported in IrExpression, so we need to handle it specially
-            let mut any_resolved = false;
-            for expr in chain.expressions.iter() {
-                if resolve_angular_expression(expr, scope, root_xref, &allocator).is_some() {
-                    any_resolved = true;
-                    break;
-                }
-            }
-            // Chain expressions are not representable in IR, but we still want to
-            // flag if any inner expressions need resolution
-            // For now, return None and let the Ast path handle it
-            if any_resolved {
-                // This path will not be perfectly handled, but chain expressions
-                // in listeners are unusual; the primary path (Ast) will handle most cases
-                None
-            } else {
-                None
+            // Chains are not directly representable in IR. The reify path emits only
+            // the last member of a stored chain, so resolve that member here.
+            match chain.expressions.last() {
+                Some(last) => resolve_angular_expression_with_params(
+                    last,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ),
+                None => None,
             }
         }
 
         AngularExpression::SafeCall(safe_call) => {
             // Handle safe function calls (fn?.()) - need to resolve receiver and arguments
-            let resolved_receiver =
-                resolve_angular_expression(&safe_call.receiver, scope, root_xref, &allocator);
+            let resolved_receiver = resolve_angular_expression_with_params(
+                &safe_call.receiver,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             let mut resolved_args = oxc_allocator::Vec::new_in(&allocator);
             let mut any_arg_resolved = false;
 
             for arg in safe_call.args.iter() {
-                if let Some(resolved) =
-                    resolve_angular_expression(arg, scope, root_xref, &allocator)
-                {
+                if let Some(resolved) = resolve_angular_expression_with_params(
+                    arg,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
                     resolved_args.push(resolved);
                     any_arg_resolved = true;
                 } else {
@@ -1519,10 +1646,20 @@ fn resolve_angular_expression<'a>(
 
         AngularExpression::SafeKeyedRead(safe_keyed) => {
             // Handle safe keyed read (obj?.[key]) - need to resolve receiver and key
-            let resolved_receiver =
-                resolve_angular_expression(&safe_keyed.receiver, scope, root_xref, &allocator);
-            let resolved_key =
-                resolve_angular_expression(&safe_keyed.key, scope, root_xref, &allocator);
+            let resolved_receiver = resolve_angular_expression_with_params(
+                &safe_keyed.receiver,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
+            let resolved_key = resolve_angular_expression_with_params(
+                &safe_keyed.key,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
 
             if resolved_receiver.is_some() || resolved_key.is_some() {
                 let receiver = resolved_receiver.unwrap_or_else(|| {
@@ -1555,6 +1692,134 @@ fn resolve_angular_expression<'a>(
             } else {
                 None
             }
+        }
+
+        AngularExpression::ArrowFunction(arrow) => {
+            // Mirror Angular's updateParameterReferences: reads of the arrow's own
+            // parameters become plain variable reads. The parameter set is shared
+            // with the enclosing arrow's run (if any) and only grows: this arrow's
+            // parameters are added after its body is resolved, matching the
+            // post-order traversal in ingest.ts.
+            let names = match param_names {
+                Some(shared) => std::cell::RefCell::new(
+                    shared.borrow().iter().cloned().collect::<rustc_hash::FxHashSet<Ident<'a>>>(),
+                ),
+                None => std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
+            };
+            names.borrow_mut().extend(arrow.parameters.iter().map(|p| p.name.clone()));
+
+            let body = resolve_angular_expression_with_params(
+                &arrow.body,
+                scope,
+                root_xref,
+                allocator,
+                Some(&names),
+            )
+            .unwrap_or_else(|| {
+                IrExpression::Ast(Box::new_in(
+                    crate::ir::expression::clone_angular_expression(&arrow.body, &allocator),
+                    &allocator,
+                ))
+            });
+
+            if let Some(shared) = param_names {
+                shared.borrow_mut().extend(names.borrow().iter().cloned());
+            }
+
+            let mut params = oxc_allocator::Vec::new_in(&allocator);
+            for param in arrow.parameters.iter() {
+                params.push(crate::output::ast::FnParam { name: param.name.clone() });
+            }
+
+            Some(IrExpression::ArrowFunction(Box::new_in(
+                crate::ir::expression::ArrowFunctionExpr {
+                    params,
+                    body: Box::new_in(body, &allocator),
+                    ops: oxc_allocator::Vec::new_in(&allocator),
+                    var_offset: None,
+                    hoisted: false,
+                    source_span: Some(arrow.source_span.to_span()),
+                },
+                &allocator,
+            )))
+        }
+
+        AngularExpression::TaggedTemplateLiteral(ttl) => {
+            // Resolve the tag and the template's embedded expressions.
+            let resolved_tag = resolve_angular_expression_with_params(
+                &ttl.tag,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            );
+
+            let mut resolved_exprs = oxc_allocator::Vec::new_in(&allocator);
+            let mut any_resolved = resolved_tag.is_some();
+            for expr in ttl.template.expressions.iter() {
+                if let Some(resolved) = resolve_angular_expression_with_params(
+                    expr,
+                    scope,
+                    root_xref,
+                    allocator,
+                    param_names,
+                ) {
+                    resolved_exprs.push(resolved);
+                    any_resolved = true;
+                } else {
+                    resolved_exprs.push(IrExpression::Ast(Box::new_in(
+                        crate::ir::expression::clone_angular_expression(expr, &allocator),
+                        &allocator,
+                    )));
+                }
+            }
+
+            if any_resolved {
+                let tag = resolved_tag.unwrap_or_else(|| {
+                    IrExpression::Ast(Box::new_in(
+                        crate::ir::expression::clone_angular_expression(&ttl.tag, &allocator),
+                        &allocator,
+                    ))
+                });
+                let mut elements = oxc_allocator::Vec::new_in(&allocator);
+                for elem in ttl.template.elements.iter() {
+                    elements.push(crate::ir::expression::IrTemplateLiteralElement {
+                        text: elem.text.clone(),
+                        source_span: Some(elem.source_span.to_span()),
+                    });
+                }
+                Some(IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    crate::ir::expression::IrTaggedTemplateLiteralExpr {
+                        tag: Box::new_in(tag, &allocator),
+                        elements,
+                        expressions: resolved_exprs,
+                        source_span: Some(ttl.source_span.to_span()),
+                    },
+                    &allocator,
+                )))
+            } else {
+                None
+            }
+        }
+
+        AngularExpression::SpreadElement(spread) => {
+            // Resolve the inner expression of a spread element.
+            resolve_angular_expression_with_params(
+                &spread.expression,
+                scope,
+                root_xref,
+                allocator,
+                param_names,
+            )
+            .map(|resolved| {
+                IrExpression::SpreadElement(Box::new_in(
+                    crate::ir::expression::IrSpreadElementExpr {
+                        expr: Box::new_in(resolved, &allocator),
+                        source_span: Some(spread.source_span.to_span()),
+                    },
+                    &allocator,
+                ))
+            })
         }
 
         // Other expression types don't need recursive resolution
@@ -1592,13 +1857,27 @@ fn verify_no_lexical_reads_remain(job: &mut ComponentCompilationJob<'_>) {
     // Collect errors in a RefCell to allow mutation from within the Fn closure
     let errors: RefCell<Vec<OxcDiagnostic>> = RefCell::new(Vec::new());
 
+    // `$event` inside listener handlers (IN_CHILD_OPERATION) legitimately stays
+    // a LexicalRead until reify turns it into the handler parameter. Upstream's
+    // resolveDollarEvent rewrites it to a ReadVarExpr before this check, so its
+    // verifier never sees it; this port leaves the LexicalRead in place instead,
+    // so it is exempt here.
+    let is_exempt_event_param = |lexical: &LexicalReadExpr<'_>,
+                                 flags: VisitorContextFlag|
+     -> bool {
+        flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) && lexical.name.as_str() == "$event"
+    };
+
     for view in job.all_views() {
         // Check create ops
         for op in view.create.iter() {
             visit_expressions_in_create_op(
                 op,
-                &|expr, _flags| {
+                &|expr, flags| {
                     if let IrExpression::LexicalRead(lexical) = expr {
+                        if is_exempt_event_param(lexical, flags) {
+                            return;
+                        }
                         errors.borrow_mut().push(
                             OxcDiagnostic::error(format!(
                                 "AssertionError: no lexical reads should remain, but found read of {}",
@@ -1616,8 +1895,11 @@ fn verify_no_lexical_reads_remain(job: &mut ComponentCompilationJob<'_>) {
         for op in view.update.iter() {
             visit_expressions_in_update_op(
                 op,
-                &|expr, _flags| {
+                &|expr, flags| {
                     if let IrExpression::LexicalRead(lexical) = expr {
+                        if is_exempt_event_param(lexical, flags) {
+                            return;
+                        }
                         errors.borrow_mut().push(
                             OxcDiagnostic::error(format!(
                                 "AssertionError: no lexical reads should remain, but found read of {}",

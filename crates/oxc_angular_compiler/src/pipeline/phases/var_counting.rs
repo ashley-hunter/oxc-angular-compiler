@@ -641,15 +641,28 @@ fn assign_var_offsets_in_expr(
                 assign_var_offsets_in_expr(e, var_count, pure_functions_only);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            assign_var_offsets_in_expr(&mut ttl.tag, var_count, pure_functions_only);
+            for e in ttl.expressions.iter_mut() {
+                assign_var_offsets_in_expr(e, var_count, pure_functions_only);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            assign_var_offsets_in_expr(&mut spread.expr, var_count, pure_functions_only);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             // A hoisted arrow function consumes a var slot for `ɵɵarrowFunction`; one
-            // emitted in place does not.
+            // emitted in place does not. The offset is assigned before walking the
+            // arrow's own ops and body, matching upstream's pre-order visit where
+            // the arrow gets varCount and inner var consumers follow.
             if arrow_fn.hoisted && !pure_functions_only {
                 arrow_fn.var_offset = Some(*var_count);
                 *var_count += 1;
             }
-            // Process the body expression
+            for op in arrow_fn.ops.iter_mut() {
+                assign_var_offsets_in_op(op, var_count, pure_functions_only);
+            }
             assign_var_offsets_in_expr(&mut arrow_fn.body, var_count, pure_functions_only);
         }
         IrExpression::Parenthesized(paren) => {

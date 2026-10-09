@@ -20,7 +20,7 @@ use napi_derive::napi;
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
     AngularVersion as RustAngularVersion, ChangeDetectionStrategy as RustChangeDetectionStrategy,
-    HmrUpdateModuleOptions, HostMetadataInput as RustHostMetadataInput,
+    HmrTemplateFields, HmrUpdateModuleOptions, HostMetadataInput as RustHostMetadataInput,
     TransformOptions as RustTransformOptions, ViewEncapsulation as RustViewEncapsulation,
     build_ctor_params_metadata_in as core_build_ctor_params_metadata,
     build_decorator_metadata_array as core_build_decorator_metadata_array,
@@ -533,12 +533,23 @@ pub fn compile_template(
 /// This generates a JavaScript module that can be dynamically imported
 /// during HMR to update a component's template and styles.
 ///
+/// This knows only what it is given: the generated module replaces `template`
+/// and `consts`, but `decls`, `vars` and `ngContentSelectors` stay as the live
+/// definition has them, so it is only correct when the new template needs the
+/// same ones. For a template that changes them, use `compileForHmrSync`, which
+/// compiles the template and writes every field it decides.
+///
 /// # Arguments
 ///
 /// * `component_id` - The component ID (path@ClassName)
-/// * `template_js` - The compiled template function as JavaScript
+/// * `template_js` - The compiled template function as JavaScript, or an empty
+///   string for a styles-only update
 /// * `styles` - The component's CSS styles, or `None` when unknown. An empty
 ///   array is definitive and emits `styles: []`, clearing the old styles.
+/// * `declarations_js` - Optional constant declarations the template references
+/// * `consts_js` - The new template's consts array as JavaScript. When
+///   `template_js` is given, `None` emits `consts: null`, clearing the old
+///   template's consts.
 ///
 /// # Returns
 ///
@@ -634,14 +645,18 @@ pub fn compile_for_hmr_sync(
             let mut all_styles: Vec<String> = styles.unwrap_or_default();
             all_styles.extend(output.styles);
 
-            // Apply style encapsulation for ViewEncapsulation.Emulated
-            // Angular uses %COMP% as a placeholder that the runtime replaces with the component ID
+            // Apply style encapsulation. Angular uses %COMP% as a placeholder
+            // that the runtime replaces with the component ID. Only Emulated
+            // encapsulation shims selectors; None and ShadowDom styles are
+            // served as written (the caller passes the component's
+            // encapsulation through `options.encapsulation`).
+            let emulate = opts.encapsulation.unwrap_or_default() == RustViewEncapsulation::Emulated;
             let encapsulated: Vec<String> = all_styles
                 .iter()
                 .map(|style| {
                     oxc_angular_compiler::styles::finalize_component_style(
                         style,
-                        true,
+                        emulate,
                         "_ngcontent-%COMP%",
                         "_nghost-%COMP%",
                         opts.minify_component_styles,
@@ -659,17 +674,30 @@ pub fn compile_for_hmr_sync(
                     None
                 };
 
-            // Generate HMR module with declarations, encapsulated styles, and consts
+            // Generate the HMR module from everything the new template decided
             let hmr_module = generate_hmr_update_module(&HmrUpdateModuleOptions {
                 component_id: &component_id,
                 class_name: &component_name,
-                template_js: Some(&template_js),
+                template: Some(HmrTemplateFields {
+                    template_js: &template_js,
+                    decls: output.decls,
+                    vars: output.vars,
+                    consts_js: output.consts_js.as_deref(),
+                    ng_content_selectors_js: output.ng_content_selectors_js.as_deref(),
+                }),
                 styles: encapsulated_styles.as_deref(),
                 declarations_js,
-                consts_js: output.consts_js.as_deref(),
             });
 
-            HmrCompileResult { hmr_module, component_id, template_js, errors: vec![] }
+            HmrCompileResult {
+                hmr_module,
+                component_id,
+                template_js,
+                // Non-fatal pipeline diagnostics (warnings, advice) — the
+                // update module was still generated. Errors come back through
+                // the `Err` arm instead.
+                errors: OxcError::from_diagnostics(&file_path, &template, output.diagnostics),
+            }
         }
         Err(diagnostics) => HmrCompileResult {
             hmr_module: String::new(),

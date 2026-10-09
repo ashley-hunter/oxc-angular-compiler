@@ -461,12 +461,13 @@ fn add_restore_view_to_listener<'a>(
     handler_ops.insert(0, restore_var);
 
     // Wrap handler_expression in ResetViewExpr (Angular's save_restore_view.ts lines 84-91)
-    // This resets the view context after the listener handler returns
+    // This resets the view context after the listener handler returns. The expression
+    // is moved in place (not cloned) so nodes referenced elsewhere, such as arrow
+    // functions tracked in view.functions, keep their identity.
     if let Some(expr) = handler_expression.take() {
-        let cloned_expr = expr.clone_in(allocator);
         *handler_expression = Some(Box::new_in(
             IrExpression::ResetView(Box::new_in(
-                ResetViewExpr { expr: Box::new_in(cloned_expr, &allocator), source_span: None },
+                ResetViewExpr { expr, source_span: None },
                 &allocator,
             )),
             &allocator,

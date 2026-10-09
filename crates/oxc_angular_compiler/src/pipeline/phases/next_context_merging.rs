@@ -504,6 +504,26 @@ fn visit_nested_exprs_for_merge(expr: &mut IrExpression<'_>, merge_steps: u32) -
             MergeResult::Continue
         }
 
+        // TaggedTemplateLiteral: recurse into tag and embedded expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            let result = visit_ir_expr_for_merge(&mut ttl.tag, merge_steps);
+            if result != MergeResult::Continue {
+                return result;
+            }
+            for e in ttl.expressions.iter_mut() {
+                let result = visit_ir_expr_for_merge(e, merge_steps);
+                if result != MergeResult::Continue {
+                    return result;
+                }
+            }
+            MergeResult::Continue
+        }
+
+        // SpreadElement: recurse into the inner expression
+        IrExpression::SpreadElement(spread) => {
+            visit_ir_expr_for_merge(&mut spread.expr, merge_steps)
+        }
+
         // Leaf expressions with no sub-expressions - no need to recurse
         IrExpression::LexicalRead(_)
         | IrExpression::Context(_)
