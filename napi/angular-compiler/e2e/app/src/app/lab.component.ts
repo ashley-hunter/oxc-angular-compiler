@@ -7,6 +7,9 @@ import { ChangeDetectionStrategy, Component } from '@angular/core'
 @Component({
   selector: 'app-lab',
   templateUrl: './lab.html',
+  // A style block so every template update module also merges `styles`, the
+  // key the swap otherwise leaves to the `...ɵcmp` spread.
+  styles: ['.lab-one { font-weight: bold }'],
   changeDetection: ChangeDetectionStrategy.Eager,
 })
 export class Lab {

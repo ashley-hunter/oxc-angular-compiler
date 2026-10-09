@@ -428,6 +428,11 @@ pub struct HmrTemplateCompileOutput {
     /// The `ngContentSelectors` array as JavaScript code, when the template projects
     /// content. It refers to a constant declared in `declarations_js`.
     pub ng_content_selectors_js: Option<String>,
+
+    /// Non-fatal diagnostics the pipeline reported while compiling (warnings,
+    /// advice). Error-severity diagnostics are returned as `Err` instead, since
+    /// the emitted code cannot be trusted.
+    pub diagnostics: Vec<OxcDiagnostic>,
 }
 
 /// Compiled component information.
@@ -5500,11 +5505,14 @@ pub fn compile_template_for_hmr<'a>(
     // OXC is a single-file compiler (local compilation mode): always use Full mode.
     let mode = TemplateCompilationMode::Full;
 
-    let defer_block_deps_emit_mode = if options.jit {
-        DeferBlockDepsEmitMode::PerComponent
-    } else {
-        DeferBlockDepsEmitMode::PerBlock
-    };
+    // Defer-block dependency resolution needs component metadata this compile
+    // does not have, and PerBlock mode reports "unable to find a dependency
+    // function for this deferred block" for every `@defer` when its `blocks`
+    // map is not populated — nothing ever populates it here. Local compilation
+    // uses PerComponent (upstream handler.ts:1281); with no resolver available
+    // it still emits `ɵɵdefer` with a null dependencies argument, which is what
+    // PerBlock's empty map would have produced anyway.
+    let defer_block_deps_emit_mode = DeferBlockDepsEmitMode::PerComponent;
 
     let enable_debug_locations = !options.advanced_optimizations;
 
@@ -5535,6 +5543,15 @@ pub fn compile_template_for_hmr<'a>(
 
     // Collect any diagnostics from the compilation job
     diagnostics.extend(job.diagnostics.into_iter());
+
+    // A pipeline error means the emitted code is already wrong — an update
+    // module must not be generated from it, and `decls`/`vars` may not be
+    // reliable (they default to 0 when slot allocation never ran, which would
+    // size the new TView incorrectly). Non-error diagnostics go out on the
+    // output so the caller can surface them.
+    if diagnostics.iter().any(|d| d.severity == oxc_diagnostics::Severity::Error) {
+        return Err(diagnostics);
+    }
 
     let emitter = JsEmitter::new();
 
@@ -5625,6 +5642,7 @@ pub fn compile_template_for_hmr<'a>(
         decls: job.root.decl_count.unwrap_or(0),
         vars: job.root.vars.unwrap_or(0),
         ng_content_selectors_js,
+        diagnostics,
     })
 }
 

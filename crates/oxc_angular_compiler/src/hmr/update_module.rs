@@ -111,6 +111,10 @@ pub fn generate_hmr_update_module(options: &HmrUpdateModuleOptions<'_>) -> Strin
         &fields,
         options.styles,
         options.declarations_js,
+        // A missing template is a styles-only update: the live tView still
+        // matches the template it was built for, so keep it and let
+        // recreateMatchingLViews re-render rather than rebuilding it.
+        options.template.is_some(),
     )
 }
 
@@ -118,18 +122,24 @@ pub fn generate_hmr_update_module(options: &HmrUpdateModuleOptions<'_>) -> Strin
 ///
 /// This is a convenience function when you already have the template
 /// compiled to JavaScript. It knows only what it is given: the module replaces
-/// the template function (and `consts`, when passed) and leaves `decls`, `vars`
-/// and `ngContentSelectors` as the live definition has them, so it is only
-/// correct for a template that needs the same ones. Use
-/// [`generate_hmr_update_module`] with the output of a template compile to
-/// write them all.
+/// the template function and `consts`, but `decls`, `vars` and
+/// `ngContentSelectors` stay as the live definition has them — keys the module
+/// does not write survive the `...ɵcmp` spread — so it is only correct for a
+/// template that needs the same slot counts and projection selectors as the
+/// old one. For a template that changes them, use
+/// [`generate_hmr_update_module`] with the output of a template compile, which
+/// writes them all.
 ///
 /// # Arguments
 ///
 /// * `component_id` - Component ID (path@ClassName)
-/// * `template_js` - Compiled template function as JavaScript
+/// * `template_js` - Compiled template function as JavaScript, or an empty
+///   string for a styles-only update
 /// * `styles` - Optional array of CSS styles
 /// * `declarations_js` - Optional constant declarations (child views, pooled constants)
+/// * `consts_js` - The new template's consts array as JavaScript. When the
+///   module emits a template, `None` writes `consts: null`, clearing whatever
+///   the old template's consts held.
 ///
 /// # Returns
 ///
@@ -145,21 +155,34 @@ pub fn generate_hmr_update_module_from_js(
     // can contain `@` (e.g. `node_modules/@scope/...`) but a class name cannot.
     let class_name = component_id.rsplit_once('@').map_or("Component", |(_, name)| name);
 
-    let mut fields = vec![("template", template_js.to_string())];
-    if let Some(consts_js) = consts_js {
-        fields.push(("consts", consts_js.to_string()));
+    let mut fields = std::vec::Vec::new();
+    if !template_js.is_empty() {
+        fields.push(("template", template_js.to_string()));
+        // A swapped template decides the consts it indexes into, so an absent
+        // `consts_js` clears them rather than keeping the old template's.
+        fields.push(("consts", consts_js.unwrap_or("null").to_string()));
     }
-    emit_update_module(component_id, class_name, &fields, styles, declarations_js)
+    emit_update_module(
+        component_id,
+        class_name,
+        &fields,
+        styles,
+        declarations_js,
+        !template_js.is_empty(),
+    )
 }
 
 /// Emits an update module that copies the live definition and overrides `fields`
-/// (name and JavaScript value) and, when known, `styles`.
+/// (name and JavaScript value) and, when known, `styles`. `clear_tview` writes
+/// `tView: null`, making the runtime build the view for the new template; it
+/// must only be set when `fields` replaces the template.
 fn emit_update_module(
     component_id: &str,
     class_name: &str,
     fields: &[(&str, String)],
     styles: Option<&[String]>,
     declarations_js: Option<&str>,
+    clear_tview: bool,
 ) -> String {
     let mut output = String::new();
 
@@ -214,7 +237,9 @@ fn emit_update_module(
         }
     }
 
-    output.push_str("    tView: null,\n");
+    if clear_tview {
+        output.push_str("    tView: null,\n");
+    }
     output.push_str("  };\n");
     output.push_str("}\n");
 
@@ -319,7 +344,9 @@ mod tests {
             None,
         );
 
-        for field in ["decls:", "vars:", "consts:", "ngContentSelectors:", "template:"] {
+        // `tView` included: clearing it would make getOrCreateComponentTView
+        // rebuild an identical view before recreateMatchingLViews re-renders.
+        for field in ["decls:", "vars:", "consts:", "ngContentSelectors:", "template:", "tView:"] {
             assert!(!result.contains(field), "unexpected `{field}`:\n{result}");
         }
         assert!(result.contains("color: red"));
@@ -360,7 +387,9 @@ mod tests {
         }
     }
 
-    /// From template JavaScript alone the counts are unknown, so they are left as they are.
+    /// From template JavaScript alone the slot counts are unknown, so they are
+    /// left as they are — `decls`, `vars` and `ngContentSelectors` keep the old
+    /// template's values, which is only correct when they do not change.
     #[test]
     fn test_generate_hmr_update_module_from_js() {
         let result = generate_hmr_update_module_from_js(
@@ -376,11 +405,35 @@ mod tests {
         assert!(result.contains("template: function MyComponent_Template(rf, ctx) { },"));
         assert!(result.contains("consts: [\"value1\"],"));
         assert!(result.contains("color: red"));
+        assert!(result.contains("    tView: null,\n  };"));
         assert!(!result.contains("ɵɵdefineComponent"));
         assert!(!result.contains("decls:"));
+        assert!(!result.contains("ngContentSelectors:"));
 
-        let result = generate_hmr_update_module_from_js("MyComponent", "", None, None, None);
+        // The swapped template decides `consts`: no consts argument clears the
+        // old template's rather than keeping it through the spread.
+        let result = generate_hmr_update_module_from_js(
+            "a.ts@MyComponent",
+            "function T(rf, ctx) {}",
+            None,
+            None,
+            None,
+        );
+        assert!(result.contains("consts: null,"), "{result}");
+
+        // No template is a styles-only update: no template key (which would be
+        // `template: ,` — invalid JS) and no `tView` clear.
+        let result = generate_hmr_update_module_from_js(
+            "MyComponent",
+            "",
+            Some(&["h1 { color: red; }".to_string()]),
+            None,
+            None,
+        );
         assert!(result.contains("function Component_UpdateMetadata(Component"));
+        assert!(!result.contains("template:"), "{result}");
+        assert!(!result.contains("tView"), "{result}");
+        assert!(result.contains("color: red"));
     }
 
     #[test]

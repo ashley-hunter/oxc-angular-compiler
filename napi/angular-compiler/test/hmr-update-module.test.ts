@@ -74,13 +74,31 @@ async function loadUpdateModule(code: string): Promise<(...args: unknown[]) => v
   return (await import(/* @vite-ignore */ pathToFileURL(file).href)).default
 }
 
+/**
+ * A template function's identity for comparison: its source text. A function
+ * compiled as a nested function expression carries a trailing `;` that a
+ * declaration does not, and that says nothing about the template.
+ */
+function templateSource(fn: unknown): string {
+  return String(fn).replace(/};(\s|$)/g, '}$1')
+}
+
 /** Hot-swaps `template` into `type` the way the runtime does. */
-async function swap(type: any, template: string, id = '/x/a.ts'): Promise<string> {
+async function swap(type: any, template: string, id = '/x/a.ts') {
   const result = compileForHmrSync(template, type.name, id, null, {})
   expect(result.errors).toEqual([])
+  // Seed a stale view so `def.tView` can only end up null if the update
+  // module wrote `tView: null` — an unrendered component's tView is already
+  // null, which would let a missing clear slip through. The sentinel is
+  // never a real view's, so ɵɵreplaceMetadata finds nothing to recreate.
+  type.ɵcmp.tView ??= {}
   const applyMetadata = await loadUpdateModule(result.hmrModule)
   ;(core as any).ɵɵreplaceMetadata(type, applyMetadata, [core], [])
-  return result.hmrModule
+  // A compiled function's source is what Function#toString returns, so this
+  // asserts the definition's template is the freshly compiled one, not a
+  // stale function the spread kept.
+  expect(templateSource(type.ɵcmp.template)).toBe(templateSource(result.templateJs))
+  return result
 }
 
 /** The fields of a definition that its template decides. */
@@ -125,17 +143,17 @@ async function expectSwapMatchesFreshCompile(
 describe('compileForHmrSync update module', () => {
   it('writes the slot counts and projection selectors of the new template', async () => {
     const type = await component('<view></view>', { members: `a = 'A';` })
-    const module = await swap(type, '<view><text>{{ a }}</text></view><ng-content select="[x]"/>')
+    const { hmrModule } = await swap(type, '<view><text>{{ a }}</text></view><ng-content select="[x]"/>')
 
-    expect(templateFields(type)).toEqual({
+    expect(templateFields(type)).toMatchObject({
       decls: 4,
       vars: 1,
       consts: null,
       ngContentSelectors: ['[x]'],
     })
     // Every constant the module declares is one it uses.
-    for (const [, name] of module.matchAll(/const (_c\d+) =/g)) {
-      expect(module.split(name).length - 1, `${name} is declared and used`).toBeGreaterThan(1)
+    for (const [, name] of hmrModule.matchAll(/const (_c\d+) =/g)) {
+      expect(hmrModule.split(name).length - 1, `${name} is declared and used`).toBeGreaterThan(1)
     }
   })
 

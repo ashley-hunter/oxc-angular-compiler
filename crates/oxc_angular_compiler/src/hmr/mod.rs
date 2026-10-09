@@ -27,10 +27,18 @@
 //! });
 //!
 //! // HMR Update Module (served by Vite middleware)
-//! export default {
-//!   ɵcmp: /* compiled component definition */,
-//!   template: /* template function */,
-//! };
+//! export default function Cmp_UpdateMetadata(Cmp, ɵɵnamespaces) {
+//!   const i0 = ɵɵnamespaces[0];
+//!   Cmp.ɵcmp = {
+//!     ...Cmp.ɵcmp,
+//!     decls: /* new template's slot count */,
+//!     vars: /* new template's binding count */,
+//!     consts: /* new template's consts, or null */,
+//!     ngContentSelectors: /* new template's selectors, or undefined */,
+//!     template: /* new template function */,
+//!     tView: null,
+//!   };
+//! }
 //! ```
 
 mod dependencies;

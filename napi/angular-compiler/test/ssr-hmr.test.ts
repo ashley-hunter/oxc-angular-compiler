@@ -135,7 +135,10 @@ describe('compileForHmrSync with @ in the file path', () => {
   })
 
   it('generateHmrModule names the update function after the class', () => {
-    const hmrModule = generateHmrModule('node_modules/@scope/pkg/src/a.ts@Foo', 'null')
+    const hmrModule = generateHmrModule(
+      'node_modules/@scope/pkg/src/a.ts@Foo',
+      'function Foo_Template(rf, ctx) {}',
+    )
 
     expect(hmrModule).toContain('export default function Foo_UpdateMetadata(Foo, ɵɵnamespaces) {')
     expect(parseSync('hmr.js', hmrModule).errors).toEqual([])

@@ -26,11 +26,15 @@ async function definition(page: Page, selector: string) {
   return await page.evaluate((selector) => {
     const element = document.querySelector(selector)!
     const def = (window as any).ng.getComponent(element).constructor.ɵcmp
+    // `consts` may be a thunk when the template has i18n initializers — its
+    // `.length` would be the function's arity, not the entry count.
+    const consts = typeof def.consts === 'function' ? def.consts() : def.consts
     return {
       decls: def.decls as number,
       vars: def.vars as number,
-      consts: (def.consts?.length ?? null) as number | null,
+      consts: (consts?.length ?? null) as number | null,
       ngContentSelectors: (def.ngContentSelectors ?? null) as string[] | null,
+      styles: (def.styles ?? null) as string[] | null,
       outputs: { ...def.outputs } as Record<string, string>,
       inputs: Object.fromEntries(
         Object.entries(def.inputs as Record<string, unknown[]>).map(([name, value]) => [
@@ -46,14 +50,23 @@ async function definition(page: Page, selector: string) {
 test.describe('HMR update definition', () => {
   let errors: string[]
 
-  test.beforeEach(async ({ page }) => {
+  test.beforeEach(async ({ page, hmrDetector }) => {
     errors = []
     page.on('pageerror', (error) => errors.push(error.message))
     page.on('console', (message) => {
       if (message.type() === 'error') errors.push(message.text())
     })
+    // The DOM sentinel alone cannot prove no reload was requested: Vite's
+    // client drops a `full-reload` payload whose `.html` path does not match
+    // `location.pathname`, so the sentinel survives it. Record the wire.
+    await hmrDetector.captureWirePayloads()
     await page.goto('/')
     await page.waitForLoadState('networkidle')
+  })
+
+  test.afterEach(async ({ hmrDetector }) => {
+    const payloads = await hmrDetector.getWirePayloads()
+    expect(payloads.map((p) => p.type)).not.toContain('full-reload')
   })
 
   test('a template that gains an element and a binding, then loses both', async ({
@@ -74,7 +87,13 @@ test.describe('HMR update definition', () => {
     await expect(page.locator('app-lab .lab-two')).toHaveText('LAB_A')
     await expect(page.locator('app-lab .lab-three')).toHaveAttribute('title', 'LAB_B')
     await expect(page.locator('app-lab .lab-one')).toHaveText('one')
-    expect(await definition(page, 'app-lab')).toMatchObject({ decls: 6, vars: 2 })
+    const grown = await definition(page, 'app-lab')
+    expect(grown).toMatchObject({ decls: 6, vars: 2 })
+    // The update module carries the component's styles into the merged
+    // definition — the spread alone would keep them, but an update module
+    // that regressed to emitting none would drop them.
+    expect(grown.styles?.join('')).toContain('.lab-one')
+    await expect(page.locator('app-lab .lab-one')).toHaveCSS('font-weight', '700')
 
     // A second swap on the same component, down to less than it started with.
     await page.waitForTimeout(WATCHER_THROTTLE_MS)
