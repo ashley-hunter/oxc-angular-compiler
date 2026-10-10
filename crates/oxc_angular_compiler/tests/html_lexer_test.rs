@@ -3020,3 +3020,69 @@ mod regular_text {
         );
     }
 }
+
+// ============================================================================
+// Raw-text Closing Tag Tests
+// ============================================================================
+
+mod raw_text_close {
+    use super::*;
+
+    /// Upstream `_consumeRawTextWithTagClose` matches the close with
+    /// `_attemptStrCaseInsensitive(parts[1])`, the local name — `</script>`
+    /// closes `<svg:script>`, and the close token keeps the opener's
+    /// `[prefix, name]` parts (`_endToken(openToken.parts)`).
+    #[test]
+    fn raw_text_close_uses_opening_tag_parts() {
+        let result = tokenize_and_humanize_parts("<svg:script>let x;</script>");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::TagOpenStart, vec!["svg".to_string(), "script".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::RawText, vec!["let x;".to_string()]),
+                (HtmlTokenType::TagClose, vec!["svg".to_string(), "script".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_text_close_is_case_insensitive() {
+        let result = tokenize_and_humanize_parts("<STYLE>a</style>");
+        assert_eq!(
+            result,
+            vec![
+                (HtmlTokenType::TagOpenStart, vec![String::new(), "STYLE".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::RawText, vec!["a".to_string()]),
+                (HtmlTokenType::TagClose, vec![String::new(), "STYLE".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    /// The component raw-text close is matched case-insensitively too
+    /// (`_consumeRawTextWithTagClose` is shared between elements and
+    /// selectorless components).
+    #[test]
+    fn component_raw_text_close_is_case_insensitive() {
+        let result = tokenize_selectorless_and_humanize_parts("<MyComp:style>a</MYCOMP:STYLE>");
+        assert_eq!(
+            result,
+            vec![
+                (
+                    HtmlTokenType::ComponentOpenStart,
+                    vec!["MyComp".to_string(), String::new(), "style".to_string()]
+                ),
+                (HtmlTokenType::ComponentOpenEnd, vec![]),
+                (HtmlTokenType::RawText, vec!["a".to_string()]),
+                (
+                    HtmlTokenType::ComponentClose,
+                    vec!["MyComp".to_string(), String::new(), "style".to_string()]
+                ),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+}

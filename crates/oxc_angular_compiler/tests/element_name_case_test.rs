@@ -262,3 +262,135 @@ fn selectorless_component_node_is_reported() {
     let emitted = JsEmitter::new().emit_statements(&result.template_fn.statements);
     assert!(emitted.contains(r#"i0.ɵɵelementStart(0,"p")"#), "{emitted}");
 }
+
+/// A template stylesheet `<link>` compiles its resolvable URL into the
+/// component's styles and disappears from the emitted template, like the
+/// preparser classifying it STYLESHEET and the transform returning `null`.
+/// Attribute names are matched case-insensitively and in any order, because
+/// `preparseElement` lowercases them.
+#[test]
+fn capitalised_stylesheet_links() {
+    use std::collections::HashMap;
+
+    use oxc_angular_compiler::ResolvedResources;
+
+    let cases = [
+        // Uppercase tag and attributes, `HREF` before `REL`.
+        "<LINK HREF=\"./theme.css\" REL=\"stylesheet\" />",
+        // Mixed case tag, lowercase attributes.
+        "<Link rel=\"stylesheet\" href=\"./theme.css\">",
+    ];
+    for template in cases {
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ selector: 'x', template: `{template}` }})\n\
+             export class X {{}}"
+        );
+        let allocator = Allocator::default();
+        let mut styles = HashMap::new();
+        styles.insert("./theme.css".to_string(), vec![".link-style{color:red}".to_string()]);
+        let resources = ResolvedResources { styles, ..Default::default() };
+        let result = transform_angular_file(
+            &allocator,
+            "/x/a.ts",
+            &source,
+            Some(&TransformOptions::default()),
+            Some(&resources),
+        );
+        assert!(result.diagnostics.is_empty(), "`{template}`: {:?}", result.diagnostics);
+        // The collected stylesheet joins the component's styles…
+        assert!(
+            result.code.contains("link-style"),
+            "`{template}` should compile the linked stylesheet:\n{}",
+            result.code
+        );
+        // …and the link element is dropped from the template.
+        let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !compact.contains("LINK") || !compact.contains("ɵɵelement"),
+            "`{template}` should not emit a link element:\n{compact}"
+        );
+    }
+}
+
+/// A resolvable stylesheet `<link>` missing from the provided resources is a
+/// COMPONENT_RESOURCE_NOT_FOUND diagnostic like a missing `styleUrl`.
+#[test]
+fn missing_stylesheet_link_is_a_resource_error() {
+    use std::collections::HashMap;
+
+    use oxc_angular_compiler::ResolvedResources;
+
+    let source = "import { Component } from '@angular/core';\n\
+                  @Component({ selector: 'x', template: `<LINK rel=\"stylesheet\" href=\"./theme.css\">` })\n\
+                  export class X {}";
+    let allocator = Allocator::default();
+    let resources = ResolvedResources { styles: HashMap::new(), ..Default::default() };
+    let result = transform_angular_file(
+        &allocator,
+        "/x/a.ts",
+        source,
+        Some(&TransformOptions::default()),
+        Some(&resources),
+    );
+    let messages: Vec<String> = result.diagnostics.iter().map(|d| d.message.to_string()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("style URL './theme.css' could not be resolved")),
+        "{messages:?}"
+    );
+}
+
+/// Inside `ngNonBindable` a stylesheet `<link>` is still dropped
+/// (`NonBindableVisitor` checks `type === STYLESHEET`), but its URL is not
+/// recorded — and an unresolvable or missing href does not save it, because
+/// `isStyleUrlResolvable` is not consulted there. Outside `ngNonBindable` an
+/// unresolvable stylesheet link stays an ordinary element.
+#[test]
+fn stylesheet_links_inside_ng_non_bindable() {
+    let non_bindable_div = r#"i0.ɵɵelementStart(0,"div");i0.ɵɵdisableBindings();i0.ɵɵtext(1,"a");i0.ɵɵenableBindings();"#;
+    assert_compiles_to(
+        r#"<div ngNonBindable><Link rel="stylesheet" href="./theme.css">a</div>"#,
+        &[non_bindable_div],
+    );
+    assert_compiles_to(
+        r#"<div ngNonBindable><LINK REL="stylesheet" HREF="https://x/t.css">a</div>"#,
+        &[non_bindable_div],
+    );
+    assert_compiles_to(r#"<div ngNonBindable><link rel="stylesheet">a</div>"#, &[non_bindable_div]);
+    // Outside ngNonBindable an unresolvable stylesheet link stays an element,
+    // and so does a link without `rel="stylesheet"`.
+    assert_compiles_to(
+        r#"<link rel="stylesheet" href="https://x/t.css">"#,
+        &[r#"i0.ɵɵelement(0,"link",0)"#],
+    );
+    assert_compiles_to(
+        r#"<link rel="icon" href="./favicon.ico">"#,
+        &[r#"i0.ɵɵelement(0,"link",0)"#],
+    );
+}
+
+/// `isNgContent` reads the namespace-stripped local name lowercased, so both
+/// a namespaced `<svg:ng-content>` and a capitalised `<NG-CONTENT>` project
+/// content, and its `select` attribute is matched case-insensitively.
+#[test]
+fn namespaced_and_capitalised_ng_content() {
+    assert_compiles_to(
+        "<svg:ng-content SELECT=\"[a]\"></svg:ng-content><NG-CONTENT />",
+        &[
+            "ngContentSelectors:_c1,",
+            "i0.ɵɵprojectionDef(_c0);i0.ɵɵprojection(0);i0.ɵɵprojection(1,1);",
+        ],
+    );
+}
+
+/// `isNgTemplate` reads the namespace-stripped local name as written, so a
+/// namespaced `<svg:ng-template>` is a template while a capitalised
+/// `<NG-TEMPLATE>` is an ordinary element.
+#[test]
+fn namespaced_ng_template_vs_capitalised() {
+    assert_compiles_to("<svg:ng-template><p>x</p></svg:ng-template>", &["decls:"]);
+    assert_compiles_to(
+        "<NG-TEMPLATE>a</NG-TEMPLATE>",
+        &[r#"i0.ɵɵelementStart(0,"NG-TEMPLATE");i0.ɵɵtext(1,"a")"#],
+    );
+}
