@@ -866,6 +866,9 @@ impl Identifiers {
     /// Store a let value.
     pub const STORE_LET: &'static str = "ɵɵstoreLet";
 
+    /// Instantiate a hoisted arrow function.
+    pub const ARROW_FUNCTION: &'static str = "ɵɵarrowFunction";
+
     /// Read a context let.
     pub const READ_CONTEXT_LET: &'static str = "ɵɵreadContextLet";
 

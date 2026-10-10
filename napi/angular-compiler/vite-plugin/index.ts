@@ -828,8 +828,18 @@ export function angular(options: PluginOptions = {}): Plugin[] {
 
                 const result = compileForHmrSync(templateContent, className, resolvedId, styles, {
                   angularVersion: pluginOptions.angularVersion,
+                  encapsulation: classMetadata.encapsulation,
                   minifyComponentStyles: getMinifyComponentStyles(),
                 })
+
+                // A failed compile must not be served as an (empty) update
+                // module — that would call `ɵɵreplaceMetadata` with no
+                // callback and throw inside the listener. Fall back to the
+                // `angular:invalidate` full-reload path in the catch below.
+                const hmrErrors = result.errors.filter((e) => e.severity === 'Error')
+                if (hmrErrors.length > 0) {
+                  throw new Error(hmrErrors.map((e) => e.message).join('\n'))
+                }
 
                 // Only consume the pending slot once we have real content to
                 // serve. If we deleted unconditionally and the file was

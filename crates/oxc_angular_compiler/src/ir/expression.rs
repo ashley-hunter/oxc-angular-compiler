@@ -191,6 +191,12 @@ pub enum IrExpression<'a> {
     /// Used when a template literal like `\`bwi ${menuItem.icon}\`` has expressions
     /// that need to be resolved to variables in scope.
     ResolvedTemplateLiteral(Box<'a, ResolvedTemplateLiteralExpr<'a>>),
+    /// Tagged template literal (tag`...`) with IR tag and template expressions.
+    /// Used to preserve pipes and arrow functions inside tagged templates during ingest.
+    TaggedTemplateLiteral(Box<'a, IrTaggedTemplateLiteralExpr<'a>>),
+    /// Spread element (...expr) with an IR inner expression.
+    /// Used to preserve pipes and arrow functions inside spread positions during ingest.
+    SpreadElement(Box<'a, IrSpreadElementExpr<'a>>),
     /// Arrow function expression.
     /// Created by the generateArrowFunctions phase to wrap user-defined arrow functions.
     ArrowFunction(Box<'a, ArrowFunctionExpr<'a>>),
@@ -267,6 +273,10 @@ impl<'a> IrExpression<'a> {
             IrExpression::Void(_) => ExpressionKind::Void,
             // ResolvedTemplateLiteral is a template literal with resolved expressions
             IrExpression::ResolvedTemplateLiteral(_) => ExpressionKind::ResolvedTemplateLiteral,
+            // TaggedTemplateLiteral is a tagged template literal with IR sub-expressions
+            IrExpression::TaggedTemplateLiteral(_) => ExpressionKind::TaggedTemplateLiteral,
+            // SpreadElement is a spread element with an IR inner expression
+            IrExpression::SpreadElement(_) => ExpressionKind::SpreadElement,
             // ArrowFunction is an arrow function expression
             IrExpression::ArrowFunction(_) => ExpressionKind::ArrowFunction,
             IrExpression::Parenthesized(_) => ExpressionKind::Parenthesized,
@@ -775,11 +785,41 @@ impl<'a> IrExpression<'a> {
                     ResolvedTemplateLiteralExpr {
                         elements,
                         expressions,
+                        tagged: e.tagged,
                         source_span: e.source_span,
                     },
                     &allocator,
                 ))
             }
+            IrExpression::TaggedTemplateLiteral(e) => {
+                let mut elements = Vec::with_capacity_in(e.elements.len(), &allocator);
+                for elem in e.elements.iter() {
+                    elements.push(IrTemplateLiteralElement {
+                        text: elem.text.clone(),
+                        source_span: elem.source_span,
+                    });
+                }
+                let mut expressions = Vec::with_capacity_in(e.expressions.len(), &allocator);
+                for expr in e.expressions.iter() {
+                    expressions.push(expr.clone_in(allocator));
+                }
+                IrExpression::TaggedTemplateLiteral(Box::new_in(
+                    IrTaggedTemplateLiteralExpr {
+                        tag: Box::new_in(e.tag.clone_in(allocator), &allocator),
+                        elements,
+                        expressions,
+                        source_span: e.source_span,
+                    },
+                    &allocator,
+                ))
+            }
+            IrExpression::SpreadElement(e) => IrExpression::SpreadElement(Box::new_in(
+                IrSpreadElementExpr {
+                    expr: Box::new_in(e.expr.clone_in(allocator), &allocator),
+                    source_span: e.source_span,
+                },
+                &allocator,
+            )),
             IrExpression::ArrowFunction(e) => {
                 let mut params = Vec::with_capacity_in(e.params.len(), &allocator);
                 for param in e.params.iter() {
@@ -789,9 +829,9 @@ impl<'a> IrExpression<'a> {
                     ArrowFunctionExpr {
                         params,
                         body: Box::new_in(e.body.clone_in(allocator), &allocator),
-                        // ops are not cloned as they are transient data added during compilation
-                        ops: Vec::new_in(&allocator),
+                        ops: clone_arrow_function_ops(&e.ops, allocator),
                         var_offset: e.var_offset,
+                        hoisted: e.hoisted,
                         source_span: e.source_span,
                     },
                     &allocator,
@@ -1059,7 +1099,13 @@ pub struct ResolvedTemplateLiteralExpr<'a> {
     /// Template literal text elements (the static parts between expressions).
     pub elements: Vec<'a, IrTemplateLiteralElement<'a>>,
     /// Resolved expressions (the dynamic parts inside ${...}).
+    ///
+    /// For a tagged template the tag comes first, ahead of the `${...}` parts, so that
+    /// every phase resolves and rewrites it along with them.
     pub expressions: Vec<'a, IrExpression<'a>>,
+    /// Whether this is a tagged template (`` tag`...` ``), with the tag stored as the
+    /// first entry of `expressions`.
+    pub tagged: bool,
     /// Source span.
     pub source_span: Option<Span>,
 }
@@ -1069,6 +1115,34 @@ pub struct ResolvedTemplateLiteralExpr<'a> {
 pub struct IrTemplateLiteralElement<'a> {
     /// The text content.
     pub text: Ident<'a>,
+    /// Source span.
+    pub source_span: Option<Span>,
+}
+
+/// Tagged template literal (tag`...`) with IR sub-expressions.
+///
+/// Used during ingest to preserve pipes and arrow functions inside the tag and
+/// the template's interpolated expressions.
+#[derive(Debug)]
+pub struct IrTaggedTemplateLiteralExpr<'a> {
+    /// The tag function expression.
+    pub tag: Box<'a, IrExpression<'a>>,
+    /// Template literal text elements (the static parts between expressions).
+    pub elements: Vec<'a, IrTemplateLiteralElement<'a>>,
+    /// The dynamic parts inside ${...}.
+    pub expressions: Vec<'a, IrExpression<'a>>,
+    /// Source span.
+    pub source_span: Option<Span>,
+}
+
+/// Spread element (...expr) with an IR inner expression.
+///
+/// Used during ingest to preserve pipes and arrow functions inside spread
+/// positions (e.g. call arguments).
+#[derive(Debug)]
+pub struct IrSpreadElementExpr<'a> {
+    /// The expression being spread.
+    pub expr: Box<'a, IrExpression<'a>>,
     /// Source span.
     pub source_span: Option<Span>,
 }
@@ -1487,6 +1561,10 @@ pub enum IrUnaryOperator {
     Plus,
     /// Unary minus (-)
     Minus,
+    /// Spread (`...expr`), which only appears as a call argument. It is modelled as a
+    /// unary operator so that every phase resolves and rewrites its operand like any
+    /// other expression.
+    Spread,
 }
 
 /// Logical NOT expression (!expr).
@@ -1537,13 +1615,14 @@ pub struct VoidExpr<'a> {
 
 /// Arrow function expression.
 ///
-/// Created by the generateArrowFunctions phase to wrap user-defined arrow functions
-/// found in template expressions. Arrow functions in event listeners are preserved
-/// in place (not wrapped) because they need to access $event.
+/// Created during ingestion for every arrow function the user wrote. The
+/// generateArrowFunctions phase then marks the ones to hoist (see `hoisted`); arrow
+/// functions in event listeners stay in place because they need to access $event.
 ///
-/// The `ops` list is used to store Variable ops that are prepended by the
-/// generate_variables phase. These ops are processed during the naming phase
-/// to ensure variables are named in the correct order.
+/// For a hoisted arrow function, `ops` holds the Variable ops prepended by the
+/// generate_variables phase and `body` is its return value. Angular keeps the return
+/// statement in the op list too; here it is separate, as a listener's
+/// `handler_expression` is.
 ///
 /// Ported from Angular's `ir.ArrowFunctionExpr` in `expression.ts`.
 #[derive(Debug)]
@@ -1552,15 +1631,74 @@ pub struct ArrowFunctionExpr<'a> {
     pub params: Vec<'a, crate::output::ast::FnParam<'a>>,
     /// Function body expression.
     pub body: Box<'a, IrExpression<'a>>,
-    /// Operations list for this arrow function.
+    /// Operations list for this arrow function, used only when it is hoisted.
     /// Initially empty, populated by generate_variables phase with Variable ops.
     /// These ops are processed by the naming phase before create/update ops.
     pub ops: Vec<'a, crate::ir::ops::UpdateOp<'a>>,
     /// Variable offset for change detection slot indexing.
     /// Assigned by the var_counting phase.
     pub var_offset: Option<u32>,
+    /// Whether the generateArrowFunctions phase hoisted this arrow function. A hoisted
+    /// arrow is emitted as a shared factory instantiated through `ɵɵarrowFunction`;
+    /// the others (in listeners, or nested in another arrow) are emitted in place.
+    pub hoisted: bool,
     /// Source span.
     pub source_span: Option<Span>,
+}
+
+impl<'a> ArrowFunctionExpr<'a> {
+    /// Lends the ops and the body in the shape the phases use for listener handlers
+    /// (`handler_ops` plus an optional `handler_expression`), so a hoisted arrow function
+    /// is processed by the same code as a listener.
+    pub fn with_handler<R>(
+        &mut self,
+        allocator: &'a oxc_allocator::Allocator,
+        f: impl FnOnce(
+            &mut Vec<'a, crate::ir::ops::UpdateOp<'a>>,
+            &mut Option<Box<'a, IrExpression<'a>>>,
+        ) -> R,
+    ) -> R {
+        let placeholder = Box::new_in(
+            IrExpression::Empty(Box::new_in(EmptyExpr { source_span: None }, &allocator)),
+            &allocator,
+        );
+        let mut body = Some(std::mem::replace(&mut self.body, placeholder));
+        let result = f(&mut self.ops, &mut body);
+        if let Some(body) = body {
+            self.body = body;
+        }
+        result
+    }
+}
+
+/// Clones the ops of an arrow function: the variables prepended to it and the statements
+/// the variable optimizer turns some of them into.
+pub fn clone_arrow_function_ops<'a>(
+    ops: &Vec<'a, crate::ir::ops::UpdateOp<'a>>,
+    allocator: &'a oxc_allocator::Allocator,
+) -> Vec<'a, crate::ir::ops::UpdateOp<'a>> {
+    use crate::ir::ops::{StatementOp, UpdateOp, UpdateVariableOp};
+    let mut cloned = Vec::with_capacity_in(ops.len(), &allocator);
+    for op in ops {
+        match op {
+            UpdateOp::Variable(var) => cloned.push(UpdateOp::Variable(UpdateVariableOp {
+                base: Default::default(),
+                xref: var.xref,
+                kind: var.kind,
+                name: var.name,
+                initializer: Box::new_in(var.initializer.clone_in(allocator), &allocator),
+                flags: var.flags,
+                view: var.view,
+                local: var.local,
+            })),
+            UpdateOp::Statement(stmt) => cloned.push(UpdateOp::Statement(StatementOp {
+                base: Default::default(),
+                statement: crate::output::ast::clone_output_statement(&stmt.statement, allocator),
+            })),
+            _ => {}
+        }
+    }
+    cloned
 }
 
 // ============================================================================
@@ -1714,11 +1852,29 @@ pub fn transform_expressions_in_expression<'a, F>(
                 transform_expressions_in_expression(expr, transform, flags);
             }
         }
+        IrExpression::TaggedTemplateLiteral(e) => {
+            transform_expressions_in_expression(&mut e.tag, transform, flags);
+            for expr in e.expressions.iter_mut() {
+                transform_expressions_in_expression(expr, transform, flags);
+            }
+        }
+        IrExpression::SpreadElement(e) => {
+            transform_expressions_in_expression(&mut e.expr, transform, flags);
+        }
         IrExpression::ArrowFunction(e) => {
-            // Transform body with InChildOperation and InArrowFunctionOperation flags set
-            let child_flags = flags
-                .union(VisitorContextFlag::IN_CHILD_OPERATION)
-                .union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            // Mirror ir.ArrowFunctionExpr.transformInternalExpressions: ops are
+            // transformed as child operations inside an arrow function. The
+            // InArrowFunctionOperation flag only applies to top-level (collected)
+            // arrows; arrows preserved in place inside child operations (listener
+            // handlers, nested arrows) get only InChildOperation, matching the
+            // o.ArrowFunctionExpr branch of transformExpressionsInExpression.
+            let mut child_flags = flags.union(VisitorContextFlag::IN_CHILD_OPERATION);
+            if !flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                child_flags = child_flags.union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            }
+            for op in e.ops.iter_mut() {
+                transform_expressions_in_update_op(op, transform, child_flags);
+            }
             transform_expressions_in_expression(&mut e.body, transform, child_flags);
         }
         IrExpression::Parenthesized(e) => {
@@ -1901,11 +2057,25 @@ pub fn visit_expressions_in_expression<'a, F>(
                 visit_expressions_in_expression(expr, visitor, flags);
             }
         }
+        IrExpression::TaggedTemplateLiteral(e) => {
+            visit_expressions_in_expression(&e.tag, visitor, flags);
+            for expr in e.expressions.iter() {
+                visit_expressions_in_expression(expr, visitor, flags);
+            }
+        }
+        IrExpression::SpreadElement(e) => {
+            visit_expressions_in_expression(&e.expr, visitor, flags);
+        }
         IrExpression::ArrowFunction(e) => {
-            // Visit body with InChildOperation and InArrowFunctionOperation flags set
-            let child_flags = flags
-                .union(VisitorContextFlag::IN_CHILD_OPERATION)
-                .union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            // See transform_expressions_in_expression for the flag rationale:
+            // InArrowFunctionOperation applies only to top-level (collected) arrows.
+            let mut child_flags = flags.union(VisitorContextFlag::IN_CHILD_OPERATION);
+            if !flags.contains(VisitorContextFlag::IN_CHILD_OPERATION) {
+                child_flags = child_flags.union(VisitorContextFlag::IN_ARROW_FUNCTION_OPERATION);
+            }
+            for op in e.ops.iter() {
+                visit_expressions_in_update_op(op, visitor, child_flags);
+            }
             visit_expressions_in_expression(&e.body, visitor, child_flags);
         }
         IrExpression::Parenthesized(e) => {
@@ -2294,8 +2464,12 @@ pub fn transform_expressions_in_create_op<'a, F>(
         | CreateOp::I18nAttributes(_)
         | CreateOp::SourceLocation(_)
         | CreateOp::ConditionalBranch(_)
-        | CreateOp::ControlCreate(_)
-        | CreateOp::Statement(_) => {}
+        | CreateOp::ControlCreate(_) => {}
+        CreateOp::Statement(op) => {
+            // Statement ops may contain WrappedIrNode which wraps IR expressions,
+            // same as UpdateOp::Statement.
+            transform_expressions_in_output_statement(&mut op.statement, transform, flags);
+        }
     }
 }
 
@@ -2375,11 +2549,165 @@ pub fn visit_expressions_in_update_op<'a, F>(
         UpdateOp::DeferWhen(op) => {
             visit_expressions_in_expression(&op.condition, visitor, flags);
         }
+        UpdateOp::Statement(op) => {
+            // Statement ops may contain WrappedIrNode which wraps IR expressions;
+            // transform_expressions_in_update_op covers them, and upstream's
+            // visitExpressionsInOp shares that same implementation. Mirror the
+            // transform here so read-only consumers see the same expressions.
+            visit_expressions_in_output_statement(&op.statement, visitor, flags);
+        }
         // Operations without expressions
-        UpdateOp::ListEnd(_)
-        | UpdateOp::Advance(_)
-        | UpdateOp::I18nApply(_)
-        | UpdateOp::Statement(_) => {}
+        UpdateOp::ListEnd(_) | UpdateOp::Advance(_) | UpdateOp::I18nApply(_) => {}
+    }
+}
+
+/// Visit all expressions inside an OutputStatement (read-only).
+/// This handles WrappedIrNode expressions that contain IR expressions.
+fn visit_expressions_in_output_statement<'a, F>(
+    stmt: &crate::output::ast::OutputStatement<'a>,
+    visitor: &F,
+    flags: VisitorContextFlag,
+) where
+    F: Fn(&IrExpression<'a>, VisitorContextFlag),
+{
+    use crate::output::ast::OutputStatement;
+
+    match stmt {
+        OutputStatement::Expression(expr_stmt) => {
+            visit_expressions_in_output_expression(&expr_stmt.expr, visitor, flags);
+        }
+        OutputStatement::Return(ret_stmt) => {
+            visit_expressions_in_output_expression(&ret_stmt.value, visitor, flags);
+        }
+        OutputStatement::DeclareVar(decl) => {
+            if let Some(ref value) = decl.value {
+                visit_expressions_in_output_expression(value, visitor, flags);
+            }
+        }
+        OutputStatement::If(if_stmt) => {
+            visit_expressions_in_output_expression(&if_stmt.condition, visitor, flags);
+            for stmt in if_stmt.true_case.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+            for stmt in if_stmt.false_case.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+        }
+        OutputStatement::DeclareFunction(_) => {
+            // Function declarations don't contain IrExpressions to visit
+        }
+    }
+}
+
+/// Visit all expressions inside an OutputExpression (read-only).
+/// This handles WrappedIrNode which contains IR expressions.
+fn visit_expressions_in_output_expression<'a, F>(
+    expr: &crate::output::ast::OutputExpression<'a>,
+    visitor: &F,
+    flags: VisitorContextFlag,
+) where
+    F: Fn(&IrExpression<'a>, VisitorContextFlag),
+{
+    use crate::output::ast::OutputExpression;
+
+    match expr {
+        OutputExpression::WrappedIrNode(wrapped) => {
+            visit_expressions_in_expression(&wrapped.node, visitor, flags);
+        }
+        OutputExpression::Conditional(cond) => {
+            visit_expressions_in_output_expression(&cond.condition, visitor, flags);
+            visit_expressions_in_output_expression(&cond.true_case, visitor, flags);
+            if let Some(false_case) = &cond.false_case {
+                visit_expressions_in_output_expression(false_case, visitor, flags);
+            }
+        }
+        OutputExpression::BinaryOperator(bin) => {
+            visit_expressions_in_output_expression(&bin.lhs, visitor, flags);
+            visit_expressions_in_output_expression(&bin.rhs, visitor, flags);
+        }
+        OutputExpression::UnaryOperator(un) => {
+            visit_expressions_in_output_expression(&un.expr, visitor, flags);
+        }
+        OutputExpression::Not(not) => {
+            visit_expressions_in_output_expression(&not.condition, visitor, flags);
+        }
+        OutputExpression::ReadProp(member) => {
+            visit_expressions_in_output_expression(&member.receiver, visitor, flags);
+        }
+        OutputExpression::ReadKey(idx) => {
+            visit_expressions_in_output_expression(&idx.receiver, visitor, flags);
+            visit_expressions_in_output_expression(&idx.index, visitor, flags);
+        }
+        OutputExpression::TaggedTemplateLiteral(tagged) => {
+            visit_expressions_in_output_expression(&tagged.tag, visitor, flags);
+            for expr in tagged.template.expressions.iter() {
+                visit_expressions_in_output_expression(expr, visitor, flags);
+            }
+        }
+        OutputExpression::ArrowFunction(arrow) => match &arrow.body {
+            crate::output::ast::ArrowFunctionBody::Expression(expr) => {
+                visit_expressions_in_output_expression(expr, visitor, flags);
+            }
+            crate::output::ast::ArrowFunctionBody::Statements(stmts) => {
+                for stmt in stmts.iter() {
+                    visit_expressions_in_output_statement(stmt, visitor, flags);
+                }
+            }
+        },
+        OutputExpression::LiteralArray(arr) => {
+            for elem in arr.entries.iter() {
+                visit_expressions_in_output_expression(elem, visitor, flags);
+            }
+        }
+        OutputExpression::LiteralMap(obj) => {
+            for entry in obj.entries.iter() {
+                visit_expressions_in_output_expression(&entry.value, visitor, flags);
+            }
+        }
+        OutputExpression::InvokeFunction(inv) => {
+            visit_expressions_in_output_expression(&inv.fn_expr, visitor, flags);
+            for arg in inv.args.iter() {
+                visit_expressions_in_output_expression(arg, visitor, flags);
+            }
+        }
+        OutputExpression::Function(func) => {
+            for stmt in func.statements.iter() {
+                visit_expressions_in_output_statement(stmt, visitor, flags);
+            }
+        }
+        OutputExpression::Instantiate(inst) => {
+            visit_expressions_in_output_expression(&inst.class_expr, visitor, flags);
+            for arg in inst.args.iter() {
+                visit_expressions_in_output_expression(arg, visitor, flags);
+            }
+        }
+        OutputExpression::Parenthesized(paren) => {
+            visit_expressions_in_output_expression(&paren.expr, visitor, flags);
+        }
+        OutputExpression::Comma(comma) => {
+            for part in comma.parts.iter() {
+                visit_expressions_in_output_expression(part, visitor, flags);
+            }
+        }
+        OutputExpression::Typeof(typeof_expr) => {
+            visit_expressions_in_output_expression(&typeof_expr.expr, visitor, flags);
+        }
+        OutputExpression::Void(void_expr) => {
+            visit_expressions_in_output_expression(&void_expr.expr, visitor, flags);
+        }
+        OutputExpression::SpreadElement(spread) => {
+            visit_expressions_in_output_expression(&spread.expr, visitor, flags);
+        }
+        // Leaf expressions without sub-expressions
+        OutputExpression::Literal(_)
+        | OutputExpression::TemplateLiteral(_)
+        | OutputExpression::RegularExpressionLiteral(_)
+        | OutputExpression::ReadVar(_)
+        | OutputExpression::External(_)
+        | OutputExpression::LocalizedString(_)
+        | OutputExpression::WrappedNode(_)
+        | OutputExpression::DynamicImport(_)
+        | OutputExpression::RawSource(_) => {}
     }
 }
 
@@ -2483,8 +2811,11 @@ pub fn visit_expressions_in_create_op<'a, F>(
         | CreateOp::I18nAttributes(_)
         | CreateOp::SourceLocation(_)
         | CreateOp::ConditionalBranch(_)
-        | CreateOp::ControlCreate(_)
-        | CreateOp::Statement(_) => {}
+        | CreateOp::ControlCreate(_) => {}
+        CreateOp::Statement(op) => {
+            // Same as UpdateOp::Statement: statements may wrap IR expressions.
+            visit_expressions_in_output_statement(&op.statement, visitor, flags);
+        }
     }
 }
 
@@ -3002,6 +3333,15 @@ pub fn vars_used_by_ir_expression(expr: &IrExpression<'_>) -> u32 {
         IrExpression::ResolvedTemplateLiteral(rtl) => {
             rtl.expressions.iter().map(vars_used_by_ir_expression).sum()
         }
+
+        // TaggedTemplateLiteral: vars used by tag and template expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            vars_used_by_ir_expression(&ttl.tag)
+                + ttl.expressions.iter().map(vars_used_by_ir_expression).sum::<u32>()
+        }
+
+        // SpreadElement: vars used by the inner expression
+        IrExpression::SpreadElement(spread) => vars_used_by_ir_expression(&spread.expr),
 
         // All other expressions don't directly consume variable slots
         IrExpression::LexicalRead(_)

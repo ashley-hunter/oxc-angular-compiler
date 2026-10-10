@@ -229,6 +229,15 @@ fn collect_fences(expr: &IrExpression<'_>) -> Fence {
                 fences |= collect_fences(e);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            fences |= collect_fences(&ttl.tag);
+            for e in ttl.expressions.iter() {
+                fences |= collect_fences(e);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            fences |= collect_fences(&spread.expr);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             fences |= collect_fences(&arrow_fn.body);
@@ -405,6 +414,7 @@ fn collect_create_op_fences(op: &CreateOp<'_>) -> Fence {
 /// yet, unused ReadVariable references in handler_ops inflate the usage counts of
 /// variables declared in create ops (e.g., SavedView), preventing their removal.
 pub fn optimize_variables(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     // Step 1: Inline AlwaysInline variables unconditionally
     // Per TypeScript's variable_optimization.ts lines 33-51
     inline_always_inline_variables(job);
@@ -1674,6 +1684,9 @@ fn optimize_arrow_function_ops<'a>(job: &mut ComponentCompilationJob<'a>) {
     let allocator = job.allocator;
     let mut local_diagnostics = Vec::new();
 
+    // The inlining steps above rebuild expressions, so find the arrow functions again.
+    super::generate_arrow_functions::collect_arrow_functions(job);
+
     // Collect view xrefs
     let view_xrefs: Vec<XrefId> =
         std::iter::once(job.root.xref).chain(job.views.keys().copied()).collect();
@@ -1694,12 +1707,21 @@ fn optimize_arrow_function_ops<'a>(job: &mut ComponentCompilationJob<'a>) {
             // allocated in the allocator and stored in the view's functions vec.
             let func = unsafe { &mut **func_ptr };
 
-            // Step 1: Optimize variables in the arrow function's ops
-            // (No handler_expression for arrow functions)
-            optimize_handler_ops(&mut func.ops, None, &allocator, &mut local_diagnostics);
+            // The body plays the role a listener's handler_expression does.
+            func.with_handler(allocator, |ops, body| {
+                inline_always_inline_in_handler_ops_and_expr(ops, body.as_mut(), &allocator);
 
-            // Step 2: Apply save/restore view optimization
-            optimize_save_restore_view(&mut func.ops, &mut None, &allocator);
+                // Step 1: Optimize variables in the arrow function's ops
+                optimize_handler_ops(
+                    ops,
+                    body.as_ref().map(|e| e.as_ref()),
+                    &allocator,
+                    &mut local_diagnostics,
+                );
+
+                // Step 2: Apply save/restore view optimization
+                optimize_save_restore_view(ops, body, &allocator);
+            });
         }
     }
 
@@ -2690,6 +2712,15 @@ fn collect_variable_xrefs(expr: &IrExpression<'_>, xrefs: &mut Vec<XrefId>) {
             for e in rtl.expressions.iter() {
                 collect_variable_xrefs(e, xrefs);
             }
+        }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            collect_variable_xrefs(&ttl.tag, xrefs);
+            for e in ttl.expressions.iter() {
+                collect_variable_xrefs(e, xrefs);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            collect_variable_xrefs(&spread.expr, xrefs);
         }
 
         IrExpression::ArrowFunction(arrow_fn) => {
@@ -3745,7 +3776,49 @@ where
                 expressions.push(transform_expression(e, &allocator, transform));
             }
             IrExpression::ResolvedTemplateLiteral(OxcBox::new_in(
-                ResolvedTemplateLiteralExpr { elements, expressions, source_span: rtl.source_span },
+                ResolvedTemplateLiteralExpr {
+                    elements,
+                    expressions,
+                    tagged: rtl.tagged,
+                    source_span: rtl.source_span,
+                },
+                &allocator,
+            ))
+        }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            use crate::ir::expression::{IrTaggedTemplateLiteralExpr, IrTemplateLiteralElement};
+            let tag = transform_expression(&ttl.tag, &allocator, transform);
+            let mut elements = OxcVec::with_capacity_in(ttl.elements.len(), &allocator);
+            for elem in ttl.elements.iter() {
+                elements.push(IrTemplateLiteralElement {
+                    text: elem.text.clone(),
+                    source_span: elem.source_span,
+                });
+            }
+            let mut expressions = OxcVec::with_capacity_in(ttl.expressions.len(), &allocator);
+            for e in ttl.expressions.iter() {
+                expressions.push(transform_expression(e, &allocator, transform));
+            }
+            IrExpression::TaggedTemplateLiteral(OxcBox::new_in(
+                IrTaggedTemplateLiteralExpr {
+                    tag: OxcBox::new_in(tag, &allocator),
+                    elements,
+                    expressions,
+                    source_span: ttl.source_span,
+                },
+                &allocator,
+            ))
+        }
+        IrExpression::SpreadElement(spread) => {
+            use crate::ir::expression::IrSpreadElementExpr;
+            IrExpression::SpreadElement(OxcBox::new_in(
+                IrSpreadElementExpr {
+                    expr: OxcBox::new_in(
+                        transform_expression(&spread.expr, &allocator, transform),
+                        &allocator,
+                    ),
+                    source_span: spread.source_span,
+                },
                 &allocator,
             ))
         }
@@ -3765,9 +3838,9 @@ where
                 ArrowFunctionExpr {
                     params,
                     body: OxcBox::new_in(body, &allocator),
-                    // ops are not transformed as they are transient data
-                    ops: OxcVec::new_in(&allocator),
+                    ops: crate::ir::expression::clone_arrow_function_ops(&arrow_fn.ops, allocator),
                     var_offset: arrow_fn.var_offset,
+                    hoisted: arrow_fn.hoisted,
                     source_span: arrow_fn.source_span,
                 },
                 &allocator,

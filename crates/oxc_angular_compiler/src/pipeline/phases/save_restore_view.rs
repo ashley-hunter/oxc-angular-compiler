@@ -44,6 +44,7 @@ use crate::pipeline::compilation::ComponentCompilationJob;
 ///
 /// This order is critical for XrefId allocation which affects variable naming.
 pub fn save_and_restore_view(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
     let root_xref = job.root.xref;
 
@@ -211,10 +212,18 @@ fn process_arrow_functions_in_view(
             // Insert at the beginning of the arrow function's ops
             func.ops.insert(0, restore_var);
 
-            // Note: Arrow functions don't have return statements to wrap
-            // because they are single-expression functions in templates.
-            // The ResetView wrapping only applies to listener handlers
-            // which can have explicit return statements.
+            // The body is the arrow function's return value: reset the view around it.
+            func.with_handler(allocator, |_ops, body| {
+                if let Some(expr) = body.take() {
+                    *body = Some(Box::new_in(
+                        IrExpression::ResetView(Box::new_in(
+                            ResetViewExpr { expr, source_span: None },
+                            &allocator,
+                        )),
+                        &allocator,
+                    ));
+                }
+            });
         }
     }
 }
@@ -452,12 +461,13 @@ fn add_restore_view_to_listener<'a>(
     handler_ops.insert(0, restore_var);
 
     // Wrap handler_expression in ResetViewExpr (Angular's save_restore_view.ts lines 84-91)
-    // This resets the view context after the listener handler returns
+    // This resets the view context after the listener handler returns. The expression
+    // is moved in place (not cloned) so nodes referenced elsewhere, such as arrow
+    // functions tracked in view.functions, keep their identity.
     if let Some(expr) = handler_expression.take() {
-        let cloned_expr = expr.clone_in(allocator);
         *handler_expression = Some(Box::new_in(
             IrExpression::ResetView(Box::new_in(
-                ResetViewExpr { expr: Box::new_in(cloned_expr, &allocator), source_span: None },
+                ResetViewExpr { expr, source_span: None },
                 &allocator,
             )),
             &allocator,

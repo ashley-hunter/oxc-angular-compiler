@@ -251,6 +251,7 @@ fn make_semantic_key<'a>(
 /// - Parent: `ComponentName_Conditional_0`
 /// - Child: `ComponentName_Conditional_0_ng_container_1`
 pub fn name_functions_and_variables(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
     let component_name = job.component_name.as_str();
 
@@ -283,12 +284,14 @@ pub fn name_functions_and_variables(job: &mut ComponentCompilationJob<'_>) {
 
     // Second pass: Propagate variable names to ReadVariableExpr expressions
     propagate_variable_names_in_view(&mut job.root.create, &mut job.root.update, &var_names);
+    propagate_variable_names_in_functions(&job.root.functions, &var_names);
 
     // Process embedded views
     let view_xrefs: Vec<_> = job.views.keys().copied().collect();
     for xref in view_xrefs {
         if let Some(view) = job.view_mut(xref) {
             propagate_variable_names_in_view(&mut view.create, &mut view.update, &var_names);
+            propagate_variable_names_in_functions(&view.functions, &var_names);
         }
     }
 }
@@ -399,7 +402,7 @@ fn process_view_ops_depth_first<'a>(
     // Phase 0: Process function ops FIRST (matches TypeScript ops() generator order)
     // Arrow functions have their own ops lists that contain Variable ops prepended
     // by the generate_variables phase. These must be named before create/update ops.
-    process_function_ops_in_view(job, view_xref, &allocator, state, var_names);
+    process_function_ops_in_view(job, view_xref, &allocator, state, var_names, semantic_var_names);
 
     // Phase 1: Collect info about child views with their create op indices
     // We need to collect upfront to avoid borrow issues during iteration
@@ -948,7 +951,9 @@ fn process_function_ops_in_view<'a>(
     allocator: &'a oxc_allocator::Allocator,
     state: &mut NamingState,
     var_names: &mut FxHashMap<XrefId, Ident<'a>>,
+    semantic_var_names: &mut FxHashMap<SemanticVariableKey<'a>, Ident<'a>>,
 ) {
+    let own_view = view_xref.unwrap_or(job.root.xref);
     let functions = match view_xref {
         None => &job.root.functions,
         Some(xref) => {
@@ -975,16 +980,18 @@ fn process_function_ops_in_view<'a>(
         let mut arrow_fn_semantic_var_names: FxHashMap<SemanticVariableKey<'a>, Ident<'a>> =
             FxHashMap::default();
 
-        // Process Variable ops in this arrow function
+        // Process Variable ops in this arrow function. Only the scope of the arrow
+        // function's own view is fresh (`getScopeForView(view, parentScope)`); variables
+        // that come from parent scopes are the same objects the view's other op lists
+        // use, so they share a name with them.
         for op in func.ops.iter_mut() {
             if let UpdateOp::Variable(var_op) = op {
-                name_variable_op(
-                    var_op,
-                    &allocator,
-                    state,
-                    var_names,
-                    &mut arrow_fn_semantic_var_names,
-                );
+                let semantic_names = if var_op.view == Some(own_view) {
+                    &mut arrow_fn_semantic_var_names
+                } else {
+                    &mut *semantic_var_names
+                };
+                name_variable_op(var_op, &allocator, state, var_names, semantic_names);
             }
         }
     }
@@ -1122,6 +1129,28 @@ fn propagate_variable_names_in_view<'a>(
             },
             VisitorContextFlag::NONE,
         );
+    }
+}
+
+/// Propagates variable names into the ops of a view's hoisted arrow functions, which the
+/// expression visitors do not walk into.
+fn propagate_variable_names_in_functions<'a>(
+    functions: &oxc_allocator::Vec<'a, *mut crate::ir::expression::ArrowFunctionExpr<'a>>,
+    var_names: &FxHashMap<XrefId, Ident<'a>>,
+) {
+    for func_ptr in functions.iter() {
+        // SAFETY: These pointers are valid as they point to ArrowFunctionExpr
+        // allocated in the allocator and stored in the view's functions vec.
+        let func = unsafe { &mut **func_ptr };
+        for op in func.ops.iter_mut() {
+            transform_expressions_in_update_op(
+                op,
+                &|expr, _flags| {
+                    propagate_name_to_expression(expr, var_names);
+                },
+                VisitorContextFlag::NONE,
+            );
+        }
     }
 }
 

@@ -641,15 +641,30 @@ fn assign_var_offsets_in_expr(
                 assign_var_offsets_in_expr(e, var_count, pure_functions_only);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            assign_var_offsets_in_expr(&mut ttl.tag, var_count, pure_functions_only);
+            for e in ttl.expressions.iter_mut() {
+                assign_var_offsets_in_expr(e, var_count, pure_functions_only);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            assign_var_offsets_in_expr(&mut spread.expr, var_count, pure_functions_only);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
-            // Arrow functions consume a var slot and have their own var_offset
-            if !pure_functions_only {
+            // A hoisted arrow function consumes a var slot for `ɵɵarrowFunction`; one
+            // emitted in place does not. Var consumers inside the arrow's own ops
+            // and body are counted first — upstream's visitor transforms children
+            // before the node, so ngtsc numbers e.g. an inner pipe before the
+            // arrow's own offset (`pipeBind1(1,3, arrowFunction(2,...))`).
+            for op in arrow_fn.ops.iter_mut() {
+                assign_var_offsets_in_op(op, var_count, pure_functions_only);
+            }
+            assign_var_offsets_in_expr(&mut arrow_fn.body, var_count, pure_functions_only);
+            if arrow_fn.hoisted && !pure_functions_only {
                 arrow_fn.var_offset = Some(*var_count);
                 *var_count += 1;
             }
-            // Process the body expression
-            assign_var_offsets_in_expr(&mut arrow_fn.body, var_count, pure_functions_only);
         }
         IrExpression::Parenthesized(paren) => {
             assign_var_offsets_in_expr(&mut paren.expr, var_count, pure_functions_only);

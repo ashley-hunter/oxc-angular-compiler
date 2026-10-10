@@ -397,6 +397,15 @@ fn check_ir_expression_for_required_parens(
                 check_ir_expression_for_required_parens(e, required);
             }
         }
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            check_ir_expression_for_required_parens(&ttl.tag, required);
+            for e in ttl.expressions.iter() {
+                check_ir_expression_for_required_parens(e, required);
+            }
+        }
+        IrExpression::SpreadElement(spread) => {
+            check_ir_expression_for_required_parens(&spread.expr, required);
+        }
 
         IrExpression::ArrowFunction(arrow_fn) => {
             check_ir_expression_for_required_parens(&arrow_fn.body, required);
@@ -674,10 +683,12 @@ fn ir_is_unary(expr: &IrExpression<'_>) -> bool {
         // Look through nested parens: in `((-1)) ** 2` the outer wrapper is
         // the required one (the inner then strips to `(-1)`).
         IrExpression::Parenthesized(p) => ir_is_unary(&p.expr),
-        IrExpression::Unary(_)
-        | IrExpression::Not(_)
-        | IrExpression::Typeof(_)
-        | IrExpression::Void(_) => true,
+        IrExpression::Unary(u) => {
+            // IrUnaryOperator::Spread is only ever a call argument, never a
+            // `**` base — `(…x) ** 2` does not parse.
+            u.operator != crate::ir::expression::IrUnaryOperator::Spread
+        }
+        IrExpression::Not(_) | IrExpression::Typeof(_) | IrExpression::Void(_) => true,
         IrExpression::Ast(ast) => matches!(
             ast.as_ref(),
             AngularExpression::Unary(_)

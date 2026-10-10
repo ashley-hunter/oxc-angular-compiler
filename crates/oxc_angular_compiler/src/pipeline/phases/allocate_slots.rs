@@ -18,6 +18,7 @@ use crate::pipeline::compilation::ComponentCompilationJob;
 /// Slot indices are used by the Angular runtime to identify elements, templates,
 /// and other entities during change detection and rendering.
 pub fn allocate_slots(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     // Map of all declarations in all views within the component which require an assigned slot index.
     // This map is global across all views since it's possible to reference a slot from one view
     // in an expression within another (e.g., local references work this way).

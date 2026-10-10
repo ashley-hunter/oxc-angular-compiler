@@ -18,40 +18,52 @@ const DOLLAR_EVENT: &str = "$event";
 /// Resolves $event to the event parameter in handlers.
 ///
 /// This phase:
-/// 1. Finds all `LexicalReadExpr('$event')` in event handlers
+/// 1. Rewrites `LexicalReadExpr('$event')` in event handlers to an output
+///    `ReadVarExpr('$event')` so it bypasses name resolution, matching the
+///    TypeScript implementation.
 /// 2. Marks the listener as consuming $event
 ///
-/// Note: Unlike the TypeScript implementation, we don't need to transform
-/// the expression since LexicalRead will be converted to proper variable
-/// access in the reify phase.
+/// Expressions stored as raw AST (Ast/ExpressionRef) cannot be rewritten here;
+/// they are still emitted correctly by the reify phase's `$event` special-case.
 pub fn resolve_dollar_event(job: &mut ComponentCompilationJob<'_>) {
     // We need to borrow the expression store separately from the views
     // to avoid mutable borrow conflicts. We use a raw pointer to the store
     // since transform_dollar_event_create only needs read access to expressions.
     let expressions_ptr = &job.expressions as *const ExpressionStore<'_>;
+    let allocator = job.allocator;
 
     // Process each view's create ops (listeners are CreateOps)
     for view in job.all_views_mut() {
         // SAFETY: We only read from expressions, never modify it, and job.expressions
         // outlives this function call.
         let expressions = unsafe { &*expressions_ptr };
-        transform_dollar_event_create(&mut view.create, expressions);
+        transform_dollar_event_create(&mut view.create, expressions, allocator);
     }
 }
 
 /// Transform $event in create operations.
+///
+/// Listener handler ops are transformed as child operations, matching
+/// `transformExpressionsInOp`. Each `LexicalReadExpr('$event')` found is
+/// rewritten to an output `ReadVarExpr`, like Angular's resolveDollarEvent.
 fn transform_dollar_event_create<'a>(
     ops: &mut crate::ir::list::CreateOpList<'a>,
     expressions: &ExpressionStore<'a>,
+    allocator: &'a oxc_allocator::Allocator,
 ) {
     for op in ops.iter_mut() {
         match op {
             CreateOp::Listener(listener) => {
                 // Check handler expression for $event usage
-                if let Some(handler) = &listener.handler_expression {
+                if let Some(handler) = &mut listener.handler_expression {
                     if expression_contains_dollar_event(handler, expressions) {
                         listener.consumes_dollar_event = true;
                     }
+                    crate::ir::expression::transform_expressions_in_expression(
+                        handler,
+                        &|expr, _flags| replace_dollar_event(expr, allocator),
+                        VisitorContextFlag::IN_CHILD_OPERATION,
+                    );
                 }
 
                 // Check handler ops for $event usage
@@ -64,32 +76,29 @@ fn transform_dollar_event_create<'a>(
                                 found.set(true);
                             }
                         },
-                        VisitorContextFlag::NONE,
+                        VisitorContextFlag::IN_CHILD_OPERATION,
                     );
                     if found.get() {
                         listener.consumes_dollar_event = true;
-                        break;
                     }
+                }
+                // Rewrite $event reads in handler ops
+                for handler_op in listener.handler_ops.iter_mut() {
+                    transform_expressions_in_update_op(
+                        handler_op,
+                        &|expr, _flags| replace_dollar_event(expr, allocator),
+                        VisitorContextFlag::IN_CHILD_OPERATION,
+                    );
                 }
             }
             CreateOp::TwoWayListener(listener) => {
                 // Check handler ops for $event usage
                 for handler_op in listener.handler_ops.iter_mut() {
-                    let found = Cell::new(false);
                     transform_expressions_in_update_op(
                         handler_op,
-                        &|expr, _flags| {
-                            if expression_contains_dollar_event(expr, expressions) {
-                                found.set(true);
-                            }
-                        },
-                        VisitorContextFlag::NONE,
+                        &|expr, _flags| replace_dollar_event(expr, allocator),
+                        VisitorContextFlag::IN_CHILD_OPERATION,
                     );
-                    if found.get() {
-                        // TwoWayListener doesn't have consumes_dollar_event field
-                        // since it always implicitly consumes $event
-                        break;
-                    }
                 }
             }
             CreateOp::AnimationListener(listener) => {
@@ -103,15 +112,41 @@ fn transform_dollar_event_create<'a>(
                                 found.set(true);
                             }
                         },
-                        VisitorContextFlag::NONE,
+                        VisitorContextFlag::IN_CHILD_OPERATION,
                     );
                     if found.get() {
                         listener.consumes_dollar_event = true;
-                        break;
                     }
+                }
+                // Rewrite $event reads in handler ops
+                for handler_op in listener.handler_ops.iter_mut() {
+                    transform_expressions_in_update_op(
+                        handler_op,
+                        &|expr, _flags| replace_dollar_event(expr, allocator),
+                        VisitorContextFlag::IN_CHILD_OPERATION,
+                    );
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Rewrites `LexicalReadExpr('$event')` to an output `ReadVarExpr` so the read
+/// bypasses name resolution, like Angular's resolveDollarEvent.
+fn replace_dollar_event<'a>(expr: &mut IrExpression<'a>, allocator: &'a oxc_allocator::Allocator) {
+    if let IrExpression::LexicalRead(lexical) = expr {
+        if lexical.name.as_str() == DOLLAR_EVENT {
+            *expr = IrExpression::OutputExpr(oxc_allocator::Box::new_in(
+                crate::output::ast::OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+                    crate::output::ast::ReadVarExpr {
+                        name: lexical.name.clone(),
+                        source_span: lexical.source_span,
+                    },
+                    &allocator,
+                )),
+                &allocator,
+            ));
         }
     }
 }
@@ -262,6 +297,17 @@ fn expression_contains_dollar_event<'a>(
             rtl.expressions.iter().any(|e| expression_contains_dollar_event(e, expressions))
         }
 
+        // TaggedTemplateLiteral: check the tag and embedded expressions
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            expression_contains_dollar_event(&ttl.tag, expressions)
+                || ttl.expressions.iter().any(|e| expression_contains_dollar_event(e, expressions))
+        }
+
+        // SpreadElement: check the inner expression
+        IrExpression::SpreadElement(spread) => {
+            expression_contains_dollar_event(&spread.expr, expressions)
+        }
+
         // ArrowFunction: check the body expression
         IrExpression::ArrowFunction(arrow_fn) => {
             expression_contains_dollar_event(&arrow_fn.body, expressions)
@@ -397,5 +443,5 @@ pub fn resolve_dollar_event_for_host(job: &mut HostBindingCompilationJob<'_>) {
     let expressions = unsafe { &*expressions_ptr };
 
     // Process create ops for listeners
-    transform_dollar_event_create(&mut job.root.create, expressions);
+    transform_dollar_event_create(&mut job.root.create, expressions, job.allocator);
 }
