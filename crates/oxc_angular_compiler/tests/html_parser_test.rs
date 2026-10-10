@@ -974,6 +974,37 @@ mod incomplete_blocks {
         );
     }
 
+    // Quoted parameter delimiters
+
+    #[test]
+    fn a_backtick_quoted_paren_keeps_a_block_well_formed() {
+        // `chars.isQuote` includes the backtick, so a `)` inside a template
+        // literal doesn't close the parameter list.
+        check(
+            "@if (a === `)`) {x}",
+            &[],
+            &["Block \"if\" params=[\"a === `)`\"] [0,19]", "  Text \"x\" [17,18]"],
+        );
+    }
+
+    #[test]
+    fn a_backtick_quoted_semicolon_does_not_split_parameters() {
+        check(
+            "@if (`;`;b) {x}",
+            &[],
+            &["Block \"if\" params=[\"`;`\",\"b\"] [0,15]", "  Text \"x\" [13,14]"],
+        );
+    }
+
+    #[test]
+    fn unclosed_parameters_with_a_paren_inside_a_template_literal() {
+        check(
+            "@if (a === `)` {x}",
+            &[(incomplete("if"), 0, 18)],
+            &["Block \"if\" params=[\"a === `)` {x}\"] [0,18]"],
+        );
+    }
+
     #[test]
     fn unclosed_parameters_as_the_last_thing_in_the_template() {
         check(
@@ -2305,6 +2336,48 @@ mod expansion_forms {
         );
         // Note: The result may be empty because Humanizer doesn't visit Expansion nodes
         // but the parser should not panic
+    }
+
+    /// Angular parses each case body with a full `_TreeBuilder`, so block
+    /// tokens are real there: a bare `@if` inside a case is an incomplete
+    /// block and is reported, like anywhere else.
+    #[test]
+    fn should_report_an_incomplete_block_inside_an_expansion_case() {
+        let allocator = Allocator::default();
+        let result = HtmlParser::with_expansion_forms(
+            &allocator,
+            "{x, plural, =a {@if} =b {y}}",
+            "TestComp",
+        )
+        .parse();
+        assert_eq!(
+            result.errors.iter().map(|e| e.msg.as_str()).collect::<Vec<_>>(),
+            ["Incomplete block \"if\". If you meant to write the @ character, \
+              you should use the \"&#64;\" HTML entity instead."]
+        );
+    }
+
+    /// Well-formed blocks inside a case get real nodes; a block left open at
+    /// the case's `}` is unclosed, same as at EOF.
+    #[test]
+    fn should_parse_blocks_inside_an_expansion_case() {
+        let allocator = Allocator::default();
+        let result = HtmlParser::with_expansion_forms(
+            &allocator,
+            "{x, plural, =a {@if (cond) {y}} =b {z}}",
+            "TestComp",
+        )
+        .parse();
+        // The case's `}` lands inside the block, so the block is unclosed and
+        // the expansion's own `}` is consumed as the case terminator.
+        assert_eq!(
+            result.errors.iter().map(|e| e.msg.as_str()).collect::<Vec<_>>(),
+            [
+                "Unexpected character \"EOF\" (Do you have an unescaped \"{\" in your template? \
+                 Use \"{{ '{' }}\") to escape it.)",
+                "Unclosed block \"@if\"",
+            ]
+        );
     }
 }
 

@@ -150,10 +150,16 @@ impl<'a> HtmlParser<'a> {
         let result = lexer.tokenize();
         let source_file = Arc::new(ParseSourceFile::new(source.to_string(), url.to_string()));
 
-        // Convert lexer errors to ParseErrors
+        // Convert lexer errors to ParseErrors. `lex_err.position` is a
+        // (line, column) pair; the span needs the byte offset.
         let mut errors = std::vec::Vec::new();
         for lex_err in result.errors {
-            let loc = ParseLocation::new(source_file.clone(), lex_err.position.0, 0, 0);
+            let loc = ParseLocation::new(
+                source_file.clone(),
+                lex_err.offset,
+                lex_err.position.0,
+                lex_err.position.1,
+            );
             let span = ParseSourceSpan::new(loc.clone(), loc);
             errors.push(ParseError::new(span, lex_err.msg));
         }
@@ -1475,33 +1481,14 @@ impl<'a> HtmlParser<'a> {
         let saved_elements = std::mem::take(&mut self.elements);
         let saved_blocks = std::mem::take(&mut self.blocks);
 
-        // Parse content until ExpansionCaseExpEnd
+        // Parse content until ExpansionCaseExpEnd. Angular runs a full
+        // `_TreeBuilder` over the case body, so blocks, @let declarations and
+        // comments get real nodes — and an `IncompleteBlockOpen` produces its
+        // "Incomplete block" diagnostic instead of being skipped silently.
         while let Some(tok) = self.peek() {
             match tok.token_type {
-                HtmlTokenType::ExpansionCaseExpEnd => break,
-                HtmlTokenType::ExpansionFormEnd => break,
-                HtmlTokenType::Text
-                | HtmlTokenType::EncodedEntity
-                | HtmlTokenType::Interpolation => {
-                    if let Some(node) = self.consume_text() {
-                        self.add_to_parent(node);
-                    }
-                }
-                HtmlTokenType::TagOpenStart | HtmlTokenType::ComponentOpenStart => {
-                    self.consume_element_start();
-                }
-                HtmlTokenType::TagClose | HtmlTokenType::ComponentClose => {
-                    self.consume_element_end();
-                }
-                HtmlTokenType::ExpansionFormStart => {
-                    // Nested expansion
-                    if let Some(node) = self.parse_expansion() {
-                        self.add_to_parent(node);
-                    }
-                }
-                _ => {
-                    self.advance();
-                }
+                HtmlTokenType::ExpansionCaseExpEnd | HtmlTokenType::ExpansionFormEnd => break,
+                _ => self.parse_and_add_node(),
             }
         }
 
@@ -1529,6 +1516,14 @@ impl<'a> HtmlParser<'a> {
                     self.add_to_parent(HtmlNode::Element(Box::new_in(element, &self.allocator)));
                 }
                 ContainerIndex::Block(idx) => {
+                    // A block left open at the case's `}` is unclosed, same as
+                    // at EOF in the main loop.
+                    let block = &self.blocks[idx];
+                    let err = self.make_error(
+                        block.span.start,
+                        format!("Unclosed block \"@{}\"", block.name),
+                    );
+                    self.errors.push(err);
                     let block = std::mem::replace(
                         &mut self.blocks[idx],
                         HtmlBlock {

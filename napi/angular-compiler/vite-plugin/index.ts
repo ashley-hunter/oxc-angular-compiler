@@ -861,7 +861,9 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                 // `angular:invalidate` full-reload path in the catch below.
                 const hmrErrors = result.errors.filter((e) => e.severity === 'Error')
                 if (hmrErrors.length > 0) {
-                  throw new Error(hmrErrors.map((e) => e.message).join('\n'))
+                  // Keep the help text (`file:line:column` for template parse
+                  // errors) so the invalidation message says where it is.
+                  throw new Error(hmrErrors.map(describeDiagnostic).join('\n'))
                 }
 
                 // Only consume the pending slot once we have real content to

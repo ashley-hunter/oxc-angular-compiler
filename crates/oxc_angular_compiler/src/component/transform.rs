@@ -5618,8 +5618,11 @@ pub fn compile_template_for_hmr<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
-        let template_origin =
-            TemplateOrigin::InSource { path: file_path, source: template, offset: 0 };
+        // `file_path` names the component's file here, while the template text
+        // usually came from a `templateUrl` read — so the template has no
+        // locatable origin (same as `compile_component_template` /
+        // `compile_template_for_linker`) and positions stay template-relative.
+        let template_origin = TemplateOrigin::Unknown;
         for error in &html_result.errors {
             diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }

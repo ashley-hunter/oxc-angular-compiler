@@ -138,6 +138,38 @@ fn incomplete_block_through_compile_template_to_js() {
     assert_eq!(diagnostic.help.as_deref(), Some("/x/cut.html:2:1"));
 }
 
+/// A lexer error is reported at the byte offset of the offending character, so
+/// the label lands on it and the help text has the real `line:column`. The
+/// location used to read the `(line, column)` pair as the byte offset, which
+/// pointed the label at the start of the file.
+#[test]
+fn lexer_error_in_an_inline_template_points_at_the_character() {
+    let source = "import { Component } from '@angular/core';
+
+@Component({
+  selector: 'x-cut',
+  template: `
+    <p>before</p>
+    <!x
+    <p>after</p>
+  `,
+})
+export class Cut {}
+";
+    let diagnostics = transform(source, None);
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {diagnostics:?}");
+    };
+    assert_eq!(diagnostic.message, "Unexpected character \"x\"");
+    // Zero-length label at the `x`.
+    let [label] = diagnostic.labels.as_slice() else {
+        panic!("expected one label, got {diagnostic:?}");
+    };
+    assert_eq!(label.offset() as usize, source.find("<!x").unwrap() + 2);
+    assert_eq!(label.len(), 0);
+    assert_eq!(diagnostic.help.as_deref(), Some("/x/cut.ts:7:7"));
+}
+
 #[test]
 fn literal_at_sign_and_well_formed_blocks_still_compile() {
     let source = "import { Component } from '@angular/core';
