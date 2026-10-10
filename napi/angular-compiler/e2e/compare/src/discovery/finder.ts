@@ -105,6 +105,9 @@ async function extractComponentsFromFile(
       template: ts.template,
       templateUrl: ts.templateUrl,
       styles: ts.styles || [],
+      // The TypeScript extractor reads `styles` itself, so they are always
+      // resolved here.
+      stylesResolved: true,
       styleUrls: ts.styleUrls || [],
       standalone: ts.standalone ?? true,
       encapsulation: ts.encapsulation || 'Emulated',
