@@ -6,4 +6,16 @@
   <app-inline-card />
   <app-duo-first />
   <app-duo-second />
+  <app-lab
+    ><span x class="lab-px">PX</span><span y class="lab-py">PY</span
+    ><em class="lab-rest">REST</em></app-lab
+  >
+  <app-io
+    labelAlias="io"
+    [(checked)]="ioChecked"
+    (clicked)="ioClicked.set($event)"
+    (renamedAlias)="ioRenamed.set($event)"
+  />
+  <p class="io-result">{{ ioClicked() }}|{{ ioRenamed() }}|{{ ioChecked() }}</p>
+  <app-at />
 </main>

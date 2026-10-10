@@ -17,10 +17,14 @@ use oxc_allocator::{Box, Vec as OxcVec};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_str::Ident;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 use crate::ast::expression::AngularExpression;
 use crate::ir::enums::BindingKind;
-use crate::ir::expression::IrExpression;
+use crate::ir::expression::{
+    IrExpression, VisitorContextFlag, transform_expressions_in_create_op,
+    transform_expressions_in_update_op,
+};
 use crate::ir::ops::{CreateOp, UpdateOp, XrefId};
 use crate::output::ast::{
     ArrowFunctionBody, ArrowFunctionExpr, FnParam, FunctionExpr, InvokeFunctionExpr, LiteralExpr,
@@ -33,6 +37,7 @@ use crate::pipeline::compilation::{
 };
 use crate::pipeline::constant_pool::ConstantPool;
 use crate::pipeline::expression_store::ExpressionStore;
+use crate::r3::Identifiers;
 
 use angular_expression::convert_angular_expression;
 use ir_expression::convert_ir_expression;
@@ -215,6 +220,125 @@ pub fn reify(job: &mut ComponentCompilationJob<'_>) {
     job.diagnostics.extend(diagnostics);
 }
 
+/// Settings shared by every operation reified for one compilation job.
+struct ArrowFunctionReifier<'a, 'b> {
+    allocator: &'a oxc_allocator::Allocator,
+    core_namespace: &'a str,
+    expressions: &'b ExpressionStore<'a>,
+    root_xref: XrefId,
+    mode: TemplateCompilationMode,
+    supports_value_interpolation: bool,
+    supports_dom_property: bool,
+    pool: RefCell<&'b mut ConstantPool<'a>>,
+    diagnostics: RefCell<&'b mut Vec<OxcDiagnostic>>,
+}
+
+impl<'a> ArrowFunctionReifier<'a, '_> {
+    /// Replaces a hoisted arrow function with `ɵɵarrowFunction(varOffset, factory, ctx)`,
+    /// where `factory` is a shared constant `(ctx, view) => (params) => body`.
+    ///
+    /// Ported from the `ArrowFunction` case of `reifyIrExpression` and from
+    /// `getArrowFunctionFactory` in Angular's `reify.ts`.
+    fn reify(&self, expr: &mut IrExpression<'a>) {
+        let IrExpression::ArrowFunction(arrow_fn) = expr else { return };
+        if !arrow_fn.hoisted {
+            return;
+        }
+        let allocator = self.allocator;
+        let Some(var_offset) = arrow_fn.var_offset else {
+            self.diagnostics.borrow_mut().push(OxcDiagnostic::error(
+                "AssertionError: variable offset was not assigned to arrow function",
+            ));
+            return;
+        };
+
+        let mut statements = OxcVec::new_in(&allocator);
+        for op in &arrow_fn.ops {
+            if let UpdateOp::Statement(stmt_op) = op {
+                statements.push(convert_statement_ir_nodes(
+                    allocator,
+                    self.core_namespace,
+                    &stmt_op.statement,
+                    self.expressions,
+                    self.root_xref,
+                    &mut self.diagnostics.borrow_mut(),
+                ));
+            } else if let Some(stmt) = reify_update_op(
+                allocator,
+                self.core_namespace,
+                op,
+                self.expressions,
+                self.root_xref,
+                self.mode,
+                &mut self.diagnostics.borrow_mut(),
+                self.supports_value_interpolation,
+                self.supports_dom_property,
+            ) {
+                statements.push(stmt);
+            }
+        }
+        let value = convert_ir_expression(
+            allocator,
+            self.core_namespace,
+            &arrow_fn.body,
+            self.expressions,
+            self.root_xref,
+        );
+        let body = if statements.is_empty() {
+            ArrowFunctionBody::Expression(Box::new_in(value, &allocator))
+        } else {
+            statements.push(OutputStatement::Return(Box::new_in(
+                ReturnStatement { value, source_span: None },
+                &allocator,
+            )));
+            ArrowFunctionBody::Statements(statements)
+        };
+
+        let mut params = OxcVec::with_capacity_in(arrow_fn.params.len(), &allocator);
+        for param in &arrow_fn.params {
+            params.push(FnParam { name: param.name });
+        }
+        let inner = OutputExpression::ArrowFunction(Box::new_in(
+            ArrowFunctionExpr { params, body, source_span: arrow_fn.source_span },
+            &allocator,
+        ));
+
+        let mut factory_params = OxcVec::with_capacity_in(2, &allocator);
+        factory_params.push(FnParam { name: Ident::from("ctx") });
+        factory_params.push(FnParam { name: Ident::from("view") });
+        let factory = OutputExpression::ArrowFunction(Box::new_in(
+            ArrowFunctionExpr {
+                params: factory_params,
+                body: ArrowFunctionBody::Expression(Box::new_in(inner, &allocator)),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        let factory_ref =
+            self.pool.borrow_mut().get_shared_function_reference(factory, "arrowFn", true);
+
+        let mut args = OxcVec::with_capacity_in(3, &allocator);
+        args.push(OutputExpression::Literal(Box::new_in(
+            LiteralExpr { value: LiteralValue::Number(f64::from(var_offset)), source_span: None },
+            &allocator,
+        )));
+        args.push(factory_ref);
+        args.push(OutputExpression::ReadVar(Box::new_in(
+            ReadVarExpr { name: Ident::from("ctx"), source_span: None },
+            &allocator,
+        )));
+        *expr = IrExpression::OutputExpr(Box::new_in(
+            utils::create_instruction_call_expr(
+                allocator,
+                self.core_namespace,
+                Identifiers::ARROW_FUNCTION,
+                args,
+            ),
+            &allocator,
+        ));
+    }
+}
+
 /// Reify a single view's operations to statements (without modifying the view).
 fn reify_view_to_stmts<'a>(
     allocator: &'a oxc_allocator::Allocator,
@@ -228,6 +352,43 @@ fn reify_view_to_stmts<'a>(
     let mut create_stmts = std::vec::Vec::new();
     let mut update_stmts = std::vec::Vec::new();
     let core_namespace = ctx.core_namespace;
+
+    // Hoist arrow functions before the operations that contain them are reified.
+    {
+        let reifier = ArrowFunctionReifier {
+            allocator,
+            core_namespace,
+            expressions,
+            root_xref,
+            mode: ctx.mode,
+            supports_value_interpolation: ctx.supports_value_interpolation,
+            supports_dom_property: ctx.supports_dom_property,
+            pool: RefCell::new(&mut *pool),
+            diagnostics: RefCell::new(&mut *diagnostics),
+        };
+        for op in view.create.iter_mut() {
+            if !matches!(
+                op,
+                CreateOp::Listener(_)
+                    | CreateOp::TwoWayListener(_)
+                    | CreateOp::Animation(_)
+                    | CreateOp::AnimationListener(_)
+            ) {
+                transform_expressions_in_create_op(
+                    op,
+                    &|expr, _flags| reifier.reify(expr),
+                    VisitorContextFlag::NONE,
+                );
+            }
+        }
+        for op in view.update.iter_mut() {
+            transform_expressions_in_update_op(
+                op,
+                &|expr, _flags| reifier.reify(expr),
+                VisitorContextFlag::NONE,
+            );
+        }
+    }
 
     // Reify create operations
     // Use iter_mut() so we can take ownership of expressions that can't be cloned
@@ -1475,6 +1636,28 @@ pub fn reify_host(job: &mut HostBindingCompilationJob<'_>) {
     let supports_dom_property = job.supports_dom_property();
     let core_namespace = job.core_namespace.as_str();
     let mut diagnostics = Vec::new();
+
+    // Hoist arrow functions before the operations that contain them are reified.
+    {
+        let reifier = ArrowFunctionReifier {
+            allocator,
+            core_namespace,
+            expressions: &job.expressions,
+            root_xref,
+            mode: TemplateCompilationMode::Full,
+            supports_value_interpolation,
+            supports_dom_property,
+            pool: RefCell::new(&mut job.pool),
+            diagnostics: RefCell::new(&mut diagnostics),
+        };
+        for op in job.root.update.iter_mut() {
+            transform_expressions_in_update_op(
+                op,
+                &|expr, _flags| reifier.reify(expr),
+                VisitorContextFlag::NONE,
+            );
+        }
+    }
 
     // Reify create operations (listeners)
     for op in job.root.create.iter() {

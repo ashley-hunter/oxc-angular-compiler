@@ -114,6 +114,14 @@ fn validate_two_way_binding_target(expr: &IrExpression<'_>) -> Option<OxcDiagnos
                 // Valid - context variable assignment
                 None
             }
+            // Resolved forms produced by resolve_names, matching upstream's
+            // acceptance of `o.ReadPropExpr`/`o.ReadKeyExpr` (property/keyed
+            // reads already resolved against the context or a template
+            // variable). Safe reads are settable here — the reify arm emits
+            // the non-safe write, like the Ast arm allows.
+            IrExpression::ResolvedPropertyRead(_)
+            | IrExpression::ResolvedKeyedRead(_)
+            | IrExpression::ResolvedSafePropertyRead(_) => None,
             // Other IR expression types are not valid for two-way binding
             _ => Some(
                 OxcDiagnostic::error("Unsupported expression in two-way action binding")

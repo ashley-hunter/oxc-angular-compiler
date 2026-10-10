@@ -40,9 +40,9 @@ test.describe('Input Component HMR', () => {
     })
     expect(titleColor).toBe('rgb(255, 0, 0)')
 
-    // Verify input bindings still work after HMR update
-    // This exercises the inputConfig conditional in update_module.rs:
-    // If inputs were corrupted, these values would be missing or wrong
+    // Verify input bindings still work after HMR update. The update module
+    // copies the live definition, so its inputs are never converted again:
+    // if they were corrupted, these values would be missing or wrong
     await expect(page.locator('.card-title')).toContainText('INPUT_TITLE')
     await expect(page.locator('.card-value')).toContainText('42')
   })

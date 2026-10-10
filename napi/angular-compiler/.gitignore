@@ -10,3 +10,4 @@
 /benchmarks/typedb-web/dist
 /e2e/app/dist
 /tsconfig.tsbuildinfo
+/test/.hmr-update-module-tmp

@@ -839,7 +839,9 @@ fn convert_angular_expression_with_ctx<'a>(
             for elem in ttl.template.elements.iter() {
                 elements.push(TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: Some(elem.source_span.to_span()),
                 });
             }

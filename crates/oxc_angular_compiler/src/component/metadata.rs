@@ -241,6 +241,12 @@ pub struct ComponentMetadata<'a> {
     /// Inline styles array.
     pub styles: Vec<'a, Ident<'a>>,
 
+    /// `false` when the decorator had a `styles` field the static evaluator
+    /// could not resolve (e.g. an import `resolveImportedValues` does not
+    /// cover): `styles` is then empty and must not be read as "no styles".
+    /// `true` when `styles` was absent or fully evaluated.
+    pub styles_resolved: bool,
+
     /// URLs to external stylesheet files.
     pub style_urls: Vec<'a, Ident<'a>>,
 
@@ -659,6 +665,7 @@ impl<'a> ComponentMetadata<'a> {
             template: None,
             template_url: None,
             styles: Vec::new_in(&allocator),
+            styles_resolved: true,
             style_urls: Vec::new_in(&allocator),
             standalone: implicit_standalone,
             encapsulation: ViewEncapsulation::default(),

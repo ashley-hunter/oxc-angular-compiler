@@ -349,6 +349,12 @@ export interface ExtractedComponentMetadata {
   templateUrl?: string
   /** Inline styles array. */
   styles: Array<string>
+  /**
+   * `false` when `styles` could not be statically evaluated (e.g. it
+   * references an imported value): `styles` is then empty and must be
+   * treated as "unknown", not as "the component has no styles".
+   */
+  stylesResolved: boolean
   /** URLs to external stylesheet files. */
   styleUrls: Array<string>
   /** Whether this is a standalone component. */
@@ -498,12 +504,23 @@ export interface FactoryNapiCompileResult {
  * This generates a JavaScript module that can be dynamically imported
  * during HMR to update a component's template and styles.
  *
+ * This knows only what it is given: the generated module replaces `template`
+ * and `consts`, but `decls`, `vars` and `ngContentSelectors` stay as the live
+ * definition has them, so it is only correct when the new template needs the
+ * same ones. For a template that changes them, use `compileForHmrSync`, which
+ * compiles the template and writes every field it decides.
+ *
  * # Arguments
  *
  * * `component_id` - The component ID (path@ClassName)
- * * `template_js` - The compiled template function as JavaScript
+ * * `template_js` - The compiled template function as JavaScript, or an empty
+ *   string for a styles-only update
  * * `styles` - The component's CSS styles, or `None` when unknown. An empty
  *   array is definitive and emits `styles: []`, clearing the old styles.
+ * * `declarations_js` - Optional constant declarations the template references
+ * * `consts_js` - The new template's consts array as JavaScript. When
+ *   `template_js` is given, `None` emits `consts: null`, clearing the old
+ *   template's consts.
  *
  * # Returns
  *

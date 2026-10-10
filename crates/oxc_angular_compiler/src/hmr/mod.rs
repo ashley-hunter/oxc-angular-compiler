@@ -27,10 +27,18 @@
 //! });
 //!
 //! // HMR Update Module (served by Vite middleware)
-//! export default {
-//!   ɵcmp: /* compiled component definition */,
-//!   template: /* template function */,
-//! };
+//! export default function Cmp_UpdateMetadata(Cmp, ɵɵnamespaces) {
+//!   const i0 = ɵɵnamespaces[0];
+//!   Cmp.ɵcmp = {
+//!     ...Cmp.ɵcmp,
+//!     decls: /* new template's slot count */,
+//!     vars: /* new template's binding count */,
+//!     consts: /* new template's consts, or null */,
+//!     ngContentSelectors: /* new template's selectors, or undefined */,
+//!     template: /* new template function */,
+//!     tView: null,
+//!   };
+//! }
 //! ```
 
 mod dependencies;
@@ -46,5 +54,6 @@ pub use dependencies::{
 pub use initializer::{HmrDefinition, compile_hmr_initializer, compile_hmr_update_callback};
 pub use styles::generate_style_update_module;
 pub use update_module::{
-    HmrUpdateModuleOptions, generate_hmr_update_module, generate_hmr_update_module_from_js,
+    HmrTemplateFields, HmrUpdateModuleOptions, generate_hmr_update_module,
+    generate_hmr_update_module_from_js,
 };

@@ -408,11 +408,11 @@ impl<'a> ConstantPool<'a> {
         // Get the per-base-name count for deduplication within this component
         let count = self.claimed_names.get(base).copied().unwrap_or(0);
 
-        // Only apply the global offset for "generic" names that start with underscore
-        // (like `_forTrack`, `_c`). These names could collide across components.
+        // Only apply the global offset for "generic" names (`_forTrack`, `_c`, `arrowFn`).
+        // These names could collide across components.
         // Component-specific names (like `ComponentName_Template`) don't need the
         // offset because they already contain the component class name.
-        let apply_offset = base.starts_with('_');
+        let apply_offset = base.starts_with('_') || base == "arrowFn";
         let effective_count = if apply_offset { self.unique_name_offset + count } else { count };
 
         let name = if effective_count == 0 && !always_include_suffix {

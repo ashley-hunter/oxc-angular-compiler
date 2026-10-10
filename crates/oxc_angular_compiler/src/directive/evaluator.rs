@@ -1221,6 +1221,14 @@ pub(crate) enum StaticValue {
     Array(Vec<StaticValue>),
     /// Object literal properties. Later duplicates win, like [`Value::prop`].
     Object(Vec<(String, StaticValue)>),
+    /// A member of an enum in the resolved file. Identity is kept (ngtsc
+    /// preserves `EnumValue` across module resolution) so a reader that
+    /// rejects enums — `styles: [Enum.A]` is a `Value is of type 'Enum'`
+    /// error, not a string — rejects them from an import too.
+    Enum {
+        name: String,
+        value: Box<StaticValue>,
+    },
 }
 
 impl StaticValue {
@@ -1242,8 +1250,10 @@ impl StaticValue {
                 .map(|p| Self::to_static(&p.value).map(|v| (p.key.clone(), v)))
                 .collect::<Option<_>>()
                 .map(Self::Object),
-            // An enum member carries its resolved value.
-            Value::Enum { value, .. } => Self::to_static(value),
+            // An enum member keeps its enum identity, like ngtsc's EnumValue
+            // travelling across module resolution.
+            Value::Enum { name, value } => Self::to_static(value)
+                .map(|value| Self::Enum { name: name.clone(), value: Box::new(value) }),
             _ => None,
         }
     }
@@ -1270,6 +1280,9 @@ impl StaticValue {
                     })
                     .collect(),
             ),
+            Self::Enum { name, value } => {
+                Value::Enum { name: name.clone(), value: Box::new(value.to_value()) }
+            }
         }
     }
 }
@@ -3504,6 +3517,7 @@ pub fn input_transform_types<'a>(
     class: &'a Class<'a>,
     consts: &super::StringConsts<'a>,
     source: &'a str,
+    comments: &'a [oxc_ast::ast::Comment],
     core_namespace: &'a str,
 ) -> HashMap<String, String> {
     let evaluator = Evaluator::new(consts);
@@ -3557,6 +3571,7 @@ pub fn input_transform_types<'a>(
         }
     }
 
+    let lexed = std::rc::Rc::new(super::dts_type::Lexed::from_comments(comments));
     transforms
         .into_iter()
         .filter_map(|(name, transform)| {
@@ -3571,6 +3586,10 @@ pub fn input_transform_types<'a>(
                         source,
                         core_ns: core_namespace,
                         other_module: false,
+                        container_pos: u32::MAX,
+                        container_end: u32::MAX,
+                        indent: 1,
+                        lexed: lexed.clone(),
                     };
                     let ty = printer.print(ty);
                     if printer.other_module {

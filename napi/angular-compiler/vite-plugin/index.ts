@@ -792,8 +792,8 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                 // `fileReplacements` pointed `actualId` at a different file.
                 //
                 // On a disk source the compiler never saw, every `styles`
-                // shape the extractor cannot fold — an array constant, an
-                // imported one, a `.concat(...)` — resolves to nothing. Read
+                // shape the extractor cannot evaluate (an imported constant,
+                // a call to an imported function) resolves to nothing. Read
                 // as definitive that emits `styles: []` and wipes CSS the
                 // running component genuinely has, from a template edit that
                 // never touched the styles at all.
@@ -821,15 +821,37 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                       stripComponentMetadata(source, componentDecoratorsByFile.get(fileId))
                   )
                 }
+                // `stylesResolved` comes first, ahead of "serve what was
+                // read": the extractor here evaluates `styles` without the
+                // `resolveImportedValues` the transform runs with, so a
+                // component whose styles live in another file extracts
+                // `styles: []` — an UNKNOWN answer, not an empty one. Serving
+                // it as definitive would wipe live CSS that the transform
+                // compiled from the import, and serving `merged` when it is
+                // non-empty is no better: it holds only the styleUrls
+                // content, so the imported inline styles are dropped either
+                // way. An unknown `styles` field makes the merged array
+                // itself unrepresentable, so the answer is `null`.
                 const styles: string[] | null =
-                  merged.length > 0 || (external.complete && compiledFromThisSource())
+                  classMetadata.stylesResolved &&
+                  (merged.length > 0 || (external.complete && compiledFromThisSource()))
                     ? merged
                     : null
 
                 const result = compileForHmrSync(templateContent, className, resolvedId, styles, {
                   angularVersion: pluginOptions.angularVersion,
+                  encapsulation: classMetadata.encapsulation,
                   minifyComponentStyles: getMinifyComponentStyles(),
                 })
+
+                // A failed compile must not be served as an (empty) update
+                // module — that would call `ɵɵreplaceMetadata` with no
+                // callback and throw inside the listener. Fall back to the
+                // `angular:invalidate` full-reload path in the catch below.
+                const hmrErrors = result.errors.filter((e) => e.severity === 'Error')
+                if (hmrErrors.length > 0) {
+                  throw new Error(hmrErrors.map((e) => e.message).join('\n'))
+                }
 
                 // Only consume the pending slot once we have real content to
                 // serve. If we deleted unconditionally and the file was

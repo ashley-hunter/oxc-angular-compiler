@@ -60,6 +60,7 @@ use crate::pipeline::compilation::{ComponentCompilationJob, HostBindingCompilati
 /// This also recursively processes handler_ops for Listener, AnimationListener, and TwoWayListener,
 /// as well as track_by_ops for RepeaterCreate operations.
 pub fn generate_temporary_variables(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
 
     // Process all views - both create and update ops (matching TypeScript behavior)
@@ -69,6 +70,17 @@ pub fn generate_temporary_variables(job: &mut ComponentCompilationJob<'_>) {
 
         let mut update_stmts = generate_temporaries_for_update(&mut view.update, &allocator);
         view.update.prepend(&mut update_stmts);
+
+        for fn_ptr in view.functions.iter() {
+            // SAFETY: The pointer was collected from this view's operations at the start
+            // of this phase, and the allocator keeps the data alive.
+            let arrow_fn = unsafe { &mut **fn_ptr };
+            arrow_fn.with_handler(allocator, |ops, body| {
+                let mut stmts =
+                    generate_temporaries_for_handler_ops_with_expression(ops, body, &allocator);
+                prepend_update_ops(ops, &mut stmts, &allocator);
+            });
+        }
     }
 }
 
@@ -573,10 +585,23 @@ fn assign_temp_names<'a>(
                 assign_temp_names(e, tracker, &allocator);
             }
         }
-
-        IrExpression::ArrowFunction(arrow_fn) => {
-            assign_temp_names(&mut arrow_fn.body, tracker, &allocator);
+        IrExpression::TaggedTemplateLiteral(ttl) => {
+            assign_temp_names(&mut ttl.tag, tracker, &allocator);
+            for e in ttl.expressions.iter_mut() {
+                assign_temp_names(e, tracker, &allocator);
+            }
         }
+        IrExpression::SpreadElement(spread) => {
+            assign_temp_names(&mut spread.expr, tracker, &allocator);
+        }
+
+        // Arrow functions form their own operation scope: the op visitors reach
+        // their internals only under IN_CHILD_OPERATION, which this phase skips.
+        // Hoisted arrows are handled separately through `unit.functions` (which
+        // holds their `ops`, matching upstream `generateTemporaries(expr.ops)`),
+        // so naming their temporaries here would give them the containing op's
+        // index and leave dead declarations in the outer scope.
+        IrExpression::ArrowFunction(_) => {}
         IrExpression::Parenthesized(paren) => {
             assign_temp_names(&mut paren.expr, tracker, &allocator);
         }
@@ -667,6 +692,9 @@ impl TempVarTracker {
 /// Host version - only processes the root unit (no embedded views).
 /// Processes both create and update ops to match TypeScript behavior.
 pub fn generate_temporary_variables_for_host(job: &mut HostBindingCompilationJob<'_>) {
+    // Upstream's generateTemporaryVariables is Kind.Both, so host units process
+    // `unit.functions` too; refresh the pointer list before reading it.
+    super::generate_arrow_functions::collect_arrow_functions_for_host(job);
     let allocator = job.allocator;
 
     let mut create_stmts = generate_temporaries_for_create(&mut job.root.create, &allocator);
@@ -674,4 +702,15 @@ pub fn generate_temporary_variables_for_host(job: &mut HostBindingCompilationJob
 
     let mut update_stmts = generate_temporaries_for_update(&mut job.root.update, &allocator);
     job.root.update.prepend(&mut update_stmts);
+
+    for fn_ptr in job.root.functions.iter() {
+        // SAFETY: The pointer was collected from this unit's operations at the
+        // start of this phase, and the allocator keeps the data alive.
+        let arrow_fn = unsafe { &mut **fn_ptr };
+        arrow_fn.with_handler(allocator, |ops, body| {
+            let mut stmts =
+                generate_temporaries_for_handler_ops_with_expression(ops, body, &allocator);
+            prepend_update_ops(ops, &mut stmts, &allocator);
+        });
+    }
 }
