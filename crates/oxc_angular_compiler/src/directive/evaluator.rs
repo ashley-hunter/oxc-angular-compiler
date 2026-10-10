@@ -1221,6 +1221,14 @@ pub(crate) enum StaticValue {
     Array(Vec<StaticValue>),
     /// Object literal properties. Later duplicates win, like [`Value::prop`].
     Object(Vec<(String, StaticValue)>),
+    /// A member of an enum in the resolved file. Identity is kept (ngtsc
+    /// preserves `EnumValue` across module resolution) so a reader that
+    /// rejects enums — `styles: [Enum.A]` is a `Value is of type 'Enum'`
+    /// error, not a string — rejects them from an import too.
+    Enum {
+        name: String,
+        value: Box<StaticValue>,
+    },
 }
 
 impl StaticValue {
@@ -1242,8 +1250,10 @@ impl StaticValue {
                 .map(|p| Self::to_static(&p.value).map(|v| (p.key.clone(), v)))
                 .collect::<Option<_>>()
                 .map(Self::Object),
-            // An enum member carries its resolved value.
-            Value::Enum { value, .. } => Self::to_static(value),
+            // An enum member keeps its enum identity, like ngtsc's EnumValue
+            // travelling across module resolution.
+            Value::Enum { name, value } => Self::to_static(value)
+                .map(|value| Self::Enum { name: name.clone(), value: Box::new(value) }),
             _ => None,
         }
     }
@@ -1270,6 +1280,9 @@ impl StaticValue {
                     })
                     .collect(),
             ),
+            Self::Enum { name, value } => {
+                Value::Enum { name: name.clone(), value: Box::new(value.to_value()) }
+            }
         }
     }
 }

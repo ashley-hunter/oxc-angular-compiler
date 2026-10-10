@@ -1490,6 +1490,54 @@ fn directive_selector_error<'a>(
     None
 }
 
+/// The `styles` error a `@Component` reports, evaluated lazily like the other
+/// decorator checks.
+///
+/// Kept out of [`decorator_io_errors`] on purpose: ngtsc reads `styles` in the
+/// component handler, after `extractDirectiveMetadata` has already thrown for
+/// the io, query, selector and constructor-parameter checks, so this error
+/// must only surface when those pass.
+pub fn styles_error<'a>(class: &'a Class<'a>, consts: &StringConsts<'a>) -> Option<OxcDiagnostic> {
+    let (config, decorator_name) = angular_decorator_config(class, consts)?;
+    let expr = config
+        .filter(|_| decorator_name == "Component")
+        .and_then(|config| config_property(config, "styles", consts))?;
+    evaluate_styles(expr, consts)
+        .err()
+        .map(|message| OxcDiagnostic::error(message).with_label(expr.span()))
+}
+
+/// ngtsc's `parseDirectiveStyles`: the `styles` of a `@Component`, evaluated
+/// statically. A string is one style, and every entry of an array must be a
+/// string (`isStringArrayOrDie`). Anything else is ngtsc's error for it, or,
+/// for a value from another module, the one of [`value_error`].
+pub(crate) fn evaluate_styles<'a>(
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'a>,
+) -> Result<std::vec::Vec<String>, String> {
+    const SUBJECT: &str = "@Component.styles";
+    match Evaluator::new(consts).evaluate(expr) {
+        Value::String(style) => Ok(vec![style]),
+        Value::Array(entries) => entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, entry)| match entry {
+                Value::String(style) => Ok(style),
+                entry => Err(value_error(
+                    SUBJECT,
+                    || format!("Failed to resolve styles at position {position} to a string"),
+                    &entry,
+                )),
+            })
+            .collect(),
+        value => Err(value_error(
+            SUBJECT,
+            || format!("Failed to resolve {SUBJECT} to a string or an array of strings"),
+            &value,
+        )),
+    }
+}
+
 /// The name upstream sees for a `@angular/core` decorator (`dec.import?.name
 /// ?? dec.name`): the imported name for an aliased import (`@Inj(...)` for
 /// `import { Inject as Inj }` is `Inject`), the member name for a namespace

@@ -237,3 +237,74 @@ export class A {}
         error_messages(&result)
     );
 }
+
+// `styles` in `@Component` resolves through the same imported bindings.
+
+#[test]
+fn imported_styles_array_evaluates() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/meta.ts", "export const STYLES = ['.a { color: red }'];");
+    let result = transform(
+        &dir,
+        r#"import { Component } from '@angular/core';
+import { STYLES } from './meta';
+@Component({ selector: 'x', template: '', styles: STYLES })
+export class X {}
+"#,
+        &resolve_options(),
+    );
+    assert!(!result.has_errors(), "{}", error_messages(&result));
+    assert!(
+        define_call(&result.code, "X").contains(r#"styles:[".a[_ngcontent-%COMP%]{color:red}"]"#),
+        "{}",
+        define_call(&result.code, "X")
+    );
+}
+
+/// ngtsc keeps `EnumValue` identity across module resolution: an imported
+/// enum member in `styles` is the same `Value is of type 'E'` error a
+/// same-file one reports, not a string silently unwrapped to its value.
+#[test]
+fn imported_enum_member_is_not_a_string() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/meta.ts", "export enum E { A = '.a { color: red }' }");
+    let result = transform(
+        &dir,
+        r#"import { Component } from '@angular/core';
+import { E } from './meta';
+@Component({ selector: 'x', template: '', styles: [E.A] })
+export class X {}
+"#,
+        &resolve_options(),
+    );
+    assert!(result.has_errors());
+    assert!(
+        error_messages(&result)
+            .contains("Failed to resolve styles at position 0 to a string Value is of type 'E'."),
+        "{}",
+        error_messages(&result)
+    );
+}
+
+/// Where a same-file enum member acts as its value (a string operand of
+/// `+`), an imported one does too.
+#[test]
+fn imported_enum_member_in_concatenation() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/meta.ts", "export enum E { A = '.a' }");
+    let result = transform(
+        &dir,
+        r#"import { Component } from '@angular/core';
+import { E } from './meta';
+@Component({ selector: 'x', template: '', styles: [E.A + ' { color: red }'] })
+export class X {}
+"#,
+        &resolve_options(),
+    );
+    assert!(!result.has_errors(), "{}", error_messages(&result));
+    assert!(
+        define_call(&result.code, "X").contains(r#"styles:[".a[_ngcontent-%COMP%]{color:red}"]"#),
+        "{}",
+        define_call(&result.code, "X")
+    );
+}

@@ -1608,6 +1608,10 @@ pub struct ExtractedComponentMetadata {
     pub template_url: Option<String>,
     /// Inline styles array.
     pub styles: Vec<String>,
+    /// `false` when `styles` could not be statically evaluated (e.g. it
+    /// references an imported value): `styles` is then empty and must be
+    /// treated as "unknown", not as "the component has no styles".
+    pub styles_resolved: bool,
     /// URLs to external stylesheet files.
     pub style_urls: Vec<String>,
     /// Whether this is a standalone component.
@@ -1893,6 +1897,7 @@ pub fn extract_component_metadata_sync(
                         .as_ref()
                         .map(std::string::ToString::to_string),
                     styles: metadata.styles.iter().map(std::string::ToString::to_string).collect(),
+                    styles_resolved: metadata.styles_resolved,
                     style_urls: metadata
                         .style_urls
                         .iter()

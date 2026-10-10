@@ -349,6 +349,12 @@ export interface ExtractedComponentMetadata {
   templateUrl?: string
   /** Inline styles array. */
   styles: Array<string>
+  /**
+   * `false` when `styles` could not be statically evaluated (e.g. it
+   * references an imported value): `styles` is then empty and must be
+   * treated as "unknown", not as "the component has no styles".
+   */
+  stylesResolved: boolean
   /** URLs to external stylesheet files. */
   styleUrls: Array<string>
   /** Whether this is a standalone component. */
