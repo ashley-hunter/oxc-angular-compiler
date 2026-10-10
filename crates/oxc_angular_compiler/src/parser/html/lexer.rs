@@ -1063,8 +1063,13 @@ impl<'a> HtmlLexer<'a> {
         // A `<` followed by whitespace or other non-tag characters is just text
         if self.peek() == '<' {
             let next = self.peek_at(1);
-            // Valid tag start: `/` (close tag), `!` (comment/doctype/cdata), or letter/underscore
-            if next == '/' || next == '!' || next.is_ascii_alphabetic() || next == '_' {
+            // Valid tag start: `/` (close tag), `!` (comment/doctype/cdata), or a letter.
+            // An underscore starts a name only for a selectorless component.
+            if next == '/'
+                || next == '!'
+                || next.is_ascii_alphabetic()
+                || (next == '_' && self.selectorless_enabled)
+            {
                 self.scan_tag(start);
                 return;
             }
@@ -1718,10 +1723,10 @@ impl<'a> HtmlLexer<'a> {
             let content_type = get_html_tag_definition(&lower_name).get_content_type(ns_prefix);
             match content_type {
                 TagContentType::RawText => {
-                    self.scan_raw_text_with_tag_close(&lower_name, false);
+                    self.scan_raw_text_with_tag_close(&prefix, &name, false);
                 }
                 TagContentType::EscapableRawText => {
-                    self.scan_raw_text_with_tag_close(&lower_name, true);
+                    self.scan_raw_text_with_tag_close(&prefix, &name, true);
                 }
                 TagContentType::Parsable => {
                     // Normal parsable content, no special handling needed
@@ -1757,7 +1762,18 @@ impl<'a> HtmlLexer<'a> {
     /// Scans raw text content until the closing tag.
     /// For RAW_TEXT (script/style): entities are NOT decoded.
     /// For ESCAPABLE_RAW_TEXT (title/textarea): entities ARE decoded.
-    fn scan_raw_text_with_tag_close(&mut self, tag_name: &str, consume_entities: bool) {
+    ///
+    /// `tag_name` is the opening tag's local name as written. The closing tag is
+    /// matched against it ignoring case — upstream uses `closingTagName =
+    /// parts[1]` for ordinary elements — and the close token is emitted with the
+    /// opening tag's `[prefix, name]` parts, so `</script>` closes the element
+    /// named `:svg:script`.
+    fn scan_raw_text_with_tag_close(
+        &mut self,
+        prefix: &str,
+        tag_name: &str,
+        consume_entities: bool,
+    ) {
         let token_type =
             if consume_entities { HtmlTokenType::EscapableRawText } else { HtmlTokenType::RawText };
 
@@ -1783,12 +1799,12 @@ impl<'a> HtmlLexer<'a> {
                 {
                     self.advance();
                 }
-                let close_tag_name =
-                    self.input[close_tag_start as usize..self.index as usize].to_lowercase();
+                let close_tag_name = &self.input[close_tag_start as usize..self.index as usize];
+                let closes_tag = close_tag_name.eq_ignore_ascii_case(tag_name);
 
                 self.skip_whitespace();
 
-                if close_tag_name == tag_name && self.peek() == '>' {
+                if closes_tag && self.peek() == '>' {
                     // Found the closing tag - emit any accumulated content
                     if consume_entities {
                         // For escapable raw text, Angular ALWAYS emits a text token, even if empty.
@@ -1815,11 +1831,12 @@ impl<'a> HtmlLexer<'a> {
                         }
                     }
 
-                    // Emit the closing tag
+                    // Emit the closing tag with the opening tag's parts, like
+                    // upstream's `_endToken(openToken.parts)`.
                     self.advance(); // consume >
                     self.tokens.push(HtmlToken::with_prefix_name(
                         HtmlTokenType::TagClose,
-                        "",
+                        prefix,
                         tag_name,
                         saved_index,
                         self.index,
@@ -2010,7 +2027,9 @@ impl<'a> HtmlLexer<'a> {
 
                 self.skip_whitespace();
 
-                if close_name == expected_close && self.peek() == '>' {
+                // Upstream `_consumeRawTextWithTagClose` matches the close with
+                // `_attemptStrCaseInsensitive` for components too.
+                if close_name.eq_ignore_ascii_case(&expected_close) && self.peek() == '>' {
                     // Found the closing tag - emit content
                     let content = &self.input[content_start as usize..saved_index as usize];
                     let normalized = normalize_line_endings(content);
@@ -3076,8 +3095,11 @@ impl<'a> HtmlLexer<'a> {
             // Handle `<` - only stop if it's a valid tag start
             if ch == '<' {
                 let next = self.peek_at(1);
-                // Valid tag start: `/` (close tag), `!` (comment/doctype/cdata), or letter/underscore
-                if next == '/' || next == '!' || next.is_ascii_alphabetic() || next == '_' {
+                // Valid tag start: `/` (close tag), `!` (comment/doctype/cdata), or a letter.
+                // Upstream `_isTagStart` has no `_` case, so mid-text `<_C` stays
+                // text even in selectorless mode; a component only tokenizes at a
+                // token boundary (the dispatch check in `scan_next_token`).
+                if next == '/' || next == '!' || next.is_ascii_alphabetic() {
                     break;
                 }
                 // Otherwise, `<` is just text, continue

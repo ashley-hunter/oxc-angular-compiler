@@ -3469,10 +3469,25 @@ pub fn transform_angular_file(
                         shared_pool_index,
                         &mut file_namespace_registry,
                         &import_map,
+                        resolved_resources,
                     ) {
                         Ok(compilation_result) => {
                             // Update the shared pool index for the next component
                             shared_pool_index = compilation_result.next_pool_index;
+
+                            // Stylesheet `<link>`s in the template are watched
+                            // files like decorator `styleUrls`, and a missing
+                            // one is the same non-fatal diagnostic.
+                            for style_url in &compilation_result.template_style_urls {
+                                result.dependencies.push(style_url.clone());
+                            }
+                            for style_url in &compilation_result.missing_link_urls {
+                                result.diagnostics.push(OxcDiagnostic::error(format!(
+                                    "Component '{}': style URL '{}' could not be resolved \
+                                     (COMPONENT_RESOURCE_NOT_FOUND)",
+                                    class_name, style_url
+                                )));
+                            }
 
                             let component_id = format!("{}@{}", path, class_name);
 
@@ -4622,6 +4637,16 @@ struct FullCompilationResult {
     /// async metadata callback, and emitting them would leave dead
     /// `import(...)` calls in the output.
     has_defer_block: bool,
+
+    /// Resolvable-URL stylesheet `<link>`s the template's preparser collected
+    /// (upstream `_extractTemplateStyleUrls`). The caller records them as
+    /// watch dependencies like decorator `styleUrls`.
+    template_style_urls: Vec<String>,
+
+    /// Template link URLs missing from `resolved_resources` — non-fatal like
+    /// a missing decorator `styleUrl`: the caller surfaces
+    /// COMPONENT_RESOURCE_NOT_FOUND in the result diagnostics.
+    missing_link_urls: Vec<String>,
 }
 
 /// Compile a component template and generate ɵcmp/ɵfac definitions.
@@ -4687,6 +4712,10 @@ fn compile_component_partial<'a>(
         next_pool_index: pool_starting_index,
         ng_content_selectors: Vec::new(),
         has_defer_block,
+        // Partial mode never parses the template; the linker collects link
+        // URLs at consumer build time.
+        template_style_urls: Vec::new(),
+        missing_link_urls: Vec::new(),
     }
 }
 
@@ -4702,6 +4731,7 @@ fn compile_component_full<'a>(
     pool_starting_index: u32,
     namespace_registry: &mut NamespaceRegistry<'a>,
     import_map: &ImportMap<'a>,
+    resolved_resources: Option<&ResolvedResources>,
 ) -> Result<FullCompilationResult, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
 
@@ -4775,6 +4805,27 @@ fn compile_component_full<'a>(
     // Capture ng-content selectors from the R3 AST for .d.ts generation
     let ng_content_selectors: Vec<String> =
         r3_result.ng_content_selectors.iter().map(|s| s.to_string()).collect();
+
+    // Resolve stylesheet `<link>`s the preparser collected (`_extractTemplateStyleUrls`):
+    // they compile to styles like decorator `styleUrls` (handler.ts resolves both through
+    // `resourceLoader` and the link element is removed from the template). Upstream puts
+    // external styles before inline ones; the file's own ordering keeps URL contents after
+    // the decorator's inline styles, and the links land ahead of the `<style>` contents
+    // below, like upstream.
+    let mut missing_link_urls = Vec::new();
+    let template_style_urls: Vec<String> =
+        r3_result.style_urls.iter().map(|url| url.to_string()).collect();
+    if let Some(resources) = resolved_resources {
+        for style_url in &r3_result.style_urls {
+            if let Some(style_contents) = resources.styles.get(style_url.as_str()) {
+                for style in style_contents {
+                    metadata.styles.push(Ident::from_in(style.as_str(), &allocator));
+                }
+            } else {
+                missing_link_urls.push(style_url.to_string());
+            }
+        }
+    }
 
     // Merge inline template styles into component metadata
     // These are styles from <style> tags directly in the template HTML
@@ -5110,6 +5161,8 @@ fn compile_component_full<'a>(
         next_pool_index,
         ng_content_selectors,
         has_defer_block,
+        template_style_urls,
+        missing_link_urls,
     })
 }
 

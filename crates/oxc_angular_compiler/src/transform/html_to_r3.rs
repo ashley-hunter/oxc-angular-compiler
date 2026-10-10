@@ -434,15 +434,27 @@ impl<'a> HtmlToR3Transform<'a> {
                 }
                 return None;
             }
-            if raw_name == "link" {
-                // Collect stylesheet URLs
+            // Like `script` and `style` above, the preparser lowercases the name before
+            // it looks for `link` and `ng-content` (`preparseElement`).
+            if raw_name.eq_ignore_ascii_case("link") {
+                // A stylesheet `<link>` with a resolvable URL is compiled into
+                // `styles` and dropped from the tree (`r3_template_transform.ts`
+                // returns `null`). Inside ngNonBindable the preparser still drops
+                // stylesheet links (`NonBindableVisitor`), but the URL is discarded
+                // because that visitor never reaches `styleUrls`.
                 if let Some(href) = self.get_stylesheet_href(element) {
-                    self.style_urls.push(href);
+                    if self.non_bindable_depth == 0 {
+                        self.style_urls.push(href);
+                    }
+                    return None;
                 }
-                // Filter out <link rel="stylesheet"> inside ngNonBindable elements
+                // Inside ngNonBindable a stylesheet `<link>` is dropped even when
+                // its URL is unresolvable or missing — `NonBindableVisitor` checks
+                // only `type === STYLESHEET`, not `isStyleUrlResolvable`.
                 if self.non_bindable_depth > 0 && self.is_stylesheet_link(element) {
                     return None;
                 }
+                // Every other `<link>` stays an element.
             }
         }
 
@@ -455,7 +467,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 &element.attrs,
                 &security_name,
                 i18n_element_name,
-                raw_name == "ng-template",
+                // `isNgTemplate` sees the namespace-stripped local name.
+                split_ns_name(raw_name).1 == "ng-template",
             );
 
         // `child_prefix` is what children inherit; `foreignObject` already
@@ -588,7 +601,9 @@ impl<'a> HtmlToR3Transform<'a> {
         // Check for ng-content
         // Reference: r3_template_transform.ts lines 191-204
         // Children are passed directly without extra whitespace filtering
-        if raw_name == "ng-content" {
+        // `preparseElement` lowercases the name and `isNgContent` reads the local
+        // name, so namespaced and capitalised spellings both count.
+        if split_ns_name(raw_name).1.eq_ignore_ascii_case("ng-content") {
             let selector = self.get_ng_content_selector(element);
             self.ng_content_selectors.push(selector);
 
@@ -639,8 +654,10 @@ impl<'a> HtmlToR3Transform<'a> {
             return Some(result);
         }
 
-        // Check for ng-template
-        if raw_name == "ng-template" {
+        // Check for ng-template. `isNgTemplate` reads the local name without
+        // lowering it: a namespaced `<svg:ng-template>` is a template, but a
+        // capitalised `<NG-TEMPLATE>` is an ordinary element.
+        if split_ns_name(raw_name).1 == "ng-template" {
             let name = Ident::from_in(resolved_name.as_str(), &self.allocator);
             let template = R3Template {
                 tag_name: Some(name),
@@ -684,24 +701,10 @@ impl<'a> HtmlToR3Transform<'a> {
 
         let name = Ident::from_in(resolved_name.as_str(), &self.allocator);
 
-        // Check if this is a component (uppercase first letter or underscore)
-        let first_char = raw_name.chars().next().unwrap_or('a');
-        let is_component = first_char.is_ascii_uppercase() || first_char == '_';
-
-        let mut result = if is_component {
-            // Parsed components already checked the host tag. An uppercase element
-            // from a non-selectorless parse (`<Link>`) still uses the element name.
-            if !element.is_component {
-                let tag_name_lower = raw_name.to_ascii_lowercase();
-                if UNSUPPORTED_SELECTORLESS_TAGS.contains(&tag_name_lower.as_str()) {
-                    self.report_error(
-                        &format!("Tag name \"{raw_name}\" cannot be used as a component tag"),
-                        element.start_span,
-                    );
-                    return None;
-                }
-            }
-
+        // Only the lexer decides that a tag is a selectorless component, and only when
+        // selectorless parsing is enabled. An element name is otherwise kept as written,
+        // whatever its case: `<View>` is an element named "View".
+        let mut result = if element.is_component {
             // Validate selectorless references
             self.validate_selectorless_references(&references);
 
@@ -754,7 +757,10 @@ impl<'a> HtmlToR3Transform<'a> {
                 source_span: element.span,
                 start_source_span: element.start_span,
                 end_source_span: element.end_span,
-                is_void: self.is_void_element(resolved_name.as_str()),
+                // `element.isVoid` in TypeScript is the parser's own tag-definition
+                // lookup; `HtmlElement.is_void` already holds it and is
+                // case-insensitive (`<BR>` is void upstream).
+                is_void: element.is_void,
                 i18n: i18n_meta,
             };
             R3Node::Element(Box::new_in(r3_element, &self.allocator))
@@ -5016,63 +5022,54 @@ impl<'a> HtmlToR3Transform<'a> {
     /// Gets the stylesheet href from a link element.
     /// Only returns resolvable URLs per Angular's `isStyleUrlResolvable`.
     /// Reference: style_url_resolver.ts lines 12-18
+    ///
+    /// `preparseElement` lowercases attribute names and keeps the last
+    /// `rel`/`href` when they repeat; the rel value itself is matched as
+    /// written (`relAttr == 'stylesheet'`).
     fn get_stylesheet_href(&self, element: &HtmlElement<'a>) -> Option<Ident<'a>> {
-        let mut is_stylesheet = false;
+        let mut rel = None;
         let mut href = None;
 
         for attr in &element.attrs {
-            if attr.name.as_str() == "rel" {
-                is_stylesheet = attr.value.as_str() == "stylesheet";
-            }
-            if attr.name.as_str() == "href" {
-                let href_value = attr.value.as_str();
-                // Only include resolvable URLs
-                if is_style_url_resolvable(href_value) {
-                    href = Some(attr.value);
-                }
+            if attr.name.as_str().eq_ignore_ascii_case("rel") {
+                rel = Some(attr.value.as_str());
+            } else if attr.name.as_str().eq_ignore_ascii_case("href") {
+                href = Some(attr.value);
             }
         }
 
-        if is_stylesheet { href } else { None }
+        if rel == Some("stylesheet") && href.is_some_and(|h| is_style_url_resolvable(h.as_str())) {
+            href
+        } else {
+            None
+        }
     }
 
-    /// Checks if an element is a `<link rel="stylesheet">`.
+    /// Checks whether the preparser would classify the element as
+    /// `PreparsedElementType.STYLESHEET`: `rel == "stylesheet"` on the last
+    /// case-insensitively-named `rel` attribute, with no resolvability check.
+    /// Only used inside ngNonBindable, where `NonBindableVisitor` drops every
+    /// stylesheet link regardless of its URL.
     fn is_stylesheet_link(&self, element: &HtmlElement<'a>) -> bool {
         element
             .attrs
             .iter()
-            .any(|attr| attr.name.as_str() == "rel" && attr.value.as_str() == "stylesheet")
+            .rev()
+            .find(|attr| attr.name.as_str().eq_ignore_ascii_case("rel"))
+            .is_some_and(|attr| attr.value.as_str() == "stylesheet")
     }
 
     /// Gets the ng-content selector.
+    /// `preparseElement` lowercases the attribute name, keeps the last
+    /// `select`, and defaults a missing or empty one to `*`.
     fn get_ng_content_selector(&self, element: &HtmlElement<'a>) -> Ident<'a> {
+        let mut selector = Ident::from("*");
         for attr in &element.attrs {
-            if attr.name.as_str() == "select" && !attr.value.is_empty() {
-                return attr.value;
+            if attr.name.as_str().eq_ignore_ascii_case("select") {
+                selector = attr.value;
             }
         }
-        Ident::from("*")
-    }
-
-    /// Checks if an element is a void element.
-    fn is_void_element(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "area"
-                | "base"
-                | "br"
-                | "col"
-                | "embed"
-                | "hr"
-                | "img"
-                | "input"
-                | "link"
-                | "meta"
-                | "param"
-                | "source"
-                | "track"
-                | "wbr"
-        )
+        if selector.is_empty() { Ident::from("*") } else { selector }
     }
 }
 
