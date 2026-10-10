@@ -192,8 +192,11 @@ impl<'a> HtmlParser<'a> {
         }
 
         // Close all remaining containers at EOF (error recovery)
-        // This ensures we still produce AST nodes even for unclosed elements
-        // Process from top of stack (innermost) to bottom (outermost)
+        // This ensures we still produce AST nodes even for unclosed elements.
+        // Popping drains innermost→outermost, so multiple "Unclosed block"
+        // errors come out in that order; upstream iterates `_containerStack`
+        // front-to-back and reports outermost first. (Its message and span also
+        // differ: `Unclosed block "if"` over the whole block, no `@`.)
         while let Some(container) = self.container_stack.pop() {
             match container {
                 ContainerIndex::Block(idx) => {
@@ -576,7 +579,11 @@ impl<'a> HtmlParser<'a> {
                 }
             }
             _ => {
-                // Skip unknown tokens
+                // Skip unknown tokens. Known gap: `IncompleteComponentOpen`
+                // (selectorless mode) reaches this arm and is dropped silently;
+                // upstream routes it through `_consumeComponentStartTag` and
+                // reports `Opening tag "<name>" not terminated.` Pre-existing,
+                // outside this PR's scope.
                 self.advance();
             }
         }
@@ -1343,6 +1350,8 @@ impl<'a> HtmlParser<'a> {
         let name = token.value().to_string();
 
         let name_string = if name.is_empty() { String::new() } else { format!(" \"{name}\"") };
+        // Upstream reports on the token's full sourceSpan; `make_error` gives a
+        // zero-width span at `start` (pre-existing).
         let err = self.make_error(
             start,
             format!(
@@ -1635,6 +1644,9 @@ impl<'a> HtmlParser<'a> {
             }
         }
 
+        // Upstream ends the block span at `_peek.sourceSpan.fullStart`; we use
+        // `start`. Inert today: `leading_trivia_chars` is never enabled, so
+        // `fullStart == start`.
         let end = self.peek().map(|t| t.start).unwrap_or(start);
         let span = self.make_span(start, end);
         let name_span = self.make_span(start, name_end);

@@ -3795,6 +3795,12 @@ pub fn transform_angular_file(
                         class_name, template_url
                     )));
                 }
+                // A `template:` value that isn't statically resolvable
+                // (`extract_string_value` returned `None`) reaches neither
+                // branch: the component is emitted with no ɵcmp and no
+                // diagnostic. Upstream errors instead ("Unresolved identifier
+                // found for @Component.template field" in local mode /
+                // "template must be a string") — pre-existing gap.
             } else {
                 // Not a @Component - check if it's a @Directive
                 // We need to compile @Directive classes properly to generate ɵdir/ɵfac
@@ -4739,12 +4745,21 @@ impl<'s> TemplateOrigin<'s> {
         template: &str,
         path: &'s str,
         source: &'s str,
+        resolved_resources: Option<&ResolvedResources>,
     ) -> Self {
+        // With `templateUrl` set and resolved resources present, the resolved
+        // template is the external file even when the inline `template` happens
+        // to hold identical text (`resolve_template` prefers the URL, matching
+        // upstream `parseTemplateDeclaration`'s isInline:false). With no
+        // resources, `resolve_template` skipped the URL and `template` is
+        // whatever inline text existed — fall through to the InSource checks.
+        if let Some(url) = &metadata.template_url
+            && resolved_resources.is_some()
+        {
+            return Self::External { url: url.as_str() };
+        }
         if metadata.template.as_ref().is_none_or(|inline| inline.as_str() != template) {
-            return match &metadata.template_url {
-                Some(url) => Self::External { url: url.as_str() },
-                None => Self::Unknown,
-            };
+            return Self::Unknown;
         }
         match metadata.template_span {
             Some(span) if source.get(span.start as usize..span.end as usize) == Some(template) => {
@@ -4808,7 +4823,10 @@ fn compile_component_full<'a>(
 
     // Partial-mode early branch: skip the entire template pipeline.
     // Partial declarations carry the template as a verbatim string and
-    // let the linker re-parse at consumer build time.
+    // let the linker re-parse at consumer build time. Known gap: this also
+    // means template parse errors (incl. `IncompleteBlockOpen`) go unreported
+    // for library builds — upstream ngtsc still parses the template in
+    // declaration mode and surfaces those diagnostics.
     if matches!(options.compilation_mode, crate::CompilationMode::Partial) {
         return Ok(compile_component_partial(
             allocator,
@@ -4839,7 +4857,8 @@ fn compile_component_full<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
-        let template_origin = TemplateOrigin::of_component(metadata, template, file_path, source);
+        let template_origin =
+            TemplateOrigin::of_component(metadata, template, file_path, source, resolved_resources);
         for error in &html_result.errors {
             diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
@@ -5220,7 +5239,13 @@ fn compile_component_full<'a>(
         host_binding_next_pool_index.unwrap_or_else(|| job.pool.next_name_index());
 
     // Collect any diagnostics from the compilation job
-    // (Done after using job to avoid borrow issues)
+    // (Done after using job to avoid borrow issues).
+    // Non-error job diagnostics are collected here but discarded:
+    // `FullCompilationResult` has no diagnostics field, and downstream napi
+    // maps every `TransformResult.diagnostics` entry into `errors` while
+    // hardcoding `warnings: vec![]` — so a warning-severity diagnostic would
+    // surface as an error and the Vite plugin's `result.warnings` arm stays
+    // unreachable. Splitting warnings through is beyond this PR's scope.
     diagnostics.extend(job.diagnostics);
 
     Ok(FullCompilationResult {
@@ -5338,6 +5363,10 @@ pub fn compile_component_template<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        // `file_path` names the component's file while error offsets point into
+        // the template text — a source label would land in the wrong buffer, so
+        // positions stay template-relative (same as `compile_template_for_hmr`
+        // and `compile_template_for_linker`).
         let template_origin = TemplateOrigin::Unknown;
         for error in &html_result.errors {
             diagnostics.push(html_parse_error_diagnostic(error, &template_origin));

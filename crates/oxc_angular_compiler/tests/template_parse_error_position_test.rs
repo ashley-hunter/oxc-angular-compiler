@@ -118,6 +118,31 @@ export class Cut {}
     assert_eq!(diagnostic.help.as_deref(), Some("./cut.html:2:3"));
 }
 
+/// `templateUrl` wins even when the inline `template` holds identical text:
+/// the error belongs to the external file, not the inline literal.
+#[test]
+fn template_url_wins_when_inline_template_matches() {
+    let template = "<p>a</p>@if (cond) text";
+    let source = "import { Component } from '@angular/core';
+@Component({
+  selector: 'x-cut',
+  template: '<p>a</p>@if (cond) text',
+  templateUrl: './cut.html',
+})
+export class Cut {}
+";
+    let mut templates = HashMap::new();
+    templates.insert("./cut.html".to_string(), template.to_string());
+    let resources = ResolvedResources { templates, styles: HashMap::new() };
+    let diagnostics = transform(source, Some(&resources));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {diagnostics:?}");
+    };
+    assert_eq!(diagnostic.message, INCOMPLETE_IF);
+    assert!(labelled(diagnostic, source).is_empty());
+    assert_eq!(diagnostic.help.as_deref(), Some("./cut.html:1:9"));
+}
+
 /// The template-only entry point renders diagnostics against the template itself.
 #[test]
 fn incomplete_block_through_compile_template_to_js() {

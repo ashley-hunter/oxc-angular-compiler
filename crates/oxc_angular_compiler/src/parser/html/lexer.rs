@@ -972,7 +972,11 @@ impl<'a> HtmlLexer<'a> {
             let check_str = format!("@{block_name}");
             if self.starts_with(&check_str) {
                 // Make sure the block name is not followed by an identifier char
-                // (e.g., "@iffy" should not match "@if")
+                // (e.g., "@iffy" should not match "@if"). Deliberate divergence
+                // from upstream `_isBlockStart`, which is a pure `_peekStr`
+                // prefix match: there `@ifx`/`@else5` lex as
+                // IncompleteBlockOpen ("Incomplete block \"ifx\"") instead of
+                // staying plain text.
                 let next_char_index = self.index as usize + check_str.len();
                 if next_char_index >= self.input.len() {
                     return true; // At end of input, it's a match
@@ -1120,7 +1124,13 @@ impl<'a> HtmlLexer<'a> {
             }
         }
 
-        // Normalize whitespace: collapse multiple spaces/tabs into single space
+        // Normalize whitespace: collapse multiple spaces/tabs into single space.
+        // Upstream `_getBlockName` only `.trim()`s, so a name like `else  if`
+        // keeps its double space in the "Incomplete block" message, `else\nif`
+        // fails its `/^else[^\S\r\n]+if/` else-if pattern (no newline allowed),
+        // and `default  never` fails the strict `=== 'default never'` check
+        // that accepts `@default never;`. Here they normalize to
+        // `else if`/`default never` and are accepted.
         let raw = self.input[name_start as usize..self.index as usize].trim();
         let mut result = String::with_capacity(raw.len());
         let mut prev_was_whitespace = false;
@@ -1414,7 +1424,10 @@ impl<'a> HtmlLexer<'a> {
             let mut paren_depth = 0;
 
             // Consume the parameter until the next semicolon or closing paren.
-            // Note that we skip over semicolons inside of strings.
+            // Note that we skip over semicolons inside of strings and inside
+            // nested parens — upstream's `_consumeBlockParameters` tracks
+            // `openParens` only for `)` and splits on any `;` outside quotes,
+            // so `@for (i of f(a; b))` is one parameter here, two upstream.
             while self.index < self.length {
                 let ch = self.peek();
 

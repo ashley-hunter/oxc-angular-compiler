@@ -99,6 +99,13 @@ pub fn extract_component_metadata<'a>(
                             .filter(|s| !s.as_str().is_empty());
                 }
                 "template" => {
+                    // A value that isn't statically resolvable (e.g. a
+                    // template literal referencing an unknown identifier)
+                    // leaves `metadata.template` as `None`: the caller then
+                    // emits the component with no ɵcmp and no diagnostic.
+                    // Upstream errors instead ("Unresolved identifier found
+                    // for @Component.template field" in local mode,
+                    // "template must be a string" otherwise) — pre-existing.
                     metadata.template =
                         crate::directive::extract_string_value(allocator, &prop.value, consts);
                     // The text between the quotes or backticks.
