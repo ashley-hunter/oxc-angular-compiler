@@ -292,3 +292,30 @@ export class X {}
         "expected the position-0 styles error, got {diagnostics:?}"
     );
 }
+
+/// ngtsc folds duplicate `styles` properties into a Map — the last key is the
+/// only one `parseDirectiveStyles` sees.
+#[test]
+fn the_last_styles_property_wins() {
+    // A bad `styles` a later good one shadows is never read upstream.
+    let (code, diagnostics) = compile(&source("", "styles: 1, styles: ['.a { color: red }']"));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(compiled_styles("", "styles: 1, styles: ['.a { color: red }']").is_some());
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains(r#"styles:[".a[_ngcontent-%COMP%]{color:red}"]"#), "{compact}");
+
+    // A good `styles` a later bad one shadows is fully replaced, error and all.
+    let (code, diagnostics) = compile(&source("", "styles: ['.a { color: red }'], styles: 1"));
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {diagnostics:?}");
+    };
+    assert_eq!(
+        diagnostic.message,
+        "Failed to resolve @Component.styles to a string or an array of strings Value is of type \
+         'number'.",
+    );
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let definition = &compact[compact.find("i0.ɵɵdefineComponent(").expect("definition")..];
+    let definition = &definition[..definition.find("(()=>{").unwrap_or(definition.len())];
+    assert!(!definition.contains("styles:"), "{compact}");
+}

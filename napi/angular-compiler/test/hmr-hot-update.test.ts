@@ -3514,7 +3514,11 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
 
     // A cross-file reference is unreadable to the extractor, which sees one
-    // file: the answer is unknown and must not clear the live CSS.
+    // file: the answer is unknown and must not clear the live CSS. The
+    // transform runs on the source exactly as it sits on disk — Vite hands
+    // `transform` the file content and resolveImportedValues follows the
+    // import — so disk source and compiled source are byte-identical and the
+    // stylesResolved leg, not the strip match, is what keeps the styles.
     const diskSource = `
       import { Component } from '@angular/core';
       import { PS458_IMP } from './ps458-imp-styles';
@@ -3527,11 +3531,7 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     `
     writeFileSync(impPath, diskSource)
 
-    const transformCode = diskSource.replace(
-      'styles: PS458_IMP',
-      `styles: ['.PS458_IMP_MARKER { color: red; }']`,
-    )
-    const transformed = await transformSource(plugin, transformCode, impPath)
+    const transformed = await transformSource(plugin, diskSource, impPath)
     expect(transformed?.code ?? '').toContain('PS458_IMP_MARKER')
 
     writeFileSync(impHtmlPath, '<p>two</p>')
@@ -3550,6 +3550,61 @@ describe('@ng/component endpoint resolves the styles per class', () => {
     )
     expect(body).not.toBe('')
     expect(body).toContain('two')
+    expect(body).not.toContain('styles:')
+  })
+
+  it('keeps the styles of a class mixing imported `styles` with `styleUrls`', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithRealConfig(plugin)
+
+    const mixHtmlPath = join(appDir, 'ps458-mix.component.html')
+    const mixPath = join(appDir, 'ps458-mix.component.ts')
+    writeFileSync(mixHtmlPath, '<p>one</p>')
+    writeFileSync(
+      join(appDir, 'ps458-mix-styles.ts'),
+      `export const PS458_MIX = ['.PS458_MIX_MARKER { color: red; }'];\n`,
+    )
+    writeFileSync(join(appDir, 'ps458-mix.css'), '.PS458_MIX_EXT { color: blue; }\n')
+
+    // The transform resolves the import and compiles BOTH style lists. The
+    // extractor resolves neither `PS458_MIX` nor the inline styles the import
+    // holds — merged would be only the external CSS, a partial answer that
+    // must not be served as the component's styles.
+    const diskSource = `
+      import { Component } from '@angular/core';
+      import { PS458_MIX } from './ps458-mix-styles';
+      @Component({
+        selector: 'app-ps458-mix',
+        templateUrl: './ps458-mix.component.html',
+        styles: PS458_MIX,
+        styleUrls: ['./ps458-mix.css'],
+      })
+      export class MixedStylesComponent {}
+    `
+    writeFileSync(mixPath, diskSource)
+
+    const transformed = await transformSource(plugin, diskSource, mixPath)
+    expect(transformed?.code ?? '').toContain('PS458_MIX_MARKER')
+    expect(transformed?.code ?? '').toContain('PS458_MIX_EXT')
+
+    writeFileSync(mixHtmlPath, '<p>two</p>')
+    await callHandleHotUpdate(
+      plugin,
+      createMockHmrContext(
+        normalizePath(mixHtmlPath),
+        [{ id: normalizePath(mixHtmlPath) }],
+        mockServer,
+      ),
+    )
+
+    const body = await invokeAngularMiddleware(
+      getMiddleware(mockServer),
+      `${mixPath}@MixedStylesComponent`,
+    )
+    expect(body).not.toBe('')
+    expect(body).toContain('two')
+    // Serving only the external CSS here would silently drop the imported
+    // inline styles the component was compiled with.
     expect(body).not.toContain('styles:')
   })
 

@@ -106,6 +106,12 @@ pub fn extract_component_metadata<'a>(
                         crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "styles" => {
+                    // ngtsc's `reflectObjectLiteral` drops computed keys and
+                    // folds duplicate `styles` entries with `Map.set` — the
+                    // last one is the only one `parseDirectiveStyles` sees.
+                    if prop.computed {
+                        continue;
+                    }
                     // Anything that isn't styles is an error `styles_error` reports.
                     match crate::directive::evaluate_styles(&prop.value, consts) {
                         Ok(styles) => {
@@ -113,11 +119,16 @@ pub fn extract_component_metadata<'a>(
                                 styles.iter().map(|style| Ident::from(allocator.alloc_str(style))),
                                 &allocator,
                             );
+                            // A later `styles:` overwrites an earlier failed
+                            // one: `Map.set` makes the last entry the only
+                            // one upstream reads.
+                            metadata.styles_resolved = true;
                         }
                         Err(_) => {
                             // Failed evaluation is reported as a diagnostic;
                             // here it marks the value unknown so readers do
                             // not mistake the empty array for "no styles".
+                            metadata.styles.clear();
                             metadata.styles_resolved = false;
                         }
                     }
