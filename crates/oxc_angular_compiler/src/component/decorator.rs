@@ -106,12 +106,20 @@ pub fn extract_component_metadata<'a>(
                         crate::directive::extract_string_value(allocator, &prop.value, consts);
                 }
                 "styles" => {
-                    // Anything that isn't styles is an error `decorator_io_errors` reports.
-                    if let Ok(styles) = crate::directive::evaluate_styles(&prop.value, consts) {
-                        metadata.styles = Vec::from_iter_in(
-                            styles.iter().map(|style| Ident::from(allocator.alloc_str(style))),
-                            &allocator,
-                        );
+                    // Anything that isn't styles is an error `styles_error` reports.
+                    match crate::directive::evaluate_styles(&prop.value, consts) {
+                        Ok(styles) => {
+                            metadata.styles = Vec::from_iter_in(
+                                styles.iter().map(|style| Ident::from(allocator.alloc_str(style))),
+                                &allocator,
+                            );
+                        }
+                        Err(_) => {
+                            // Failed evaluation is reported as a diagnostic;
+                            // here it marks the value unknown so readers do
+                            // not mistake the empty array for "no styles".
+                            metadata.styles_resolved = false;
+                        }
                     }
                 }
                 "styleUrls" | "styleUrl" => {

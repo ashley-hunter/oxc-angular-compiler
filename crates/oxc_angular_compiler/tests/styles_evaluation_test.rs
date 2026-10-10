@@ -250,3 +250,45 @@ fn style_urls_alongside_evaluated_styles() {
         "{compact}"
     );
 }
+
+/// ngtsc reads `styles` in the component handler, after
+/// `extractDirectiveMetadata` has already thrown for the constructor checks.
+/// A component with an invalid constructor parameter AND invalid `styles`
+/// reports the parameter error, not the styles one.
+#[test]
+fn constructor_errors_come_before_styles_errors() {
+    let source = "import { Component, Inject } from '@angular/core';
+import { OTHER } from './other';
+@Component({ selector: 'x', template: '', styles: [OTHER] })
+export class X {
+  constructor(@Inject() t: unknown) {}
+}
+";
+    let (_, diagnostics) = compile(source);
+    let [diagnostic] = diagnostics.as_slice() else {
+        panic!("expected exactly one diagnostic, got {diagnostics:?}");
+    };
+    assert!(
+        diagnostic.message.contains("Unexpected number of arguments to @Inject()"),
+        "expected the constructor error first, got: {diagnostic:?}"
+    );
+}
+
+/// ngtsc keeps `EnumValue` identity across module resolution, so an imported
+/// enum member is a wrong-type error, same as a same-file one. The evaluator
+/// must not unwrap the enum to its value when a binding crosses files
+/// (checked same-file here; the cross-file path shares `Value::Enum`).
+#[test]
+fn enum_members_are_not_strings() {
+    let source = "enum E { A = '.a{}' }
+import { Component } from '@angular/core';
+const _ = E.A;
+@Component({ selector: 'x', template: '', styles: [E.A] })
+export class X {}
+";
+    let (_, diagnostics) = compile(source);
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("Failed to resolve styles at position 0")),
+        "expected the position-0 styles error, got {diagnostics:?}"
+    );
+}

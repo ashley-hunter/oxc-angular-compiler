@@ -821,8 +821,16 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                       stripComponentMetadata(source, componentDecoratorsByFile.get(fileId))
                   )
                 }
+                // `stylesResolved` is the third leg of "may we clear": the
+                // extractor here evaluates `styles` without the
+                // `resolveImportedValues` the transform runs with, so a
+                // component whose styles live in another file extracts
+                // `styles: []` — an UNKNOWN answer, not an empty one. Serving
+                // it as definitive would wipe live CSS that the transform
+                // compiled from the import.
                 const styles: string[] | null =
-                  merged.length > 0 || (external.complete && compiledFromThisSource())
+                  merged.length > 0 ||
+                  (external.complete && compiledFromThisSource() && classMetadata.stylesResolved)
                     ? merged
                     : null
 

@@ -44,7 +44,7 @@ use crate::directive::collect_string_consts;
 use crate::directive::{
     R3QueryMetadata, create_content_queries_function, create_view_queries_function,
     decorator_io_errors, extract_class_queries, extract_directive_metadata,
-    find_directive_decorator, generate_directive_definitions, param_decorator_errors,
+    find_directive_decorator, generate_directive_definitions, param_decorator_errors, styles_error,
 };
 use crate::dts;
 use crate::injectable::{
@@ -3382,7 +3382,14 @@ pub fn transform_angular_file(
                 // throws earlier — malformed decorator args, a missing
                 // selector — for shapes oxc doesn't diagnose yet, so this
                 // can be the first error where ngtsc would report another.
-                result.diagnostics.extend(param_decorator_errors(class, &string_consts));
+                let param_errors = param_decorator_errors(class, &string_consts);
+                result.diagnostics.extend(param_errors.iter().cloned());
+                if param_errors.is_empty() {
+                    // `styles` resolves in the component handler, after
+                    // `extractDirectiveMetadata` — including the constructor
+                    // checks above — has passed.
+                    result.diagnostics.extend(styles_error(class, &string_consts));
+                }
             }
 
             if let Some(mut metadata) = extract_component_metadata(
