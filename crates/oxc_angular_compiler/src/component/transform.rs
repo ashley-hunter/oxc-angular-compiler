@@ -4719,6 +4719,77 @@ fn compile_component_partial<'a>(
     }
 }
 
+/// Where a template's text lives, so a parse error in it can be reported with a position.
+enum TemplateOrigin<'s> {
+    /// The text is `source[offset..]`, and `source` is the text the diagnostics are
+    /// rendered against.
+    InSource { path: &'s str, source: &'s str, offset: u32 },
+    /// The text is a separate file, named as the component wrote its `templateUrl`.
+    External { url: &'s str },
+    /// The text cannot be located in a file.
+    Unknown,
+}
+
+impl<'s> TemplateOrigin<'s> {
+    /// The origin of a component's template: its `templateUrl` file, or its inline
+    /// template when that appears verbatim in the source. An inline template written
+    /// with escapes or built from several strings has no exact position.
+    fn of_component(
+        metadata: &'s ComponentMetadata<'_>,
+        template: &str,
+        path: &'s str,
+        source: &'s str,
+    ) -> Self {
+        if metadata.template.as_ref().is_none_or(|inline| inline.as_str() != template) {
+            return match &metadata.template_url {
+                Some(url) => Self::External { url: url.as_str() },
+                None => Self::Unknown,
+            };
+        }
+        match metadata.template_span {
+            Some(span) if source.get(span.start as usize..span.end as usize) == Some(template) => {
+                Self::InSource { path, source, offset: span.start }
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The 1-based line and column of a byte offset in `text`, counting columns in characters.
+fn line_and_column(text: &str, offset: u32) -> (usize, usize) {
+    let before = &text[..(offset as usize).min(text.len())];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    (before.matches('\n').count() + 1, before[line_start..].chars().count() + 1)
+}
+
+/// Converts an HTML parse error to a diagnostic that says where it is: as a label when
+/// the template is part of the rendered source, and always as `file:line:column` (or a
+/// line and column within the template) in the help text.
+fn html_parse_error_diagnostic(
+    error: &crate::util::ParseError,
+    origin: &TemplateOrigin<'_>,
+) -> OxcDiagnostic {
+    let diagnostic = OxcDiagnostic::error(error.msg.clone());
+    let (start, end) = (error.span.start.offset, error.span.end.offset);
+    let template = &*error.span.start.file.content;
+    match origin {
+        TemplateOrigin::InSource { path, source, offset } => {
+            let (line, column) = line_and_column(source, offset + start);
+            diagnostic
+                .with_label(Span::new(offset + start, offset + end.max(start)))
+                .with_help(format!("{path}:{line}:{column}"))
+        }
+        TemplateOrigin::External { url } => {
+            let (line, column) = line_and_column(template, start);
+            diagnostic.with_help(format!("{url}:{line}:{column}"))
+        }
+        TemplateOrigin::Unknown => {
+            let (line, column) = line_and_column(template, start);
+            diagnostic.with_help(format!("line {line}, column {column} of the template"))
+        }
+    }
+}
+
 fn compile_component_full<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -4768,8 +4839,9 @@ fn compile_component_full<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        let template_origin = TemplateOrigin::of_component(metadata, template, file_path, source);
         for error in &html_result.errors {
-            diagnostics.push(OxcDiagnostic::error(error.msg.clone()));
+            diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
         return Err(diagnostics);
     }
@@ -5266,8 +5338,9 @@ pub fn compile_component_template<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        let template_origin = TemplateOrigin::Unknown;
         for error in &html_result.errors {
-            diagnostics.push(OxcDiagnostic::error(error.msg.clone()));
+            diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
         return Err(diagnostics);
     }
@@ -5365,8 +5438,10 @@ pub fn compile_template_to_js_with_options<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        let template_origin =
+            TemplateOrigin::InSource { path: file_path, source: template, offset: 0 };
         for error in &html_result.errors {
-            diagnostics.push(OxcDiagnostic::error(error.msg.clone()));
+            diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
         return Err(diagnostics);
     }
@@ -5543,8 +5618,10 @@ pub fn compile_template_for_hmr<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        let template_origin =
+            TemplateOrigin::InSource { path: file_path, source: template, offset: 0 };
         for error in &html_result.errors {
-            diagnostics.push(OxcDiagnostic::error(error.msg.clone()));
+            diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
         return Err(diagnostics);
     }
@@ -6279,8 +6356,9 @@ pub fn compile_template_for_linker<'a>(
     let html_result = parser.parse();
 
     if !html_result.errors.is_empty() {
+        let template_origin = TemplateOrigin::Unknown;
         for error in &html_result.errors {
-            diagnostics.push(OxcDiagnostic::error(error.msg.clone()));
+            diagnostics.push(html_parse_error_diagnostic(error, &template_origin));
         }
         return Err(diagnostics);
     }

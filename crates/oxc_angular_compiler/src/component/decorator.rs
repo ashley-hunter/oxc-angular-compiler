@@ -101,6 +101,15 @@ pub fn extract_component_metadata<'a>(
                 "template" => {
                     metadata.template =
                         crate::directive::extract_string_value(allocator, &prop.value, consts);
+                    // The text between the quotes or backticks.
+                    metadata.template_span = match &prop.value {
+                        Expression::StringLiteral(lit) => Some(lit.span),
+                        Expression::TemplateLiteral(lit) if lit.expressions.is_empty() => {
+                            Some(lit.span)
+                        }
+                        _ => None,
+                    }
+                    .map(|span| Span::new(span.start + 1, span.end - 1));
                 }
                 "templateUrl" => {
                     metadata.template_url =
