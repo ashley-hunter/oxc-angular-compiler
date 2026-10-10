@@ -18,8 +18,9 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    StringConsts, extract_host_bindings_in, extract_host_listeners_in, extract_input_metadata_in,
-    extract_output_metadata_in, merge_by_class_property, parse_decorator_io,
+    HostKey, StringConsts, extract_host_bindings_in, extract_host_listeners_in,
+    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
+    parse_decorator_io,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -155,7 +156,13 @@ pub fn extract_component_metadata<'a>(
                     metadata.change_detection = Some(extract_change_detection(&prop.value));
                 }
                 "host" => {
-                    metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                    // ngtsc's `reflectObjectLiteral` drops computed keys, and
+                    // `host_metadata_error` doesn't see this property either —
+                    // an invalid one must not be applied here where it would
+                    // be dropped silently.
+                    if !prop.computed {
+                        metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                    }
                 }
                 "imports" => {
                     // For standalone components, we need:
@@ -234,6 +241,13 @@ pub fn extract_component_metadata<'a>(
 
     // Extract host bindings and listeners from @HostBinding/@HostListener decorators on class members
     // These are merged with any host metadata from the @Component({ host: {} }) property
+    //
+    // Divergence from ngtsc (pre-existing merge structure): upstream assigns
+    // member entries into `bindings.properties[name]` / `bindings.listeners`
+    // [eventName], overwriting same-named `host:` entries so one binding per
+    // key remains. Here they are appended instead, so a key declared in both
+    // emits two bindings — both listeners fire, and both property ops emit
+    // (the member's, applied last, still wins like upstream).
     let host_bindings = extract_host_bindings_in(allocator, class, Some(consts));
     let host_listeners = extract_host_listeners_in(allocator, class, Some(consts));
 
@@ -498,70 +512,37 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
     }
 }
 
-/// Extract host metadata from a host object expression.
+/// Extract host metadata from a host expression.
 ///
 /// Reference: packages/compiler/src/render3/view/compiler.ts:560-604
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
-    expr: &Expression<'a>,
+    expr: &'a Expression<'a>,
     consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
-    let Expression::ObjectExpression(obj) = expr else {
-        return None;
-    };
+    // An unusable host is reported by `decorator_io_errors`.
+    let entries =
+        crate::directive::evaluate_host_metadata(allocator, expr, "Component", consts).ok()?;
 
-    let mut host = HostMetadata {
-        properties: Vec::new_in(&allocator),
-        attributes: Vec::new_in(&allocator),
-        listeners: Vec::new_in(&allocator),
-        class_attr: None,
-        style_attr: None,
-    };
-
-    for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop
-            && is_metadata_property(prop)
-        {
-            let Some(key_name) = get_property_key_name(&prop.key, consts) else {
-                continue;
-            };
-            let Some(value) =
-                crate::directive::extract_string_value(allocator, &prop.value, consts)
-            else {
-                continue;
-            };
-
-            let key_str = key_name.as_str();
-
-            if key_str.starts_with('[') && key_str.ends_with(']') {
-                // Property binding: [class.active]
-                host.properties.push((key_name, value));
-            } else if key_str.starts_with('(') && key_str.ends_with(')') {
-                // Event listener: (click)
-                host.listeners.push((key_name, value));
-            } else {
-                // Check for special attributes (class and style)
-                // Reference: compiler.ts:567-588
-                match key_str {
-                    "class" => {
-                        host.class_attr = Some(value);
-                    }
-                    "style" => {
-                        host.style_attr = Some(value);
-                    }
-                    _ => {
-                        // Regular static attribute
-                        host.attributes.push((key_name, value));
-                    }
-                }
-            }
+    let mut host = HostMetadata::new(allocator);
+    for (key, value) in entries {
+        match HostKey::of(key.as_str()) {
+            HostKey::Property => host.properties.push((key, value)),
+            HostKey::Listener => host.listeners.push((key, value)),
+            HostKey::Class => host.class_attr = Some(value),
+            HostKey::Style => host.style_attr = Some(value),
+            HostKey::Attribute => host.attributes.push((key, value)),
         }
     }
-
     Some(host)
 }
 
 /// Extract host directives from a hostDirectives array expression.
+///
+/// Divergence from ngtsc's `extractHostDirectives`: upstream evaluates the
+/// expression with the partial evaluator (a const or spread array works, a
+/// non-array is an error). Here only a literal `ArrayExpression` is read and
+/// anything else yields no host directives, with no diagnostic.
 ///
 /// Handles the following patterns:
 /// - Simple identifier: `hostDirectives: [TooltipDirective]`
@@ -750,6 +731,9 @@ fn extract_forward_ref_directive_name<'a>(arg: Option<&Argument<'a>>) -> Option<
 /// - Mapping string: `["color: bgColor"]` - public name mapped to internal name
 ///
 /// Returns Vec of (publicName, internalName) pairs.
+///
+/// Divergence: ngtsc evaluates the array with the partial evaluator, so a
+/// const or a spread works; here only a literal `ArrayExpression` is read.
 fn extract_io_mappings<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,

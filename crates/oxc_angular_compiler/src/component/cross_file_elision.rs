@@ -106,6 +106,13 @@ impl ImportValueResolver for CrossFileResolver {
     fn resolve(&self, module: &str, name: &str) -> Option<crate::directive::StaticValue> {
         self.inner.resolve_export_value(module, name, &self.from_file)
     }
+
+    fn exports(
+        &self,
+        module: &str,
+    ) -> Option<Vec<(String, Option<crate::directive::StaticValue>)>> {
+        self.inner.export_values_of(module, &self.from_file)
+    }
 }
 
 impl CrossFileAnalyzer {
@@ -339,6 +346,94 @@ impl Inner {
             self.analyze_file(&resolved);
         }
         self.export_value_at(&resolved, import_name, 0)
+    }
+
+    /// Every value `import_source` exports, for `{ ...ns }` with
+    /// `import * as ns` (ngtsc's `ResolvedModule.getExports()`): each name
+    /// with the value it resolves to, or `None` for one that can't be read
+    /// statically — ngtsc keeps those as `DynamicValue`s in the object rather
+    /// than dropping the key. `None` for the whole map when the module can't
+    /// be resolved, like [`Self::resolve_export_value`].
+    fn export_values_of(
+        &self,
+        import_source: &str,
+        from_file: &Path,
+    ) -> Option<Vec<(String, Option<crate::directive::StaticValue>)>> {
+        let parent = from_file.parent()?;
+        let resolved = self.resolver.resolve(parent, import_source).ok()?;
+        let resolved_path = resolved.full_path();
+        if resolved_path.components().any(|c| c.as_os_str() == "node_modules") {
+            return None;
+        }
+        let resolved = resolved_path.to_string_lossy().to_string();
+        self.value_dependencies.borrow_mut().insert(resolved.clone());
+        if !self.cache.borrow().contains_key(&resolved) {
+            if self.analyzing.borrow().contains(&resolved) {
+                return None; // Circular import
+            }
+            self.analyze_file(&resolved);
+        }
+        let mut names = Vec::new();
+        self.export_names_at(&resolved, &mut FxHashSet::default(), &mut names);
+        Some(
+            names
+                .into_iter()
+                .map(|name| {
+                    let value = self.export_value_at(&resolved, &name, 0);
+                    (name, value)
+                })
+                .collect(),
+        )
+    }
+
+    /// The names `file_path` exports, direct ones first — the first wins when
+    /// an `export *` re-exports a name the file also has (`getExportsOfModule`
+    /// answers one symbol per name) — then each star export's. `visited`
+    /// guards circular `export *` chains.
+    fn export_names_at(
+        &self,
+        file_path: &str,
+        visited: &mut FxHashSet<String>,
+        names: &mut Vec<String>,
+    ) {
+        if !visited.insert(file_path.to_string()) {
+            return;
+        }
+        let Some(exports) = self.cache.borrow().get(file_path).cloned() else {
+            return;
+        };
+        // `export *` sources, stored under their `*:` keys (see
+        // `find_in_star_exports_inner`). `export * as ns` carries the same
+        // `(source, "*")` marker but exports `ns` as one name — it isn't
+        // enumerated flat.
+        let star_sources: Vec<String> = exports
+            .iter()
+            .filter(|(key, _)| key.starts_with("*:"))
+            .filter_map(|(_, info)| {
+                info.re_export_source.as_ref().map(|(source, _)| source.clone())
+            })
+            .collect();
+        for name in exports.keys() {
+            if !name.starts_with("*:") && !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let Some(file_parent) = Path::new(file_path).parent() else {
+            return;
+        };
+        for source in star_sources {
+            let Some(resolved) = self.resolve_module_spec(file_parent, &source) else {
+                continue;
+            };
+            self.value_dependencies.borrow_mut().insert(resolved.clone());
+            if !self.cache.borrow().contains_key(&resolved) {
+                if self.analyzing.borrow().contains(&resolved) {
+                    continue;
+                }
+                self.analyze_file(&resolved);
+            }
+            self.export_names_at(&resolved, visited, names);
+        }
     }
 
     /// The value `export_name` binds to in `file_path`, direct or through
