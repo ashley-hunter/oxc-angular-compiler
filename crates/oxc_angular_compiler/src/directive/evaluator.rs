@@ -1298,7 +1298,24 @@ pub(crate) trait ImportValueResolver {
     /// The exported value of `name` in `module`, as `module` is written in
     /// the importing file (`import { name } from 'module'`), or `None` when
     /// it can't be resolved or read statically.
+    ///
+    /// `None` also covers what `StaticValue` can't hold: imported functions
+    /// and classes, which ngtsc's checker evaluates through (`{ role:
+    /// make() }` calls the foreign body, `role: Cls.STATIC` reads the static
+    /// member). Those keep the opaque-import diagnostic rather than the
+    /// value upstream computes.
     fn resolve(&self, module: &str, name: &str) -> Option<StaticValue>;
+
+    /// Every value `module` exports, like `ResolvedModule.getExports()`: the
+    /// only way `{ ...ns }` (`import * as ns`) can be evaluated, since
+    /// [`Self::resolve`] answers per-name lookups. `None` for an export whose
+    /// value can't be read statically (what ngtsc keeps as a `DynamicValue` in
+    /// the object), and for the whole module when its exports can't be
+    /// enumerated.
+    fn exports(&self, module: &str) -> Option<Vec<(String, Option<StaticValue>)>> {
+        let _ = module;
+        None
+    }
 }
 
 /// ngtsc's `KnownFn`s (partial_evaluator/src/builtin.ts), bound to their receiver.
@@ -1896,6 +1913,18 @@ impl<'s, 'a> Evaluator<'s, 'a> {
                         Value::Object(inner) if self.spend(inner.len() as u32) => {
                             props.extend(inner);
                         }
+                        // `{ ...ns }` (`import * as ns`): ngtsc merges every
+                        // export of the `ResolvedModule` into the object's map
+                        // (interpreter.ts's `visitObjectLiteralExpression`).
+                        // The resolver enumerates them; an export it can't
+                        // read stands for ngtsc's `DynamicValue`.
+                        #[cfg(feature = "cross_file_elision")]
+                        Value::Module(module) => match self.module_exports(module) {
+                            Some(exports) if self.spend(exports.len() as u32) => {
+                                props.extend(exports);
+                            }
+                            _ => return Value::Dynamic,
+                        },
                         value if value.is_import() => return value.computed(),
                         _ => return Value::Dynamic,
                     }
@@ -2025,6 +2054,25 @@ impl<'s, 'a> Evaluator<'s, 'a> {
             // ngtsc marks only this element as dynamic, not the whole array.
             _ => vec![Value::Dynamic],
         }
+    }
+
+    /// The exports of `import * as ns from 'module'` as object properties, for
+    /// `{ ...ns }` (see [`Evaluator::object`]). `None` when no resolver is
+    /// attached or the module's exports can't be enumerated.
+    #[cfg(feature = "cross_file_elision")]
+    fn module_exports(&self, module: &str) -> Option<std::vec::Vec<Prop<'a>>> {
+        let exports = self.consts.resolver()?.exports(module)?;
+        Some(
+            exports
+                .into_iter()
+                .map(|(key, value)| Prop {
+                    key,
+                    value: value.map_or(Value::Dynamic, |value| value.to_value()),
+                    expr: None,
+                    origin: None,
+                })
+                .collect(),
+        )
     }
 
     fn property_key(

@@ -173,7 +173,14 @@ pub fn extract_directive_metadata<'a>(
                         }
                     }
                     "host" => {
-                        host_from_decorator = extract_host_metadata(allocator, &prop.value, consts);
+                        // ngtsc's `reflectObjectLiteral` drops computed keys,
+                        // and `host_metadata_error` doesn't see this property
+                        // either — an invalid one must not be applied here
+                        // where it would be dropped silently.
+                        if !prop.computed {
+                            host_from_decorator =
+                                extract_host_metadata(allocator, &prop.value, consts);
+                        }
                     }
                     "hostDirectives" => {
                         let host_directives =
@@ -240,6 +247,13 @@ pub fn extract_directive_metadata<'a>(
     }
 
     // Merge host metadata from decorator into the existing host metadata
+    //
+    // Divergence from ngtsc (pre-existing merge structure): upstream reads the
+    // `host:` metadata first and lets member @HostBinding/@HostListener
+    // overwrite same-named keys (`bindings.properties[name] = ...`), keeping
+    // one binding per key. Here member entries were collected first and the
+    // `host:` entries are appended, so a key declared in both emits two
+    // bindings and the `host:` value applies last — the winner is reversed.
     if let Some(decorator_host) = host_from_decorator {
         // Merge properties
         for prop in decorator_host.properties {
@@ -503,6 +517,13 @@ pub struct StringConsts<'a> {
     /// `Rc`-shared so it can borrow the analyzer that produced it.
     #[cfg(feature = "cross_file_elision")]
     resolver: Option<std::rc::Rc<dyn super::evaluator::ImportValueResolver>>,
+    /// `host:` expressions already run through [`evaluate_host_metadata`],
+    /// keyed by the expression's address and the decorator's name: the
+    /// diagnostic pass (`decorator_io_errors`) and the metadata extraction
+    /// both evaluate it, and evaluation is deterministic.
+    host_values: std::cell::RefCell<
+        HashMap<(usize, String), Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String>>,
+    >,
 }
 
 impl<'a> StringConsts<'a> {
@@ -537,6 +558,7 @@ impl<'a> StringConsts<'a> {
             scope: std::cell::OnceCell::new(),
             #[cfg(feature = "cross_file_elision")]
             resolver: None,
+            host_values: std::cell::RefCell::new(HashMap::default()),
         }
     }
 
@@ -595,6 +617,7 @@ pub fn collect_string_consts<'a>(
         scope: std::cell::OnceCell::new(),
         #[cfg(feature = "cross_file_elision")]
         resolver: None,
+        host_values: std::cell::RefCell::new(HashMap::default()),
     };
     loop {
         let before = map.strings.len();
@@ -709,7 +732,9 @@ pub(crate) struct DecoratorIo<'a> {
 }
 
 /// The last property called `name` in a decorator metadata object. Like
-/// ngtsc's `reflectObjectLiteral`, computed keys (`[K]: ...`) are skipped.
+/// ngtsc's `reflectObjectLiteral`, computed keys (`[K]: ...`), methods and
+/// accessors are skipped — `host() {}` or `get host() {}` are class members,
+/// not metadata.
 pub(super) fn config_property<'a>(
     config: &'a ObjectExpression<'a>,
     name: &str,
@@ -718,6 +743,7 @@ pub(super) fn config_property<'a>(
     config.properties.iter().rev().find_map(|prop| match prop {
         ObjectPropertyKind::ObjectProperty(prop)
             if !prop.computed
+                && is_metadata_property(prop)
                 && get_property_key_name(&prop.key, consts).is_some_and(|k| k == name) =>
         {
             Some(&prop.value)
@@ -1434,7 +1460,12 @@ pub fn decorator_io_errors<'a>(
     };
     let selector =
         || directive_selector_error(config, decorator_name, &class_name, &evaluator, consts);
-    // `extractHostBindings` runs right after the selector check.
+    // `extractHostBindings` runs right after the selector check. Only the
+    // `host:` field's errors are diagnosed here: upstream's @HostBinding /
+    // @HostListener argument checks in the same step (arity, "argument must
+    // be a string") aren't ported — `extract_host_binding_name` falls back
+    // to the member name and `parse_host_listener_config` drops a non-string
+    // argument instead of reporting it.
     let host = || host_metadata_error(allocator, config, decorator_name, consts).map(at);
 
     io.as_ref()
@@ -1878,6 +1909,24 @@ pub(crate) fn evaluate_host_metadata<'a>(
     decorator_name: &str,
     consts: &StringConsts<'a>,
 ) -> Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String> {
+    // This runs twice per decorated class — the diagnostic checks it and the
+    // metadata extraction reads the entries — so each `host:` expression is
+    // evaluated once and the result shared (`StringConsts::host_values`).
+    let key = (expr as *const Expression<'a> as usize, decorator_name.to_string());
+    if let Some(cached) = consts.host_values.borrow().get(&key) {
+        return cached.clone();
+    }
+    let result = evaluate_host_metadata_uncached(allocator, expr, decorator_name, consts);
+    consts.host_values.borrow_mut().insert(key, result.clone());
+    result
+}
+
+fn evaluate_host_metadata_uncached<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    decorator_name: &str,
+    consts: &StringConsts<'a>,
+) -> Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String> {
     let subject = format!("@{decorator_name}.host");
     let host = Evaluator::new(consts).evaluate(expr);
     let Value::Object(props) = &host else {
@@ -1890,7 +1939,17 @@ pub(crate) fn evaluate_host_metadata<'a>(
 
     let alloc = |s: &str| Ident::from(allocator.alloc_str(s));
     let mut entries = std::vec::Vec::<(Ident<'a>, Ident<'a>)>::with_capacity(props.len());
+    // ngtsc reports unparseable values while building the host map, binding
+    // kinds in `parseHostBindings` afterwards, and `verifyHostBindings` last:
+    // the first error of an earlier step wins over every later one.
+    let mut parse_error = None;
     for prop in props {
+        // `hostMetaMap.forEach` assigns to `hostMetadata['__proto__']`, which
+        // sets the object's prototype instead of adding a key, so the entry
+        // never reaches `parseHostBindings` (as in `upsert_meta`).
+        if prop.key == "__proto__" {
+            continue;
+        }
         if entries.iter().any(|(key, _)| key.as_str() == prop.key) {
             continue;
         }
@@ -1904,19 +1963,24 @@ pub(crate) fn evaluate_host_metadata<'a>(
             Value::String(s) => entries.push((alloc(&prop.key), alloc(s))),
             // ngtsc's `DynamicValue`. `parseHostBindings` rejects it for everything but
             // a plain attribute, whose expression it emits as it is written.
+            // Upstream throws these as bare `Error`s (a compiler crash, no
+            // node); here they surface as diagnostics on the host expression
+            // like the rest of `decorator_io_errors`.
             _ if value.is_dynamic() || matches!(value, Value::Function(_)) => {
-                return Err(match HostKey::of(&prop.key) {
-                    HostKey::Property => "Property binding must be string".to_string(),
-                    HostKey::Listener => "Event binding must be string".to_string(),
-                    HostKey::Class => "Class binding must be string".to_string(),
-                    HostKey::Style => "Style binding must be string".to_string(),
-                    HostKey::Attribute => format!(
-                        "Decorator host metadata must be a string -> string object, but the \
-                         value of '{}' could not be determined statically. OXC does not \
-                         support dynamic host attribute values.",
-                        prop.key
-                    ),
-                });
+                if parse_error.is_none() {
+                    parse_error = Some(match HostKey::of(&prop.key) {
+                        HostKey::Property => "Property binding must be string".to_string(),
+                        HostKey::Listener => "Event binding must be string".to_string(),
+                        HostKey::Class => "Class binding must be string".to_string(),
+                        HostKey::Style => "Style binding must be string".to_string(),
+                        HostKey::Attribute => format!(
+                            "Decorator host metadata must be a string -> string object, but the \
+                             value of '{}' could not be determined statically. OXC does not \
+                             support dynamic host attribute values.",
+                            prop.key
+                        ),
+                    });
+                }
             }
             _ => {
                 return Err(value_error(
@@ -1929,6 +1993,34 @@ pub(crate) fn evaluate_host_metadata<'a>(
                     value,
                 ));
             }
+        }
+    }
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    // `verifyHostBindings`' `validateNoEventBindings`: binding a host property
+    // or attribute to an event (`[onclick]`, `[attr.onload]`) is disallowed
+    // (compiler.ts). The other errors it collects come from parsing the
+    // binding expressions, which oxc doesn't do.
+    for (key, _) in &entries {
+        let HostKey::Property = HostKey::of(key.as_str()) else { continue };
+        let prop = &key.as_str()[1..key.as_str().len() - 1];
+        let is_attr = prop.starts_with("attr.");
+        let bound = if is_attr { &prop[5..] } else { prop };
+        if bound.to_lowercase().starts_with("on") {
+            let error_type = if is_attr { "attribute" } else { "property" };
+            let suggestion = format!("({})=...", &bound[2..]);
+            let mut msg = format!(
+                "Binding to event {error_type} '{bound}' is disallowed for security reasons, \
+                 please use {suggestion}"
+            );
+            if !is_attr {
+                msg.push_str(&format!(
+                    "\nIf '{prop}' is a directive input, make sure the directive is imported \
+                     by the current module."
+                ));
+            }
+            return Err(msg);
         }
     }
     Ok(entries)
@@ -1975,6 +2067,11 @@ fn extract_host_metadata<'a>(
 }
 
 /// Extract host directives from a hostDirectives array expression.
+///
+/// Divergence from ngtsc's `extractHostDirectives`: upstream evaluates the
+/// expression with the partial evaluator (a const or spread array works, a
+/// non-array is an error). Here only a literal `ArrayExpression` is read and
+/// anything else yields no host directives, with no diagnostic.
 ///
 /// Handles the following patterns:
 /// - Simple identifier: `hostDirectives: [TooltipDirective]`
@@ -2147,6 +2244,9 @@ fn extract_forward_ref_directive_name<'a>(arg: Option<&Argument<'a>>) -> Option<
 /// - Mapping string: `["color: bgColor"]` - internal name mapped to public name
 ///
 /// Returns Vec of (publicName, internalName) pairs.
+///
+/// Divergence: ngtsc evaluates the array with the partial evaluator, so a
+/// const or a spread works; here only a literal `ArrayExpression` is read.
 fn extract_io_mappings<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,

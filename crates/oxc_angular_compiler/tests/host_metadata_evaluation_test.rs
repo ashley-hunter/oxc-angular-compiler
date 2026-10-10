@@ -418,3 +418,121 @@ fn host_that_depends_on_an_import() {
         }
     }
 }
+
+/// ngtsc builds `hostMetadata` by assigning each entry to a plain object, so
+/// `__proto__` invokes the setter and never becomes a key — in a literal, in
+/// a constant, or coming in through a spread.
+#[test]
+fn proto_key_is_dropped() {
+    for decorator in ["Component", "Directive"] {
+        for (preamble, host) in [
+            ("", "{ __proto__: 'x', role: 'r' }"),
+            ("", "{ '__proto__': 'x', role: 'r' }"),
+            ("const P = { __proto__: 'x' };", "{ ...P, role: 'r' }"),
+            ("const P = { __proto__: 'x' };", "{ ...P }"),
+        ] {
+            let (code, diagnostics) = compile(&source(decorator, preamble, host));
+            assert!(diagnostics.is_empty(), "diagnostics for `{host}`: {diagnostics:?}");
+            let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+            // Only the compiled host counts — `ɵsetClassMetadata` echoes the
+            // decorator arguments verbatim, like ngtsc does.
+            assert!(
+                !compact.contains(r#"hostAttrs:["__proto__""#)
+                    && !compact.contains(r#"hostAttrs:[1,"__proto__""#),
+                "`__proto__` reached hostAttrs for `{host}`:\n{compact}"
+            );
+        }
+        // The rest of the object is still read.
+        let (code, _) = compile(&source(decorator, "", "{ __proto__: 'x', role: 'r' }"));
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(r#""role","r""#), "{compact}");
+    }
+}
+
+/// A computed `host` key isn't metadata: ngtsc's `reflectObjectLiteral`
+/// returns null for a ComputedPropertyName, and the error check doesn't see
+/// the property either — applying it here would silently drop an invalid
+/// host, or apply a valid one ngtsc ignores.
+#[test]
+fn computed_host_key_is_not_metadata() {
+    for decorator in ["Component", "Directive"] {
+        for (preamble, property) in [
+            // A valid host ngtsc never reads — and an invalid one that must
+            // not error, since the property is ignored like upstream.
+            ("", "['host']: { role: 'r' }"),
+            ("", "['host']: { role: 1 }"),
+            ("const HOST = 'host';", "[HOST]: { role: 'r' }"),
+        ] {
+            let rest = if decorator == "Component" {
+                "selector: 'x', template: '',"
+            } else {
+                "selector: '[x]',"
+            };
+            let src = format!(
+                "import {{ {decorator} }} from '@angular/core';\n{preamble}\n\
+                 @{decorator}({{ {rest} {property} }})\nexport class X {{ {MEMBERS} }}\n"
+            );
+            let (code, diagnostics) = compile(&src);
+            assert!(
+                diagnostics.is_empty(),
+                "unexpected diagnostics for `{property}`: {diagnostics:?}"
+            );
+            assert!(!code.contains("hostAttrs"), "no host output for `{property}`");
+        }
+    }
+}
+
+/// `verifyHostBindings` forbids binding a host property or attribute to an
+/// event; the errors are ngtsc's HOST_BINDING_PARSE_ERROR messages
+/// (compiler.ts's `validateNoEventBindings`).
+#[test]
+fn binding_to_an_event_is_disallowed() {
+    for (host, message) in [
+        (
+            "{ '[onclick]': 't' }",
+            "Binding to event property 'onclick' is disallowed for security reasons, \
+             please use (click)=...\nIf 'onclick' is a directive input, make sure the \
+             directive is imported by the current module.",
+        ),
+        (
+            "{ '[attr.onload]': 't' }",
+            "Binding to event attribute 'onload' is disallowed for security reasons, \
+             please use (load)=...",
+        ),
+        (
+            "{ '[onClick]': 't' }",
+            "Binding to event property 'onClick' is disallowed for security reasons, \
+             please use (Click)=...\nIf 'onClick' is a directive input, make sure the \
+             directive is imported by the current module.",
+        ),
+    ] {
+        assert_error("", host, message);
+    }
+    // Only property keys are checked: '(onx)' is a listener, 'onx' an attribute.
+    let literal = "{ '(onx)': 'go()', onx: 'a' }";
+    assert_same_as_literal("Component", "const H = { '(onx)': 'go()', onx: 'a' };", "H", literal);
+}
+
+/// A method or accessor called `host` in the decorator object is a class
+/// member, not metadata — ngtsc's `reflectObjectLiteral` skips it, so it must
+/// not produce the "must be an object" error (regression: `config_property`
+/// matched it by name).
+#[test]
+fn host_that_is_a_method_or_getter_is_not_metadata() {
+    for decorator in ["Component", "Directive"] {
+        for host in ["host() { return {}; }", "get host() { return {}; }", "set host(v) {}"] {
+            let rest = if decorator == "Component" {
+                "selector: 'x', template: '',"
+            } else {
+                "selector: '[x]',"
+            };
+            let src = format!(
+                "import {{ {decorator} }} from '@angular/core';\n\
+                 @{decorator}({{ {rest} {host} }})\nexport class X {{ {MEMBERS} }}\n"
+            );
+            let (code, diagnostics) = compile(&src);
+            assert!(diagnostics.is_empty(), "unexpected diagnostics for `{host}`: {diagnostics:?}");
+            assert!(!code.contains("hostAttrs"), "no host output for `{host}`");
+        }
+    }
+}

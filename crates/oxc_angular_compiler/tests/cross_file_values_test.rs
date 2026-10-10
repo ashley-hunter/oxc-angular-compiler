@@ -339,6 +339,87 @@ export class A { go() {} }
         "{}",
         error_messages(&result)
     );
+
+    // A namespace spread can't even be named: `import * as ns` has no one
+    // binding to point at, so it reports like any unresolvable host.
+    let result = transform(
+        &dir,
+        r#"import { Directive } from '@angular/core';
+import * as meta from './meta';
+@Directive({ selector: '[a]', host: { ...meta } })
+export class A { go() {} }
+"#,
+        &TransformOptions::default(),
+    );
+    assert!(
+        error_messages(&result)
+            .contains("Decorator host metadata must be an object Value could not be determined"),
+        "{}",
+        error_messages(&result)
+    );
+}
+
+/// `import * as ns` spreads all of the module's exports into the host map,
+/// like ngtsc's `ResolvedModule.getExports()` — direct exports and ones a
+/// star export forwards. An export whose value can't be read is an error on
+/// its entry, not a dropped key.
+#[test]
+fn namespace_import_spreads_into_host() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/impl.ts", "export const VIA = 'v';");
+    create_test_file(dir.path(), "app/barrel.ts", "export * from './impl';");
+    create_test_file(
+        dir.path(),
+        "app/meta.ts",
+        "export const ROLE = 'button';\nexport const TITLE = 't';",
+    );
+    for (source, want) in [
+        (
+            r#"import { Directive } from '@angular/core';
+import * as meta from './meta';
+@Directive({ selector: '[a]', host: { ...meta } })
+export class A { go() {} }
+"#,
+            [r#""ROLE","button""#, r#""TITLE","t""#].as_slice(),
+        ),
+        (
+            r#"import { Directive } from '@angular/core';
+import * as barrel from './barrel';
+@Directive({ selector: '[a]', host: { ...barrel } })
+export class A { go() {} }
+"#,
+            [r#""VIA","v""#].as_slice(),
+        ),
+    ] {
+        let result = transform(&dir, source, &resolve_options());
+        assert!(!result.has_errors(), "{}", error_messages(&result));
+        let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in want {
+            assert!(compact.contains(needle), "missing `{needle}` in:\n{compact}");
+        }
+    }
+
+    // An export that can't be read statically reports the entry, upstream
+    // would emit its expression for a plain attribute (a declared divergence).
+    create_test_file(
+        dir.path(),
+        "app/bad.ts",
+        "declare function make(): string;\nexport const F = make();",
+    );
+    let result = transform(
+        &dir,
+        r#"import { Directive } from '@angular/core';
+import * as bad from './bad';
+@Directive({ selector: '[a]', host: { ...bad } })
+export class A { go() {} }
+"#,
+        &resolve_options(),
+    );
+    assert!(
+        error_messages(&result).contains("value of 'F' could not be determined statically"),
+        "{}",
+        error_messages(&result)
+    );
 }
 
 /// Where a same-file enum member acts as its value (a string operand of

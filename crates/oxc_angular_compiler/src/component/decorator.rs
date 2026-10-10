@@ -156,7 +156,13 @@ pub fn extract_component_metadata<'a>(
                     metadata.change_detection = Some(extract_change_detection(&prop.value));
                 }
                 "host" => {
-                    metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                    // ngtsc's `reflectObjectLiteral` drops computed keys, and
+                    // `host_metadata_error` doesn't see this property either —
+                    // an invalid one must not be applied here where it would
+                    // be dropped silently.
+                    if !prop.computed {
+                        metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                    }
                 }
                 "imports" => {
                     // For standalone components, we need:
@@ -235,6 +241,13 @@ pub fn extract_component_metadata<'a>(
 
     // Extract host bindings and listeners from @HostBinding/@HostListener decorators on class members
     // These are merged with any host metadata from the @Component({ host: {} }) property
+    //
+    // Divergence from ngtsc (pre-existing merge structure): upstream assigns
+    // member entries into `bindings.properties[name]` / `bindings.listeners`
+    // [eventName], overwriting same-named `host:` entries so one binding per
+    // key remains. Here they are appended instead, so a key declared in both
+    // emits two bindings — both listeners fire, and both property ops emit
+    // (the member's, applied last, still wins like upstream).
     let host_bindings = extract_host_bindings_in(allocator, class, Some(consts));
     let host_listeners = extract_host_listeners_in(allocator, class, Some(consts));
 
@@ -526,6 +539,11 @@ fn extract_host_metadata<'a>(
 
 /// Extract host directives from a hostDirectives array expression.
 ///
+/// Divergence from ngtsc's `extractHostDirectives`: upstream evaluates the
+/// expression with the partial evaluator (a const or spread array works, a
+/// non-array is an error). Here only a literal `ArrayExpression` is read and
+/// anything else yields no host directives, with no diagnostic.
+///
 /// Handles the following patterns:
 /// - Simple identifier: `hostDirectives: [TooltipDirective]`
 /// - Object with directive: `hostDirectives: [{ directive: ColorDirective }]`
@@ -713,6 +731,9 @@ fn extract_forward_ref_directive_name<'a>(arg: Option<&Argument<'a>>) -> Option<
 /// - Mapping string: `["color: bgColor"]` - public name mapped to internal name
 ///
 /// Returns Vec of (publicName, internalName) pairs.
+///
+/// Divergence: ngtsc evaluates the array with the partial evaluator, so a
+/// const or a spread works; here only a literal `ArrayExpression` is read.
 fn extract_io_mappings<'a>(
     allocator: &'a Allocator,
     expr: &Expression<'a>,
