@@ -1080,6 +1080,15 @@ pub fn convert_ir_expression<'a>(
                 crate::ir::expression::IrUnaryOperator::Minus => {
                     crate::output::ast::UnaryOperator::Minus
                 }
+                crate::ir::expression::IrUnaryOperator::Spread => {
+                    return OutputExpression::SpreadElement(Box::new_in(
+                        SpreadElementExpr {
+                            expr: Box::new_in(expr, &allocator),
+                            source_span: unary.source_span,
+                        },
+                        &allocator,
+                    ));
+                }
             };
             OutputExpression::UnaryOperator(Box::new_in(
                 crate::output::ast::UnaryOperatorExpr {
@@ -1137,7 +1146,12 @@ pub fn convert_ir_expression<'a>(
             for elem in rtl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // elem.text is cooked; the emitter prints raw_text verbatim,
+                    // so it must be re-escaped like upstream's
+                    // escapeForTemplateLiteral(escapeSlashes(text)).
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }
@@ -1150,6 +1164,15 @@ pub fn convert_ir_expression<'a>(
                     expressions,
                     root_xref,
                 ));
+            }
+
+            if rtl.tagged {
+                return crate::pipeline::conversion::tagged_template_literal(
+                    allocator,
+                    elements,
+                    output_expressions,
+                    rtl.source_span,
+                );
             }
 
             OutputExpression::TemplateLiteral(Box::new_in(
@@ -1171,7 +1194,11 @@ pub fn convert_ir_expression<'a>(
             for elem in ttl.elements.iter() {
                 elements.push(crate::output::ast::TemplateLiteralElement {
                     text: elem.text.clone(),
-                    raw_text: elem.text.clone(),
+                    // See ResolvedTemplateLiteral above: cooked text must be
+                    // re-escaped for emission as raw text.
+                    raw_text: crate::pipeline::conversion::cooked_to_raw_text(
+                        allocator, &elem.text,
+                    ),
                     source_span: elem.source_span,
                 });
             }

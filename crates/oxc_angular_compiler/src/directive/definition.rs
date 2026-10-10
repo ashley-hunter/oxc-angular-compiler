@@ -21,7 +21,7 @@ use crate::factory::{
     FactoryTarget, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryDeps,
     R3FactoryMetadata, compile_factory_function,
 };
-use crate::output::ast::OutputExpression;
+use crate::output::ast::{OutputExpression, OutputStatement};
 use crate::partial::directive::{
     compile_declare_directive_from_metadata, compile_declare_factory_for_directive,
 };
@@ -37,6 +37,9 @@ pub struct DirectiveDefinitions<'a> {
     /// The next available pool index after compilation.
     /// Used to track constant pool usage across multiple directives in the same file.
     pub next_pool_index: u32,
+
+    /// Constants the host bindings refer to, to be declared before the class.
+    pub statements: oxc_allocator::Vec<'a, OutputStatement<'a>>,
 }
 
 /// Generate ɵdir and ɵfac definitions for a directive.
@@ -88,14 +91,14 @@ pub fn generate_directive_definitions<'a>(
     match compilation_mode {
         CompilationMode::Full => {
             let fac_definition = generate_fac_definition(allocator, core_namespace, metadata);
-            let (dir_definition, next_pool_index) = generate_dir_definition(
+            let (dir_definition, next_pool_index, statements) = generate_dir_definition(
                 allocator,
                 core_namespace,
                 metadata,
                 pool_starting_index,
                 angular_version,
             );
-            DirectiveDefinitions { dir_definition, fac_definition, next_pool_index }
+            DirectiveDefinitions { dir_definition, fac_definition, next_pool_index, statements }
         }
         CompilationMode::Partial => {
             // Partial mode doesn't use the constant pool — the linker does
@@ -111,6 +114,7 @@ pub fn generate_directive_definitions<'a>(
                 dir_definition,
                 fac_definition,
                 next_pool_index: pool_starting_index,
+                statements: oxc_allocator::Vec::new_in(&allocator),
             }
         }
     }
@@ -137,7 +141,7 @@ fn generate_dir_definition<'a>(
     metadata: &R3DirectiveMetadata<'a>,
     pool_starting_index: u32,
     angular_version: Option<crate::AngularVersion>,
-) -> (OutputExpression<'a>, u32) {
+) -> (OutputExpression<'a>, u32, oxc_allocator::Vec<'a, OutputStatement<'a>>) {
     let result = compile_directive(
         allocator,
         core_namespace,
@@ -145,7 +149,7 @@ fn generate_dir_definition<'a>(
         pool_starting_index,
         angular_version,
     );
-    (result.expression, result.next_pool_index)
+    (result.expression, result.next_pool_index, result.statements)
 }
 
 /// Generate the ɵfac factory function.
@@ -445,7 +449,8 @@ mod tests {
         let allocator = Allocator::default();
         let metadata = create_test_metadata(&allocator);
 
-        let (dir, _next_pool_index) = generate_dir_definition(&allocator, "i0", &metadata, 0, None);
+        let (dir, _next_pool_index, _statements) =
+            generate_dir_definition(&allocator, "i0", &metadata, 0, None);
 
         let emitter = JsEmitter::new();
         let js = emitter.emit_expression(&dir);

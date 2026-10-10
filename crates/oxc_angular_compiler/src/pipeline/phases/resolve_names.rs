@@ -44,6 +44,7 @@ struct SavedView {
 /// - `RestoreViewExpr` → resolved to the saved view variable
 /// - `ExpressionRef` → `ReadVariable` if stored expression is PropertyRead(ImplicitReceiver, name) in scope
 pub fn resolve_names(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let root_xref = job.root.xref;
     let allocator = job.allocator;
 
@@ -61,6 +62,32 @@ pub fn resolve_names(job: &mut ComponentCompilationJob<'_>) {
     for view in job.all_views_mut() {
         // SAFETY: We're only reading from expression_store, not modifying it
         let expressions = unsafe { &*expression_store_ptr };
+
+        // Hoisted arrow functions are their own lexical scope, built from the variables
+        // prepended to their ops (resolve_names.ts: `processLexicalScope(unit, expr.ops, null)`).
+        for fn_ptr in view.functions.iter() {
+            // SAFETY: The pointer was collected from this view's operations at the start
+            // of this phase, and the allocator keeps the data alive.
+            let arrow_fn = unsafe { &mut **fn_ptr };
+            let scope = build_scope_from_handler_ops(arrow_fn.ops.iter());
+            for op in arrow_fn.ops.iter_mut() {
+                transform_expressions_in_update_op(
+                    op,
+                    &|expr, _flags| {
+                        resolve_expression(expr, &scope, root_xref, None, &allocator, expressions);
+                    },
+                    VisitorContextFlag::NONE,
+                );
+            }
+            resolve_expression(
+                arrow_fn.body.as_mut(),
+                &scope,
+                root_xref,
+                None,
+                &allocator,
+                expressions,
+            );
+        }
 
         // Process create ops with their own scope (no update scope merged in)
         process_lexical_scope_create(root_xref, &mut view.create, None, &allocator, expressions);
@@ -1250,6 +1277,7 @@ fn resolve_angular_expression_with_params<'a>(
                     crate::ir::expression::ResolvedTemplateLiteralExpr {
                         elements,
                         expressions: resolved_exprs,
+                        tagged: false,
                         source_span: Some(tl.source_span.to_span()),
                     },
                     &allocator,
@@ -1709,6 +1737,7 @@ fn resolve_angular_expression_with_params<'a>(
                     body: Box::new_in(body, &allocator),
                     ops: oxc_allocator::Vec::new_in(&allocator),
                     var_offset: None,
+                    hoisted: false,
                     source_span: Some(arrow.source_span.to_span()),
                 },
                 &allocator,
@@ -1802,9 +1831,40 @@ fn resolve_angular_expression_with_params<'a>(
 ///
 /// Host version - only processes the root unit (no embedded views).
 pub fn resolve_names_for_host(job: &mut HostBindingCompilationJob<'_>) {
+    // Upstream resolveNames iterates unit.functions for all job kinds; refresh
+    // the pointer list before reading it.
+    super::generate_arrow_functions::collect_arrow_functions_for_host(job);
     let allocator = job.allocator;
     let root_xref = job.root.xref;
     let expression_store_ptr = &job.expressions as *const ExpressionStore<'_>;
+
+    // Hoisted arrow functions are their own lexical scope, built from the
+    // variables prepended to their ops, same as in `resolve_names`.
+    for fn_ptr in job.root.functions.iter() {
+        // SAFETY: The pointer was collected from this unit's operations at the
+        // start of this phase, and the allocator keeps the data alive.
+        let arrow_fn = unsafe { &mut **fn_ptr };
+        // SAFETY: We're only reading from expression_store, not modifying it
+        let expressions = unsafe { &*expression_store_ptr };
+        let scope = build_scope_from_handler_ops(arrow_fn.ops.iter());
+        for op in arrow_fn.ops.iter_mut() {
+            transform_expressions_in_update_op(
+                op,
+                &|expr, _flags| {
+                    resolve_expression(expr, &scope, root_xref, None, &allocator, expressions);
+                },
+                VisitorContextFlag::NONE,
+            );
+        }
+        resolve_expression(
+            arrow_fn.body.as_mut(),
+            &scope,
+            root_xref,
+            None,
+            &allocator,
+            expressions,
+        );
+    }
 
     // SAFETY: We're only reading from expression_store, not modifying it
     let expressions = unsafe { &*expression_store_ptr };

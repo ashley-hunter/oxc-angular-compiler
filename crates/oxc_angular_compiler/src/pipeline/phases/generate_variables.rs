@@ -81,6 +81,7 @@ struct Scope<'a, 'b> {
 /// Following Angular's generate_variables.ts, this phase recursively processes views
 /// with a scope chain, so nested views can access @let declarations from parent views.
 pub fn generate_variables(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     // Process views recursively starting from root, building scope chains
     recursively_process_view(job, job.root.xref, None);
 }
@@ -518,6 +519,7 @@ fn generate_variables_in_scope_for_view<'a>(
             new_ops.push(create_context_let_reference_variable(
                 &allocator,
                 xref,
+                scope.view,
                 decl.variable_name.clone(),
                 decl.target_id,
                 decl.target_slot,
@@ -609,29 +611,20 @@ fn prepend_variables_to_arrow_functions<'a, 'b>(
     scope: &Scope<'a, 'b>,
     _parent_scope: Option<&'b Scope<'a, 'b>>,
 ) {
-    // Check if there are functions in the view
-    let has_functions = {
+    let function_count = {
         let is_root = view_xref == job.root.xref;
         let view =
             if is_root { Some(&job.root) } else { job.views.get(&view_xref).map(|v| v.as_ref()) };
-        view.map(|v| !v.functions.is_empty()).unwrap_or(false)
+        view.map_or(0, |v| v.functions.len())
     };
 
-    if !has_functions {
-        return;
+    // Each arrow function gets its own variables, as a listener does.
+    let mut variables_per_function = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        variables_per_function
+            .push(generate_variables_in_scope_for_view(job, view_xref, scope, true));
     }
 
-    // Generate variables for the arrow function context with is_callback=true
-    // Angular creates a fresh scope for each arrow function, but since we're
-    // iterating through all functions in the same view, they share the same scope.
-    let variables = generate_variables_in_scope_for_view(job, view_xref, scope, true);
-
-    if variables.is_empty() {
-        return;
-    }
-
-    // Get mutable access to the view
-    let allocator = job.allocator;
     let is_root = view_xref == job.root.xref;
     let view = if is_root {
         &mut job.root
@@ -641,17 +634,12 @@ fn prepend_variables_to_arrow_functions<'a, 'b>(
         return;
     };
 
-    // Prepend variables to each arrow function's ops
-    // We need to clone the variables for each function since they're consumed
-    for func_ptr in view.functions.iter() {
+    for (func_ptr, variables) in view.functions.iter().zip(variables_per_function) {
         // SAFETY: These pointers are valid as they point to ArrowFunctionExpr
         // allocated in the allocator and stored in the view's functions vec.
         let func = unsafe { &mut **func_ptr };
-
-        // Clone variables for this function
-        for var in variables.iter().rev() {
-            let cloned = clone_update_op(allocator, var);
-            func.ops.insert(0, cloned);
+        for var in variables.into_iter().rev() {
+            func.ops.insert(0, var);
         }
     }
 }
@@ -796,6 +784,7 @@ fn create_reference_variable<'a>(
 fn create_context_let_reference_variable<'a>(
     allocator: &'a oxc_allocator::Allocator,
     xref: XrefId,
+    view: XrefId,
     name: Ident<'a>,
     target_id: XrefId,
     target_slot: Option<SlotId>,
@@ -817,7 +806,7 @@ fn create_context_let_reference_variable<'a>(
         name,
         initializer: Box::new_in(initializer, &allocator),
         flags: VariableFlags::NONE,
-        view: None,
+        view: Some(view),
         local: false,
     })
 }

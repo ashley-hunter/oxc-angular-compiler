@@ -652,18 +652,16 @@ fn assign_var_offsets_in_expr(
         }
 
         IrExpression::ArrowFunction(arrow_fn) => {
-            // Collected arrows (members of unit.functions, marked by
-            // generate_arrow_functions with a u32::MAX sentinel) consume a var
-            // slot upstream (var_counting.ts varsUsedByIrExpression), even though
-            // they are emitted in place here since `ɵɵarrowFunction` hoisting is
-            // not implemented. Arrows preserved in place (var_offset still None)
-            // consume nothing. Process ops and body for inner var consumers.
-            let is_collected = arrow_fn.var_offset == Some(u32::MAX);
+            // A hoisted arrow function consumes a var slot for `ɵɵarrowFunction`; one
+            // emitted in place does not. Var consumers inside the arrow's own ops
+            // and body are counted first — upstream's visitor transforms children
+            // before the node, so ngtsc numbers e.g. an inner pipe before the
+            // arrow's own offset (`pipeBind1(1,3, arrowFunction(2,...))`).
             for op in arrow_fn.ops.iter_mut() {
                 assign_var_offsets_in_op(op, var_count, pure_functions_only);
             }
             assign_var_offsets_in_expr(&mut arrow_fn.body, var_count, pure_functions_only);
-            if is_collected && !pure_functions_only {
+            if arrow_fn.hoisted && !pure_functions_only {
                 arrow_fn.var_offset = Some(*var_count);
                 *var_count += 1;
             }

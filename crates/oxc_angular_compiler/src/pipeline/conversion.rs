@@ -195,14 +195,18 @@ pub fn convert_unary_operator(op: AstUnaryOperator) -> OutputUnaryOperator {
 /// Since the Angular expression parser gives us cooked text, we need to
 /// re-escape it for contexts that need raw text (template literal emission).
 ///
+/// Mirrors Angular's `escapeForTemplateLiteral(escapeSlashes(text))` in
+/// `output/output_ast.ts`: backslashes are doubled first, then backticks and
+/// `${` are escaped so a tag sees the same `strings.raw` it would under ngtsc.
+/// Line breaks stay literal, as upstream leaves them.
+///
 /// This function escapes:
+/// - Backslashes (doubled, so the cooked value keeps the original escape)
 /// - Backticks (`) to prevent closing the template literal
-/// - `${` to prevent interpolation syntax
-/// - Backslashes to preserve escape sequences
-/// - Carriage returns and line feeds to their escape sequences
-fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
+/// - `${` as `$\{` to prevent interpolation syntax
+pub(crate) fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
     // Fast path: if no escaping needed, return as-is
-    if !cooked.contains(['`', '$', '\\', '\r', '\n']) {
+    if !cooked.contains(['`', '$', '\\']) {
         return Ident::from(allocator.alloc_str(cooked));
     }
 
@@ -213,12 +217,10 @@ fn cooked_to_raw_text<'a>(allocator: &'a Allocator, cooked: &str) -> Ident<'a> {
         match c {
             '`' => raw.push_str("\\`"),
             '\\' => raw.push_str("\\\\"),
-            '\r' => raw.push_str("\\r"),
-            '\n' => raw.push_str("\\n"),
             '$' => {
                 // Only escape if followed by { to form ${
                 if chars.peek() == Some(&'{') {
-                    raw.push_str("\\$");
+                    raw.push_str("$\\");
                 } else {
                     raw.push('$');
                 }
@@ -760,12 +762,39 @@ pub fn convert_ast<'a>(
                     body: Box::new_in(body.to_ir(allocator), &allocator),
                     ops: Vec::new_in(&allocator),
                     var_offset: None,
+                    hoisted: false,
                     source_span: convert_source_span(arrow.source_span),
                 },
                 &allocator,
             )))
         }
     }
+}
+
+/// Builds a tagged template from the converted parts of a tagged
+/// `ResolvedTemplateLiteral`, whose first expression is the tag.
+pub(crate) fn tagged_template_literal<'a>(
+    allocator: &'a Allocator,
+    mut elements: Vec<'a, crate::output::ast::TemplateLiteralElement<'a>>,
+    mut expressions: Vec<'a, crate::output::ast::OutputExpression<'a>>,
+    source_span: Option<oxc_span::Span>,
+) -> crate::output::ast::OutputExpression<'a> {
+    let tag = expressions.remove(0);
+    // The elements hold cooked text; a tagged template is emitted from its raw text.
+    for element in &mut elements {
+        element.raw_text = cooked_to_raw_text(allocator, &element.text);
+    }
+    crate::output::ast::OutputExpression::TaggedTemplateLiteral(Box::new_in(
+        crate::output::ast::TaggedTemplateLiteralExpr {
+            tag: Box::new_in(tag, &allocator),
+            template: Box::new_in(
+                crate::output::ast::TemplateLiteralExpr { elements, expressions, source_span },
+                &allocator,
+            ),
+            source_span,
+        },
+        &allocator,
+    ))
 }
 
 /// Converts an Angular expression with interpolation support.
@@ -883,16 +912,16 @@ mod tests {
             "path\\\\to\\\\file"
         );
 
-        // Escape newlines and carriage returns
+        // Newlines and carriage returns stay literal, matching upstream
         assert_eq!(
             super::cooked_to_raw_text(&allocator, "line1\nline2\rline3").as_str(),
-            "line1\\nline2\\rline3"
+            "line1\nline2\rline3"
         );
 
-        // Escape ${
+        // Escape ${ as $\{, matching upstream's escapeForTemplateLiteral
         assert_eq!(
             super::cooked_to_raw_text(&allocator, "value is ${x}").as_str(),
-            "value is \\${x}"
+            "value is $\\{x}"
         );
 
         // Do not escape $ without {

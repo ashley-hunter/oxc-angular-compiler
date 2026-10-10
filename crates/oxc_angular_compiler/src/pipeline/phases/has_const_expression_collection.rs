@@ -32,6 +32,7 @@ use crate::pipeline::phases::reify::ir_expression::convert_ir_expression;
 /// Pass 1: Transform ConstCollectedExpr to ConstReference, collecting expressions
 /// Pass 2: Add collected expressions to const pool (indices are pre-allocated)
 pub fn collect_const_expressions(job: &mut ComponentCompilationJob<'_>) {
+    super::generate_arrow_functions::collect_arrow_functions(job);
     let allocator = job.allocator;
     let root_xref = job.root.xref;
 
