@@ -28,16 +28,16 @@ pub use compiler::{
 };
 pub(crate) use decorator::find_directive_decorator;
 pub(crate) use decorator::{
+    HostKey, angular_decorator_config, evaluate_host_metadata, evaluate_styles,
+    extract_string_value, resolve_template_literal, styles_error,
+};
+pub(crate) use decorator::{
     INPUT_API, InitializerApi, MODEL_API, OUTPUT_API, OUTPUT_FROM_OBSERVABLE_API, QUERY_APIS,
     initializer_api, initializer_api_call,
 };
 pub use decorator::{
     StringConsts, collect_string_consts, decorator_io_errors, extract_directive_metadata,
     find_directive_decorator_span, param_decorator_errors,
-};
-pub(crate) use decorator::{
-    angular_decorator_config, evaluate_styles, extract_string_value, resolve_template_literal,
-    styles_error,
 };
 pub(crate) use decorator::{merge_by_class_property, parse_decorator_io};
 pub use definition::{DirectiveDefinitions, generate_directive_definitions};

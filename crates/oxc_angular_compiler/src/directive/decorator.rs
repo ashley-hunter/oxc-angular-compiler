@@ -1096,11 +1096,11 @@ pub(crate) fn angular_decorator_config<'a>(
     Some((config, name))
 }
 
-/// The first error ngtsc raises for the inputs, outputs, queries and selector
-/// of a `@Component` / `@Directive` on `class`, in the order it checks them
+/// The first error ngtsc raises for the inputs, outputs, queries, selector and
+/// host of a `@Component` / `@Directive` on `class`, in the order it checks them
 /// (`extractDirectiveMetadata`): `inputs:`, `@Input` members, `outputs:`,
 /// output members, query members (`@ViewChild`, ...), then `queries:`, then
-/// `selector`. ngtsc stops at the first one.
+/// `selector`, then `host:`. ngtsc stops at the first one.
 ///
 /// Each error points where ngtsc's does: the `inputs:` / `outputs:` value, the
 /// member, or the part of a query at fault. `source_text` is the file's, as
@@ -1432,9 +1432,10 @@ pub fn decorator_io_errors<'a>(
         );
         queries.error.map(at)
     };
-    // The selector is the last thing `extractDirectiveMetadata` reads.
     let selector =
         || directive_selector_error(config, decorator_name, &class_name, &evaluator, consts);
+    // `extractHostBindings` runs right after the selector check.
+    let host = || host_metadata_error(allocator, config, decorator_name, consts).map(at);
 
     io.as_ref()
         .and_then(|io| io.input_error.clone())
@@ -1445,6 +1446,7 @@ pub fn decorator_io_errors<'a>(
         .or_else(member_queries)
         .or_else(queries)
         .or_else(selector)
+        .or_else(host)
         .map(|(message, span, related)| {
             let diagnostic = OxcDiagnostic::error(message).with_label(span);
             match related {
@@ -1828,58 +1830,147 @@ pub(crate) fn initializer_api(
     named(&required.object).or_else(|| namespaced(&required.object)).map(|api| (api, true))
 }
 
-/// Extract host metadata from a host object expression.
+/// What a `host` key binds, as Angular's `parseHostBindings` classifies it.
+pub(crate) enum HostKey {
+    /// `[property]`, `[class.x]`, `[style.x]`, `[attr.x]`
+    Property,
+    /// `(event)`
+    Listener,
+    /// `class`
+    Class,
+    /// `style`
+    Style,
+    /// Any other key: a static attribute.
+    Attribute,
+}
+
+impl HostKey {
+    pub(crate) fn of(key: &str) -> Self {
+        if key.starts_with('[') && key.ends_with(']') {
+            Self::Property
+        } else if key.starts_with('(') && key.ends_with(')') {
+            Self::Listener
+        } else {
+            match key {
+                "class" => Self::Class,
+                "style" => Self::Style,
+                _ => Self::Attribute,
+            }
+        }
+    }
+}
+
+/// The entries of the `host` metadata `expr` evaluates to, in order, or the error ngtsc
+/// reports for it (on `expr`).
+///
+/// Like ngtsc, the expression is evaluated statically rather than read as a literal, so
+/// a spread (`{ ...SHARED, role: 'x' }`) or a constant (`host: HOST`) gives the same
+/// entries as writing them out. As in a `Map`, an entry that repeats a key replaces its
+/// value and keeps the first one's position.
+///
+/// `decorator_name` is `Component` or `Directive`.
+///
+/// Ported from ngtsc's `evaluateHostExpressionBindings`
+/// (packages/compiler-cli/src/ngtsc/annotations/directive/src/shared.ts).
+pub(crate) fn evaluate_host_metadata<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    decorator_name: &str,
+    consts: &StringConsts<'a>,
+) -> Result<std::vec::Vec<(Ident<'a>, Ident<'a>)>, String> {
+    let subject = format!("@{decorator_name}.host");
+    let host = Evaluator::new(consts).evaluate(expr);
+    let Value::Object(props) = &host else {
+        return Err(value_error(
+            &subject,
+            || "Decorator host metadata must be an object".to_string(),
+            &host,
+        ));
+    };
+
+    let alloc = |s: &str| Ident::from(allocator.alloc_str(s));
+    let mut entries = std::vec::Vec::<(Ident<'a>, Ident<'a>)>::with_capacity(props.len());
+    for prop in props {
+        if entries.iter().any(|(key, _)| key.as_str() == prop.key) {
+            continue;
+        }
+        // The value the key ends up with: its last one.
+        let value = host.prop(&prop.key).map_or(&prop.value, |p| &p.value);
+        let value = match value {
+            Value::Enum { value, .. } => value,
+            value => value,
+        };
+        match value {
+            Value::String(s) => entries.push((alloc(&prop.key), alloc(s))),
+            // ngtsc's `DynamicValue`. `parseHostBindings` rejects it for everything but
+            // a plain attribute, whose expression it emits as it is written.
+            _ if value.is_dynamic() || matches!(value, Value::Function(_)) => {
+                return Err(match HostKey::of(&prop.key) {
+                    HostKey::Property => "Property binding must be string".to_string(),
+                    HostKey::Listener => "Event binding must be string".to_string(),
+                    HostKey::Class => "Class binding must be string".to_string(),
+                    HostKey::Style => "Style binding must be string".to_string(),
+                    HostKey::Attribute => format!(
+                        "Decorator host metadata must be a string -> string object, but the \
+                         value of '{}' could not be determined statically. OXC does not \
+                         support dynamic host attribute values.",
+                        prop.key
+                    ),
+                });
+            }
+            _ => {
+                return Err(value_error(
+                    &subject,
+                    || {
+                        "Decorator host metadata must be a string -> string object, but found \
+                         unparseable value"
+                            .to_string()
+                    },
+                    value,
+                ));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// The error ngtsc reports for the `host` of a `@Component` / `@Directive` whose
+/// metadata is `config`, and the node it reports it on (the `host` value).
+fn host_metadata_error<'a>(
+    allocator: &'a Allocator,
+    config: Option<&'a ObjectExpression<'a>>,
+    decorator_name: &str,
+    consts: &StringConsts<'a>,
+) -> Option<(String, Span)> {
+    let expr = config_property(config?, "host", consts)?;
+    evaluate_host_metadata(allocator, expr, decorator_name, consts)
+        .err()
+        .map(|message| (message, expr.span()))
+}
+
+/// Extract host metadata from a host expression.
 ///
 /// Reference: packages/compiler/src/render3/view/compiler.ts:560-604
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
-    expr: &Expression<'a>,
+    expr: &'a Expression<'a>,
     consts: &StringConsts<'a>,
 ) -> Option<R3HostMetadata<'a>> {
-    let Expression::ObjectExpression(obj) = expr else {
-        return None;
-    };
+    // An unusable host is reported by `decorator_io_errors`.
+    let entries = evaluate_host_metadata(allocator, expr, "Directive", consts).ok()?;
 
     let mut host = R3HostMetadata::new(allocator);
-
-    for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(prop) = prop
-            && is_metadata_property(prop)
-        {
-            let Some(key_name) = get_property_key_name(&prop.key, consts) else {
-                continue;
-            };
-            let Some(value) = extract_string_value(allocator, &prop.value, consts) else {
-                continue;
-            };
-
-            let key_str = key_name.as_str();
-
-            if key_str.starts_with('[') && key_str.ends_with(']') {
-                // Property binding: [class.active]
-                host.properties.push((key_name, value));
-            } else if key_str.starts_with('(') && key_str.ends_with(')') {
-                // Event listener: (click)
-                host.listeners.push((key_name, value));
-            } else {
-                // Check for special attributes (class and style)
-                match key_str {
-                    "class" => {
-                        host.class_attr = Some(value);
-                    }
-                    "style" => {
-                        host.style_attr = Some(value);
-                    }
-                    _ => {
-                        // Regular static attribute - convert to OutputExpression
-                        let attr_expr = OutputAstBuilder::string(allocator, value);
-                        host.attributes.push((key_name, attr_expr));
-                    }
-                }
+    for (key, value) in entries {
+        match HostKey::of(key.as_str()) {
+            HostKey::Property => host.properties.push((key, value)),
+            HostKey::Listener => host.listeners.push((key, value)),
+            HostKey::Class => host.class_attr = Some(value),
+            HostKey::Style => host.style_attr = Some(value),
+            HostKey::Attribute => {
+                host.attributes.push((key, OutputAstBuilder::string(allocator, value)));
             }
         }
     }
-
     Some(host)
 }
 
